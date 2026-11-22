@@ -35,9 +35,34 @@ Dockerfile           oven/bun:1.3-slim, no install step
 
 ## What the platform does
 
-- **Talent registration** — 6-step JOIN wizard (account, location, demographics,
-  categories/skills/languages/experience, 8-slot labeled portfolio, Fast-Track).
-  Photos downscale in the browser (max 1200px JPEG 0.82) before upload.
+- **Talent registration** — 3-screen JOIN wizard (v7: screen 1 quick —
+  name, email, phone, password, city, state dropdown, contact
+  preference, terms — creates the account at once; remaining fields
+  moved to post-signup profile completion with a % meter on the
+  dashboard). Email verification: 6-digit code, hash-only, 15-minute
+  expiry, 5-attempt lock, resend, live status. Consent sign requires a
+  verified email. Password reset via the same code flow. Photos
+  downscale in the browser (max 1200px JPEG 0.82) before upload.
+- **Jobs For You** (v8) — evolved ranked match feed per talent, each job
+  carrying its personal per-(talent, job) reference code.
+- **Automation** (v8) — one BIG toggle per talent (agency-send email
+  route: agency mailbox sends, talent CC'd, Reply-To the talent) plus
+  fine rules in Fast-Track. TEST MODE: even ON, nothing is ever sent.
+- **Proof of work + earnings** (v9) — completed jobs appear as credits
+  in the talent's profile; talent sees ONLY their own net per job +
+  running total. Agency commission is never in the talent payload.
+- **Owner gate** (v10) — owner passcode → 12-hour session token; Agency
+  Earnings (commission totals + per-agency breakdown) renders ONLY for
+  a verified owner (or the admin token). Everyone else gets 401.
+- **Personal portfolio links** (v11) — every talent gets `#/talent/<id>`,
+  a public page for THAT person (never the front page), gated by
+  visibility (private by default, agency-staff-only, or public) and a
+  separate share-photos switch. Casting-safe fields only: no email,
+  phone, demographics, zip, fees, or earnings, ever.
+- **Social links** (v11) — a talent links THEIR OWN Instagram/Facebook
+  (talent-attested: begin → confirm; bio-checked flag) and adds a few
+  of their social photos as an extended portfolio preview. No OAuth
+  integration yet — that is a later build, stated on the screen.
 - **Likeness Release & Representation Consent** — contract text, checkbox +
   typed e-signature (must match the legal/professional name), agency review
   gate (PASS/FAIL with reason) → READY FOR MATCHING.
@@ -48,6 +73,10 @@ Dockerfile           oven/bun:1.3-slim, no install step
   cent. Commission is automatic on a 10–15% sliding scale (10% at $100/day,
   15% at $1,000/day, linear between). Calculated and tracked only — never
   collected. Booking emails stay QUEUED (email integration not connected).
+- **Cubicles + inbound replies** — staff can create cubicles and set
+  their status (`#/cubicles`); agency/casting replies to an
+  application are recorded by staff and visible to the talent
+  (`#/replies`, `POST /api/v1/application-replies` admin-only).
 - **Ledger** — append-only, hash-chained record of every event (registrations,
   consent, reviews, matches, applications, bookings, payments, ingestions).
   `GET /api/v1/ledger/verify` recomputes the chain. Ledger view + contact
@@ -72,6 +101,15 @@ Dockerfile           oven/bun:1.3-slim, no install step
   API: `GET /api/v1/opportunities?status=live|expired|all&sort=newest|oldest
   &pay_type=&source=&county=&geography=&category=&verification_status=&q=`.
 
+## Version
+
+- **Artifact parity: v11.** The footer carries a visible stamp
+  (`TOP TEA TALENTS • v11 • updated <date>`, from
+  `window.__TTT_BUILD__` in `frontend/index.html`), and
+  `/api/v1/health` reports the backend version (`1.1.0`). If the stamp
+  and the artifact disagree, the package is stale — that is the drift
+  check.
+
 ## Run locally
 
 ```bash
@@ -81,7 +119,7 @@ PORT=3101 DATABASE_PATH=/tmp/ttt.db ADMIN_TOKEN=dev-token bun run src/server.ts
 # in another shell, serve the frontend with the API pointed at it:
 #   echo 'window.__TTT_API__ = "http://localhost:3101";' > ../frontend/api-config.js
 #   python3 -m http.server 8123 --directory ../frontend
-bash server/selftest.sh   # 37 checks, boots its own temp DB
+bash server/selftest.sh   # 87 checks, boots its own temp DB
 bun x tsc --noEmit -p server/tsconfig.json
 ```
 
