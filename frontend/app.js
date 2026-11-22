@@ -75,21 +75,14 @@ function brandMarkSVG(size){
   c.setAttribute("width", size); c.setAttribute("height", size);
   return c.outerHTML;
 }
+/* v18 fix #8: the splash gate is gone — content shows at once. The splash
+   markup stays in the DOM only as the brand-mark SVG source (header, hero,
+   and join screens clone it); it is hidden immediately here and by CSS, and
+   never waits on a tap or a timer. No audio on this page. */
 function initSplash(){
   var hm = $("#header-mark"); if(hm) hm.innerHTML = brandMarkSVG(30);
   var s = $("#splash"); if(!s) return;
-  var hide = function(){
-    if(s.classList.contains("splash-hide")) return;
-    s.classList.add("splash-hide");
-    try{ sessionStorage.setItem("ttt_splash_seen","1"); }catch(e){}
-    setTimeout(function(){ s.classList.add("hidden"); }, 700);
-  };
-  var seen = false;
-  try{ seen = sessionStorage.getItem("ttt_splash_seen")==="1"; }catch(e){}
-  if(seen){ s.classList.add("splash-hide"); s.classList.add("hidden"); return; }
-  s.addEventListener("click", hide);
-  s.addEventListener("keydown", function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); hide(); } });
-  setTimeout(hide, 2400);
+  s.classList.add("splash-hide"); s.classList.add("hidden");
 }
 function emptyBox(msg){ return '<div class="empty">'+esc(msg)+'</div>'; }
 function errBox(msg){ return '<div class="error-box" role="alert">'+esc(msg)+'</div>'; }
@@ -268,7 +261,7 @@ function oppCard(o){
   return '<article class="opp-card'+(exp?' expired':'')+'">'
     + '<h3><a href="#/opportunity/'+encodeURIComponent(o.id)+'">'+esc(o.title||"Untitled opportunity")+'</a></h3>'
     + '<p class="meta">'+esc(o.production||o.employer||o.casting_org||"")+(o.production&&o.employer?" · ":"")+esc(o.employer&&o.production?o.employer:"")+' · '+esc(locText(o))+'</p>'
-    + '<p><span class="pay">'+payText(o)+'</span> '+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+    + '<p class="pay-line"><span class="pay">'+payText(o)+'</span>'+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
     + '<p class="meta">Category: '+esc(o.category||"—")+' · Deadline: '+esc(o.deadline?fmtDate(o.deadline):"Not stated")+'</p>'
     + '<p class="meta">Source: '+src+srcLink+'</p>'
     + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(o.id)+'">View details</a></p>'
@@ -307,8 +300,8 @@ function screenLanding(app){
     + '<p class="hero-tag">Casting discovery, matching, and bookings — nationwide, South Florida first.</p>'
     + '<a class="btn btn-gold btn-gold-big" href="#/join">SIGN UP</a>'
     + '<div class="hero-panel"><div class="steps-grid">'
-    + '<div class="step-tile"><div class="step-icon">🔍</div><h3>FIND</h3><p>We hunt casting calls every day — boards, streamers, music videos, commercials.</p></div>'
-    + '<div class="step-tile"><div class="step-icon">🎯</div><h3>MATCH</h3><p>We match the right jobs to your look, skills, and location.</p></div>'
+    + '<div class="step-tile"><div class="step-icon">🔍</div><h3>FIND</h3><p>New casting calls, hunted every day.</p></div>'
+    + '<div class="step-tile"><div class="step-icon">🎯</div><h3>MATCH</h3><p>The right jobs for your look, skills, and location.</p></div>'
     + '<div class="step-tile"><div class="step-icon">📤</div><h3>SUBMIT</h3><p>We send your profile to the best-paying fits first.</p></div>'
     + '<div class="step-tile"><div class="step-icon">🎬</div><h3>BOOK</h3><p>You get the call, the details, and your pay.</p></div>'
     + '</div>'
@@ -318,13 +311,14 @@ function screenLanding(app){
     + '<div class="stat"><b data-stat="opportunities">—</b><span>opportunities found</span></div>'
     + '<div class="stat"><b data-stat="south_florida">—</b><span>in South Florida</span></div>'
     + '<div class="stat"><b data-stat="sources">—</b><span>sources checked</span></div>'
-    + '</div><p class="muted small" id="stats-note"></p><p class="muted small" id="sources-line"></p></section>'
-    + '<section class="card"><h2>South Florida</h2><p>South Florida first — Miami, Fort Lauderdale, and Palm Beach castings surface here before anywhere else.</p><p><a class="btn btn-ghost" href="#/opportunities?geography=south-florida">Browse South Florida</a></p></section>'
+    + '</div><p class="muted small" id="stats-note"></p><details class="sources-details" id="sources-details"><summary><span id="sources-count">23</span> sources checked</summary><p class="muted small" id="sources-line"></p></details></section>'
+    + '<section class="card"><h2>South Florida</h2><p>South Florida first — Miami, Fort Lauderdale, and Palm Beach castings surface here before anywhere else.</p><p><a class="btn btn-ghost" href="#/opportunities?geography=south-florida">Browse South Florida</a> <a class="btn btn-ghost" href="#/browse">Browse all listings</a></p></section>'
     + '<section><h2 style="color:var(--gold)">Browse opportunities</h2><div id="preview-list">'+loadingBox("Loading opportunities…")+'</div>'
     + '<p><a class="btn" href="#/opportunities">See all opportunities</a> <a class="btn btn-ghost" href="#/browse">Browse all listings</a></p></section>';
   if(!apiBase()){
     var note = $("#stats-note");
     if(note) note.textContent = "Live counts appear here once the backend is connected. No numbers are shown until then.";
+    var sd0 = $("#sources-details"); if(sd0) sd0.style.display = "none";
     var pl = $("#preview-list");
     if(pl) pl.innerHTML = emptyBox("Opportunities load from the live backend once it is connected. Nothing is listed yet.");
     return;
@@ -345,8 +339,12 @@ function screenLanding(app){
   apiGet("/api/v1/sources").then(function(d){
     var list = d.sources||d||[];
     var el = $("#sources-line"); if(!el) return;
-    if(Array.isArray(list) && list.length) el.textContent = "Sources checked: " + list.map(function(s){ return s.name||s.id||s; }).join(", ") + ".";
-  }).catch(function(){});
+    var sd = $("#sources-details");
+    if(Array.isArray(list) && list.length){
+      el.textContent = "Sources checked: " + list.map(function(s){ return s.name||s.id||s; }).join(", ") + ".";
+      var c = $("#sources-count"); if(c) c.textContent = list.length;
+    } else if(sd) { sd.style.display = "none"; }
+  }).catch(function(){ var sd2 = $("#sources-details"); if(sd2) sd2.style.display = "none"; });
   apiGet("/api/v1/opportunities?limit=5").then(function(d){
     var list = (d && (d.opportunities||d.items||d.data)) || [];
     var pl = $("#preview-list"); if(!pl) return;
@@ -424,7 +422,7 @@ function browseCard(o){
   return '<article class="opp-card'+(exp?' expired':'')+'">'
     + '<h3><a href="#/opportunity/'+encodeURIComponent(o.id)+'">'+esc(o.title||"Untitled opportunity")+'</a></h3>'
     + '<p class="meta">'+esc(o.production||o.employer||o.casting_org||"")+(o.production&&o.employer?" · ":"")+esc(o.employer&&o.production?o.employer:"")+' · '+esc(locText(o))+'</p>'
-    + '<p><span class="pay">'+payText(o)+'</span> '+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+    + '<p class="pay-line"><span class="pay">'+payText(o)+'</span>'+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
     + '<p class="meta">Listed: '+esc(o.discovered_at?fmtDate(o.discovered_at):"Not stated")+' · Category: '+esc(o.category||"—")+' · Deadline: '+esc(o.deadline?fmtDate(o.deadline):"Not stated")+'</p>'
     + '<p class="meta">Source: '+src+srcLink+'</p>'
     + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(o.id)+'">View details</a></p>'
@@ -449,7 +447,7 @@ function screenBrowse(app){
     + '<div><label>Showing</label><div class="seg-toggle" id="b-status" role="group" aria-label="Live or expired"><button type="button" data-status="all" aria-pressed="true">All</button><button type="button" data-status="live" aria-pressed="false">Live</button><button type="button" data-status="expired" aria-pressed="false">Expired</button></div></div>'
     + '<div><label for="b-sort">Sort by date</label><select id="b-sort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></div>'
     + '</div></div>'
-    + '<div id="browse-count"></div><div id="browse-list">'+loadingBox("Loading all listings…")+'</div>';
+    + '<div id="browse-count"></div><div id="browse-list"><div class="card"><p class="muted">Loading all listings…</p><div class="skel"></div><div class="skel s2"></div><div class="skel s3"></div></div></div>';
   if(!apiBase()){ $("#browse-list").innerHTML = emptyBox("All listings load from the live backend once it is connected."); return; }
   var base = [], status = "all";
   var uniq = function(vals){ var seen={}, out=[]; vals.forEach(function(v){ if(v && !seen[v]){ seen[v]=1; out.push(v); } }); return out.sort(); };
@@ -517,7 +515,7 @@ function screenOpportunityDetail(app, id){
     var o = d.opportunity || d;
     var el = $("#opp-detail"); if(!el) return;
     el.innerHTML = '<div class="card"><h2>'+esc(o.title||"Untitled opportunity")+'</h2>'
-      + '<p>'+verBadge(o)+(isExpired(o)?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+      + '<p class="pay-line">'+verBadge(o)+(isExpired(o)?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
       + '<dl class="kv">'
       + '<dt>Production</dt><dd>'+esc(o.production||"—")+'</dd>'
       + '<dt>Employer</dt><dd>'+esc(o.employer||"—")+'</dd>'
@@ -598,7 +596,7 @@ function screenJoin(app){
     app.innerHTML = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
       + '<h1 style="color:var(--gold)">WELCOME BACK</h1>'
       + '<p class="muted">You already have an account and you are signed in — no need to sign up again. Continue where you left off:</p>'
-      + '<div class="card"><p><a class="btn" href="#/join?step=2">Continue my profile — About you</a></p>'
+      + '<div class="card welcome-card"><p><a class="btn" href="#/join?step=2">Continue my profile — About you</a></p>'
       + '<p><a class="btn" href="#/join?step=3">Pick my categories</a></p>'
       + '<p><a class="btn btn-ghost" href="#/dashboard">Go to my dashboard</a></p></div>';
     return;

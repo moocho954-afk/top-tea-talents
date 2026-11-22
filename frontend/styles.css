@@ -23,19 +23,30 @@ label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 .wrap{max-width:1080px;margin:0 auto;padding:0 1rem}
 
 /* --- banners / top bar --- */
-.test-banner{background:var(--red);color:#fff;text-align:center;font-family:'Helvetica Neue',Arial,sans-serif;font-weight:700;letter-spacing:.04em;padding:.55rem .75rem;font-size:.85rem;position:sticky;top:0;z-index:60}
+/* v18 fix #2: the banner is NOT sticky any more. It used to be sticky top:0
+   with a higher z-index than the header, so on scroll it covered the whole
+   topbar. It now scrolls away; only the topbar sticks. */
+.test-banner{background:var(--red);color:#fff;text-align:center;font-family:'Helvetica Neue',Arial,sans-serif;font-weight:700;letter-spacing:.04em;padding:.55rem .75rem;font-size:.85rem}
 .api-banner{background:#3d2f05;color:#ffe9a8;text-align:center;padding:.55rem .75rem;font-size:.9rem;border-bottom:1px solid var(--gold-dark)}
-.topbar{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:1rem;background:rgba(14,13,11,.96);border-bottom:1px solid var(--gold-dark);padding:.6rem 1rem}
-.topbar-logo{font-size:1.15rem;font-weight:900;letter-spacing:.06em;color:var(--gold);text-decoration:none;white-space:nowrap}
+/* v18 fix #1/#5: the bar may wrap instead of clipping, has real right padding
+   and breathing room between actions, and the logo can shrink (min-width:0)
+   instead of forcing the row wider than the viewport. */
+.topbar{position:sticky;top:0;z-index:50;display:flex;align-items:center;flex-wrap:wrap;gap:1.25rem;background:rgba(14,13,11,.96);border-bottom:1px solid var(--gold-dark);padding:.6rem 1.25rem}
+.topbar-logo{font-size:1.15rem;font-weight:900;letter-spacing:.06em;color:var(--gold);text-decoration:none;white-space:nowrap;min-width:0}
+.topbar-nav{margin-left:auto;display:flex;align-items:center;gap:1.25rem}
+#auth-slot{display:flex;align-items:center;gap:.75rem}
+#auth-slot .btn,#auth-slot a{white-space:nowrap}
+/* v18 fix #1: mobile SIGN UP lives OUTSIDE the collapsing nav so it stays
+   visible on phones without ever covering the brand. Hidden on desktop. */
+.topbar .topbar-signup-mobile{display:none}
 .topbar-logo span{color:var(--white)}
-.topbar-nav{margin-left:auto;display:flex;align-items:center;gap:1rem}
 .topbar-nav a{color:var(--white);text-decoration:none;font-family:'Helvetica Neue',Arial,sans-serif;font-size:.92rem}
 .topbar-nav a:hover{color:var(--gold)}
 .nav-toggle{display:none;background:none;border:1px solid var(--line);border-radius:8px;color:var(--white);font-size:1.3rem;padding:.2rem .6rem;cursor:pointer;margin-left:auto}
 
 /* --- layout --- */
 .layout{display:flex;align-items:flex-start;max-width:1280px;margin:0 auto}
-.sidebar{width:230px;flex:0 0 230px;position:sticky;top:110px;padding:1rem .8rem;border-right:1px solid var(--line);min-height:60vh}
+.sidebar{width:230px;flex:0 0 230px;position:sticky;top:72px;padding:1rem .8rem;border-right:1px solid var(--line);min-height:60vh}
 .content{flex:1;min-width:0;padding:1.25rem 1.25rem 2rem}
 .nav-group{margin-bottom:.6rem}
 .nav-group-head{width:100%;background:var(--panel);border:1px solid var(--line);color:var(--gold);font-weight:700;text-align:left;padding:.55rem .7rem;border-radius:10px;cursor:pointer;display:flex;justify-content:space-between}
@@ -62,12 +73,16 @@ label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .hero-panel{background:linear-gradient(160deg,#1e1b17,#12100d);border:1px solid var(--gold-dark);border-radius:18px;padding:1.4rem;box-shadow:var(--shadow);transform:rotateX(2deg);max-width:860px;margin:1.6rem auto 0}
 .steps-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:.9rem;margin-top:.5rem}
-.step-tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:1rem .8rem;box-shadow:0 6px 16px rgba(0,0,0,.45);transform:perspective(600px) rotateX(2deg);transition:transform .15s,box-shadow .15s}
+.step-tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:1rem .8rem;box-shadow:0 6px 16px rgba(0,0,0,.45);transform:perspective(600px) rotateX(2deg);transition:transform .15s,box-shadow .15s;display:flex;flex-direction:column}
+.step-tile p{flex:1}
 .step-tile:hover{transform:perspective(600px) rotateX(0deg) translateY(-3px);box-shadow:0 12px 24px rgba(0,0,0,.6)}
 .step-icon{font-size:1.7rem;line-height:1}
 .step-tile h3{color:var(--gold);margin:.5rem 0 .25rem;font-size:1.05rem;letter-spacing:.06em}
 .step-tile p{margin:0;color:var(--white);font-size:.92rem}
-.trust-list{list-style:none;padding:0;margin:1.2rem auto 0;max-width:640px;text-align:left}
+/* v18 fix #7: dividers only run as wide as the longest checklist item
+   (inline-block shrinks to the text) and the list centers in the hero panel
+   instead of sitting right of center. */
+.trust-list{list-style:none;padding:0;margin:1.2rem auto 0;max-width:640px;text-align:left;display:inline-block}
 .trust-list li{padding:.3rem 0;border-bottom:1px solid #262219}
 .trust-list li::before{content:"\2713  ";color:var(--green);font-weight:700}
 
@@ -82,12 +97,22 @@ label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 .stat span{color:var(--gray);font-size:.9rem}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
 .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
-.opp-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:1rem;margin:.8rem 0;box-shadow:0 6px 16px rgba(0,0,0,.4)}
+/* v18 fix #3: opportunity lists are a 2-column grid on desktop so cards
+   fill the content width instead of one tall, half-empty column. */
+#preview-list,#opp-list,#browse-list{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+#preview-list .opp-card,#opp-list .opp-card,#browse-list .opp-card{margin:0}
+#preview-list .empty,#opp-list .empty,#browse-list .empty,#preview-list .card,#opp-list .card,#browse-list .card{grid-column:1/-1}
 .opp-card h3{margin:.2rem 0;color:var(--white)}
 .opp-card h3 a{color:var(--white);text-decoration:none}
 .opp-card h3 a:hover{color:var(--gold)}
 .meta{color:var(--gray);font-size:.9rem}
 .badge{display:inline-block;font-family:'Helvetica Neue',Arial,sans-serif;font-size:.75rem;font-weight:700;letter-spacing:.04em;padding:.15rem .5rem;border-radius:999px;border:1px solid;margin-left:.35rem;white-space:nowrap}
+.badge + .badge{margin-left:.4rem}
+/* v18 fix #4: pay + badges sit in a flex row with a real gap, so the badge
+   can never touch the pay text or another badge — it wraps to its own line
+   instead of running into the words. */
+.pay-line{display:flex;flex-wrap:wrap;gap:.35rem .5rem;align-items:center}
+.pay-line .badge{margin-left:0}
 .badge-verified{color:#7be3a8;border-color:var(--green);background:rgba(46,139,87,.15)}
 .badge-partial{color:#ffe9a8;border-color:var(--gold-dark);background:rgba(212,175,55,.12)}
 .badge-unverified{color:#ffb3a3;border-color:var(--red);background:rgba(192,57,43,.14)}
@@ -125,14 +150,18 @@ label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 table{width:100%;border-collapse:collapse;font-size:.95rem}
 th,td{text-align:left;padding:.55rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85rem;letter-spacing:.04em}
-.filters{display:flex;flex-wrap:wrap;gap:.6rem;align-items:end}
-.filters>div{flex:1 1 160px}
+/* v18 fix #6: every filter label sits directly above its control in one
+   consistent grid (was a wrapping flex row, so labels drifted off their
+   controls and the panel never stretched). */
+.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:.8rem;align-items:end;width:100%}
+.filters>div{flex:none;min-width:0}
 .filters label{margin-top:0}
 .actions-row{display:flex;flex-wrap:wrap;gap:.7rem;margin:1rem 0}
 .actions-row .btn{flex:1 1 200px}
 .kv{display:grid;grid-template-columns:150px 1fr;gap:.3rem .8rem}
 .kv dt{color:var(--gray)} .kv dd{margin:0}
 .footer{border-top:1px solid var(--line);margin-top:2rem;padding-top:1rem;color:var(--gray);font-size:.88rem}
+.footer p{margin:.35rem 0}
 .contract-box{background:#0e0d0b;border:1px solid var(--line);border-radius:10px;padding:1rem;max-height:320px;overflow:auto;white-space:pre-wrap;font-size:.92rem}
 .sig-input{font-family:cursive;font-size:1.3rem}
 .tabs{display:flex;flex-wrap:wrap;gap:.5rem;margin:1rem 0}
@@ -143,16 +172,43 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
 .agency-row{display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap}
 .agency-row .grow{flex:1;min-width:200px}
 
+/* v18 fix #3: the WELCOME BACK panel is a narrow card with full-width
+   buttons instead of a ~1000px card with three buttons lost in the corner. */
+.welcome-card{max-width:560px}
+.welcome-card .btn{display:block;width:100%}
+.sources-details{margin:.4rem 0;text-align:left}
+.sources-details summary{cursor:pointer;color:var(--gray);font-size:.85rem}
+.sources-details summary:hover{color:var(--gold)}
+/* v18 fix #6: skeleton rows replace the tall empty "Loading…" box. */
+.skel{height:12px;border-radius:6px;background:#26221a;margin:.6rem 0}
+.skel.s2{width:82%}
+.skel.s3{width:64%}
+
 /* --- mobile --- */
 @media (max-width:900px){
   .steps-grid{grid-template-columns:1fr 1fr}
   .grid-3{grid-template-columns:1fr 1fr}
   .photo-grid{grid-template-columns:repeat(2,1fr)}
+  .filters{grid-template-columns:repeat(2,1fr)}
 }
-@media (max-width:760px){
+/* v18 fix #1: the full nav (6 links + SIGN UP + auth) is ~700px wide, so it
+   already overflows below ~1100px — collapse it to the hamburger there, not
+   at 760. On collapsed widths the SIGN UP button lives outside the nav (see
+   .topbar-signup-mobile) and My Dashboard / Log out move into the dropdown. */
+@media (max-width:1100px){
   .topbar-nav{display:none}
   .topbar-nav.open{display:flex;position:absolute;top:100%;left:0;right:0;background:var(--panel);flex-direction:column;align-items:flex-start;padding:1rem;gap:.9rem;border-bottom:1px solid var(--gold-dark);z-index:55}
-  .nav-toggle{display:block}
+  .topbar-nav .topbar-signup{display:none}
+  .nav-toggle{display:block;margin-left:0}
+  .topbar .topbar-signup-mobile{display:inline-block;margin-left:auto}
+}
+@media (max-width:760px){
+  /* v18 fix #1: at phone width the bar holds logo + SIGN UP + hamburger only,
+     sized to fit 390px with room to spare — the gold button can never cover
+     the brand. */
+  .topbar{gap:.5rem;padding:.55rem .75rem}
+  .topbar-logo{font-size:1rem}
+  .topbar-signup-mobile{padding:.45rem .8rem;font-size:.85rem}
   .sidebar{position:fixed;top:0;left:0;bottom:0;width:min(82vw,300px);flex:none;z-index:70;background:var(--bg);border-right:1px solid var(--gold-dark);transform:translateX(-105%);transition:transform .2s;overflow:auto;padding-top:3rem}
   .sidebar.open{transform:none}
   .sidebar-close{display:block;position:absolute;top:.6rem;right:.8rem;background:none;border:0;color:var(--white);font-size:1.8rem;cursor:pointer}
@@ -167,11 +223,16 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
   .btn-gold-big{width:100%}
   .kv{grid-template-columns:1fr}
   .kv dt{margin-top:.5rem}
+  #preview-list,#opp-list,#browse-list{grid-template-columns:1fr}
+  .filters{grid-template-columns:1fr}
 }
 
 /* ---------- opening splash + brand mark (2.8D: layered shadows, gold gradients,
    subtle bevel — seems three-dimensional, stays crisp; body text stays flat) ---------- */
-.splash{position:fixed;inset:0;z-index:9999;background:radial-gradient(ellipse at 50% 42%, #221d10 0%, #0e0d0b 65%);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:opacity .6s ease}
+/* v18 fix #8: the splash gate is gone — the page shows content at once.
+   The markup stays in the DOM only because its SVG is the brand-mark source
+   the header, hero, and join screens clone. Never displayed. */
+.splash{display:none;position:fixed;inset:0;z-index:9999;background:radial-gradient(ellipse at 50% 42%, #221d10 0%, #0e0d0b 65%);align-items:center;justify-content:center;cursor:pointer;transition:opacity .6s ease}
 .splash-hide{opacity:0;pointer-events:none}
 .splash.hidden{display:none}
 .splash-inner{text-align:center;padding:1rem}
