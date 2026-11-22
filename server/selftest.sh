@@ -395,19 +395,60 @@ assert d["firstName"]=="Testy" and d["city"]=="Miami" and d["visibility"]=="publ
 print("public portfolio ok:", d["firstName"], d["city"], "credits:", len(d["credits"]))
 PYEOF
 
-# Social links: begin -> confirm -> photo -> bio-checked -> unlink
-curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","handle":"@testytalent"}' -o /tmp/ttt-body.json
+# v12–v14 social links: begin (code) -> confirm (signature, stays pending) ->
+# admin bio-check (authorizes) -> upload photo (traceable to own post) ->
+# pull request (unavailable, honest) -> pull callback -> public view ->
+# v13 demotion of a forged AUTHORIZED row -> unlink cascades by platform
+PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+check "social begin without own-account confirmation returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"platform\":\"instagram\",\"handle\":\"@testytalent\"}' | grep -q 400"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","handle":"@testytalent","ownAccountConfirmed":true}' -o /tmp/ttt-body.json
 SOC_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['socialLink']['id'])")
-check "social link begins PENDING" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='PENDING', d"
-curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"confirm"}' -o /tmp/ttt-body.json
-check "social link confirms to LINKED" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='LINKED', d"
-curl -sf -X POST "$BASE/talent/$TALENT_ID/social-photos" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","photoUrl":"https://example.com/photo1.jpg","caption":"Headshot preview"}' -o /tmp/ttt-body.json
+check "social link begins PENDING_VERIFICATION with an ownership code" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='PENDING_VERIFICATION', d; assert d['socialLink']['verificationStatus']=='code_issued', d; assert d['socialLink']['ownershipCode'].startswith('TTT-'), d"
+check "social confirm with wrong signature returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-links/$SOC_ID -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"action\":\"confirm\",\"signatureName\":\"Wrong Name\",\"agreed\":true,\"codeInBioConfirmed\":true}' | grep -q 400"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"confirm","signatureName":"Testy Talent","agreed":true,"codeInBioConfirmed":true}' -o /tmp/ttt-body.json
+check "social confirm signs but does NOT authorize (v13)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='PENDING_VERIFICATION', d; assert d['socialLink']['verificationStatus']=='check_pending', d"
+check "social photo before authorization returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-photos -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"platform\":\"instagram\",\"dataBase64\":\"'$PNG_B64'\",\"mimeType\":\"image/png\",\"sourcePostUrl\":\"https://instagram.com/p/abc123\"}' | grep -q 400"
+check "bio-check with wrong token returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-links/$SOC_ID -H 'Authorization: Bearer wrong-token' -H 'Content-Type: application/json' -d '{\"action\":\"bio-check\",\"outcome\":\"found\"}' | grep -q 401"
+check "bio-check with a talent token returns 401 (admin only)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-links/$SOC_ID -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"action\":\"bio-check\",\"outcome\":\"found\"}' | grep -q 401"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"action":"bio-check","outcome":"not_found","detail":"code not in bio"}' -o /tmp/ttt-body.json
+check "bio-check not_found keeps the link pending" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='PENDING_VERIFICATION' and d['socialLink']['verificationStatus']=='code_not_found', d"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"resend-bio-check"}' -o /tmp/ttt-body.json
+check "resend bio-check returns the link to check_pending" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['verificationStatus']=='check_pending', d"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"action":"bio-check","outcome":"found","detail":"code found in bio"}' -o /tmp/ttt-body.json
+check "bio-check found authorizes the account (code_confirmed)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='AUTHORIZED' and d['socialLink']['verificationStatus']=='code_confirmed' and d['socialLink']['bioChecked'] is True, d"
+check "social photo without a source post URL returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-photos -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"platform\":\"instagram\",\"dataBase64\":\"'$PNG_B64'\",\"mimeType\":\"image/png\"}' | grep -q 400"
+check "social photo with a bad mime type returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/social-photos -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"platform\":\"instagram\",\"dataBase64\":\"'$PNG_B64'\",\"mimeType\":\"image/gif\",\"sourcePostUrl\":\"https://instagram.com/p/abc123\"}' | grep -q 400"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-photos" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","dataBase64":"'$PNG_B64'","mimeType":"image/png","sourcePostUrl":"https://instagram.com/p/abc123","caption":"Headshot preview"}' -o /tmp/ttt-body.json
 SPH_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['socialPhoto']['id'])")
-curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"bio-checked","checked":true}' -o /tmp/ttt-body.json
-check "social photo added + bio-checked flag set" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['socialPhotos'])==1 and d['socialLinks'][0]['bioChecked'] is True, d\""
-curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-photos/$SPH_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
-curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
-check "social photo + link unlink cleanly" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLinks']==[] and d['socialPhotos']==[], d\""
+check "social photo uploads with traceable source post" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialPhoto']['source']=='upload', d; assert d['socialPhoto']['sourcePostUrl']=='https://instagram.com/p/abc123', d; assert d['socialPhoto']['photoUrl'].startswith('/api/v1/social-photos/'), d"
+curl -sf "$BASE/social-photos/$SPH_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-sph.png
+check "uploaded social photo bytes serve back (PNG)" bash -c "python3 -c \"import sys; b=open('/tmp/ttt-sph.png','rb').read(); assert b[:8]==b'\\\\x89PNG\\\\r\\\\n\\\\x1a\\\\n', b[:8]\""
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"request-photo-pull"}' -o /tmp/ttt-body.json
+check "photo pull request is honestly unavailable in the standalone (v14)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['requested'] is False and d['pullStatus']=='unavailable', d; assert 'agency app' in d['reason'], d"
+check "pull callback with wrong admin token returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/social-photo-pull-callback -H 'Authorization: Bearer wrong-token' -H 'Content-Type: application/json' -d '{\"talentId\":\"'$TALENT_ID'\",\"platform\":\"instagram\",\"outcome\":\"private\"}' | grep -q 401"
+curl -sf -X POST "$BASE/social-photo-pull-callback" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d "{\"talentId\":\"$TALENT_ID\",\"platform\":\"instagram\",\"outcome\":\"private\",\"detail\":\"profile is private\"}" -o /tmp/ttt-body.json
+check "pull callback private places nothing (v14)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['placed']==0 and d['pullStatus']=='private', d"
+curl -sf -X POST "$BASE/social-photo-pull-callback" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d "{\"talentId\":\"$TALENT_ID\",\"platform\":\"instagram\",\"outcome\":\"pulled\",\"detail\":\"visited public profile\",\"photos\":[{\"data_base64\":\"$PNG_B64\",\"mime_type\":\"image/png\",\"source_post_url\":\"https://instagram.com/p/pulled1\",\"selection\":\"first_three\",\"identity_verdict\":\"match\",\"identity_note\":\"face matches portfolio headshot\",\"likes_label\":\"1,204 likes\"},{\"data_base64\":\"$PNG_B64\",\"mime_type\":\"image/png\",\"source_post_url\":\"https://instagram.com/p/pulled2\",\"selection\":\"most_popular\",\"identity_verdict\":\"no_match\",\"identity_note\":\"different person\"}],\"rejectedCount\":1}" -o /tmp/ttt-body.json
+check "pull callback places only the identity match, rejects the rest (v14)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['placed']==1 and d['rejected']==2 and d['pullStatus']=='pulled', d"
+check "pulled photo shows as browser_pull with its selection" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['socialPhotos'])==2, d; p=[x for x in d['socialPhotos'] if x['source']=='browser_pull']; assert len(p)==1 and p[0]['identityVerdict']=='match' and p[0]['selection']=='first_three' and p[0]['likesLabel']=='1,204 likes', d; assert d['socialLinks'][0]['pullStatus']=='pulled' and d['socialLinks'][0]['pullRejectedCount']==2, d\""
+curl -sf "$BASE/public/talent/$TALENT_ID" -o /tmp/ttt-body.json
+check "public portfolio shows the AUTHORIZED link + both social photos" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['portfolio']; assert len(d['socialLinks'])==1 and d['socialLinks'][0]['bioChecked'] is True, d; assert len(d['socialPhotos'])==2, d; assert all('test@toptea.example' not in json.dumps(d) for _ in [0]), d"
+curl -sf "$BASE/public/social-photos/$SPH_ID" -o /tmp/ttt-sph-pub.png
+check "public social photo serves when portfolio is public + authorized" bash -c "python3 -c \"import sys; b=open('/tmp/ttt-sph-pub.png','rb').read(); assert b[:8]==b'\\\\x89PNG\\\\r\\\\n\\\\x1a\\\\n', b[:8]\""
+# v13 demotion: forge an inconsistent row directly in the DB (AUTHORIZED
+# with no confirmed code) and prove the read path demotes it to pending.
+python3 - "$DB" "$TALENT_ID" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("INSERT INTO social_links (id, talent_id, platform, handle, status, verification_status, ownership_code, bio_checked, created_at, updated_at) VALUES ('soc_forged', ?, 'facebook', '@forged', 'AUTHORIZED', '', NULL, 0, '2026-11-21T00:00:00.000Z', '2026-11-21T00:00:00.000Z')", (sys.argv[2],))
+db.commit()
+PYEOF
+check "v13: AUTHORIZED without a confirmed code reads as pending (demoted)" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); fb=[l for l in d['socialLinks'] if l['platform']=='facebook']; assert len(fb)==1 and fb[0]['status']=='PENDING_VERIFICATION' and fb[0]['verificationStatus']=='', fb\""
+curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-links/facebook" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "unlink facebook by platform removes the forged link" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['deleted'] is True and d['photosRemoved']==0, d"
+curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-links/instagram" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "unlink instagram removes the link + both preview photos at once" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['deleted'] is True and d['photosRemoved']==2, d"
+check "social links + photos are empty after unlink" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLinks']==[] and d['socialPhotos']==[], d\""
 
 # Inbound replies: admin records, talent reads
 curl -sf -X POST "$BASE/application-replies" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d "{\"applicationId\":\"$APP_ID\",\"fromName\":\"Project Casting\",\"channel\":\"email\",\"body\":\"We would like to invite Testy to an audition on Friday.\"}" -o /tmp/ttt-body.json
