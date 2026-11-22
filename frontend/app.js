@@ -1,0 +1,1342 @@
+/* Top Tea Talents — single-page app. Hash routing, API client, all screens.
+   Sections: (1) config + helpers, (2) API client, (3) auth/session,
+   (4) router, (5) shared UI bits, (6) screens, (7) join wizard,
+   (8) photos, (9) ledger / contacts / agencies, (10) init. */
+
+/* ---------- (1) config + helpers ---------- */
+var API = "";
+function apiBase(){
+  if (window.__TTT_API__) return String(window.__TTT_API__).replace(/\/+$/,"");
+  try { return (localStorage.getItem("ttt_api_url")||"").replace(/\/+$/,""); } catch(e){ return ""; }
+}
+function loadApiConfig(){
+  // api-config.js is written by the deploy workflow from repo var TTT_API_URL.
+  // It may not exist (front-end-only deploy) — a failed fetch is normal, not an error.
+  return fetch("api-config.js", {cache:"no-store"}).then(function(r){
+    if(!r.ok) return;
+    return r.text().then(function(t){
+      var m = t.match(/window\.__TTT_API__\s*=\s*"([^"]*)"/);
+      if(m) window.__TTT_API__ = m[1];
+    });
+  }).catch(function(){ /* no api-config.js — backend not configured */ });
+}
+function $(sel, root){ return (root||document).querySelector(sel); }
+function esc(s){
+  if(s===null||s===undefined) return "";
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+function money(cents){
+  if(cents===null||cents===undefined||cents==="") return "";
+  var n = Number(cents)/100;
+  if(isNaN(n)) return String(cents);
+  return "$" + n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+function fmtDate(s){
+  if(!s) return "";
+  var d = new Date(s);
+  if(isNaN(d.getTime())) return String(s);
+  return d.toLocaleDateString("en-US",{year:"numeric",month:"short",day:"numeric"});
+}
+function fmtDT(s){
+  if(!s) return "";
+  var d = new Date(s);
+  if(isNaN(d.getTime())) return String(s);
+  return d.toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"});
+}
+function payText(o){
+  var c = o.compensation || o.pay || o.compensation_text || "";
+  if(c) return esc(c);
+  return '<span class="muted">Pay not stated</span>';
+}
+function locText(o){
+  var l = o.location;
+  if(!l) return "";
+  if(typeof l === "string") return l;
+  return [l.city, l.county, l.state].filter(Boolean).join(", ");
+}
+function isExpired(o){
+  if(!o.deadline) return false;
+  var d = new Date(o.deadline);
+  return !isNaN(d.getTime()) && d < new Date(new Date().toDateString());
+}
+function verBadge(o){
+  var v = (o.verification_status||"").toUpperCase();
+  if(v==="VERIFIED") return '<span class="badge badge-verified">VERIFIED</span>';
+  if(v==="PARTIALLY_VERIFIED") return '<span class="badge badge-partial">PARTIALLY VERIFIED</span>';
+  if(v==="UNVERIFIED") return '<span class="badge badge-unverified">UNVERIFIED</span>';
+  return "";
+}
+/* Brand mark: the splash SVG is the single source — header, hero, and join
+   screens clone it. Crown on top (TOP), teacup (TEA), steam rising. */
+function brandMarkSVG(size){
+  var src = document.querySelector("#splash-mark svg");
+  if(!src) return "";
+  var c = src.cloneNode(true);
+  c.setAttribute("width", size); c.setAttribute("height", size);
+  return c.outerHTML;
+}
+function initSplash(){
+  var hm = $("#header-mark"); if(hm) hm.innerHTML = brandMarkSVG(30);
+  var s = $("#splash"); if(!s) return;
+  var hide = function(){
+    if(s.classList.contains("splash-hide")) return;
+    s.classList.add("splash-hide");
+    try{ sessionStorage.setItem("ttt_splash_seen","1"); }catch(e){}
+    setTimeout(function(){ s.classList.add("hidden"); }, 700);
+  };
+  var seen = false;
+  try{ seen = sessionStorage.getItem("ttt_splash_seen")==="1"; }catch(e){}
+  if(seen){ s.classList.add("splash-hide"); s.classList.add("hidden"); return; }
+  s.addEventListener("click", hide);
+  s.addEventListener("keydown", function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); hide(); } });
+  setTimeout(hide, 2400);
+}
+function emptyBox(msg){ return '<div class="empty">'+esc(msg)+'</div>'; }
+function errBox(msg){ return '<div class="error-box" role="alert">'+esc(msg)+'</div>'; }
+function okBox(msg){ return '<div class="success-box" role="status">'+esc(msg)+'</div>'; }
+function loadingBox(msg){ return '<div class="card"><p class="muted">'+esc(msg||"Loading…")+'</p></div>'; }
+function apiBanner(){
+  var b = $("#api-banner");
+  if(!b) return;
+  if(!apiBase()){
+    b.classList.remove("hidden");
+    b.textContent = "Backend not configured yet — showing site copy only. No live numbers until the API is connected.";
+  } else { b.classList.add("hidden"); b.textContent = ""; }
+}
+function qs(name){
+  var m = location.hash.match(new RegExp("[?&]"+name+"=([^&]*)"));
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+/* ---------- (2) API client ---------- */
+function api(path, opts){
+  opts = opts || {};
+  var base = apiBase();
+  if(!base) return Promise.reject(new Error("Backend not configured yet — set the API URL (TTT_API_URL) or localStorage ttt_api_url."));
+  var headers = {"Content-Type":"application/json"};
+  var tok = adminToken() || sessionToken();
+  if(tok) headers["Authorization"] = "Bearer " + tok;
+  return fetch(base + path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  }).then(function(r){
+    return r.text().then(function(t){
+      var data = null;
+      try { data = t ? JSON.parse(t) : null; } catch(e){ data = {raw:t}; }
+      if(!r.ok){
+        var msg = (data && (data.error || data.message)) || ("Request failed (" + r.status + ")");
+        throw new Error(msg);
+      }
+      return data;
+    });
+  });
+}
+function apiGet(path){ return api(path); }
+
+/* ---------- API field mapping: wizard/profile forms use snake_case keys; the API speaks camelCase. ---------- */
+var PROFILE_KEY_MAP = {first_name:"firstName", last_name:"lastName", professional_name:"professionalName", travel_radius:"travelRadius", age_range:"ageRange", hair_color:"hairColor", eye_color:"eyeColor"};
+function toApiProfile(d){
+  var b = {};
+  Object.keys(PROFILE_KEY_MAP).forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[PROFILE_KEY_MAP[k]]=d[k]; });
+  ["phone","city","state","zip","height","experience","availability","languages","skills","categories","adultOrMinor","minCompensation","unionAffiliation","clothing","clothingSizes","measurements","resume","demoReel","portfolioLinks","contactMethod","notifyEmail","notifySms","location","visibility","paused"].forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[k]=d[k]; });
+  if(d.gender!==undefined || d.ethnicity!==undefined){
+    b.demographics = {gender: d.gender||null, ethnicity: d.ethnicity||null};
+  }
+  return b;
+}
+/* Add snake_case aliases to a talent object returned by the API, so the UI's existing reads keep working. */
+function normTalent(t){
+  if(!t) return t;
+  Object.keys(PROFILE_KEY_MAP).forEach(function(k){ var ck = PROFILE_KEY_MAP[k]; if(t[ck]!==undefined && t[k]===undefined) t[k]=t[ck]; });
+  if(t.demographics){ if(t.gender===undefined) t.gender=t.demographics.gender; if(t.ethnicity===undefined) t.ethnicity=t.demographics.ethnicity; }
+  if(t.guardian){ if(t.guardian_name===undefined) t.guardian_name=t.guardian.guardianName||""; if(t.guardian_contact===undefined) t.guardian_contact=t.guardian.guardianEmail||t.guardian.guardianPhone||""; }
+  return t;
+}
+
+/* ---------- (3) auth / session ---------- */
+function sessionToken(){ try{ return localStorage.getItem("ttt_token")||""; }catch(e){ return ""; } }
+function sessionTalentId(){ try{ return localStorage.getItem("ttt_talent_id")||""; }catch(e){ return ""; } }
+function isLoggedIn(){ return !!sessionToken() && !!sessionTalentId(); }
+function isAdmin(){ try{ return !!localStorage.getItem("ttt_admin_token"); }catch(e){ return false; } }
+function adminToken(){ try{ return localStorage.getItem("ttt_admin_token")||""; }catch(e){ return ""; } }
+function logout(){
+  try{ localStorage.removeItem("ttt_token"); localStorage.removeItem("ttt_talent_id"); }catch(e){}
+  location.hash = "#/";
+  route();
+}
+function authSlotHtml(){
+  if(isLoggedIn()) return '<a href="#/dashboard">My Dashboard</a><button class="btn btn-ghost btn-sm" id="logout-btn" type="button">Log out</button>';
+  return '<a href="#/login">Log in</a>';
+}
+function bindAuthSlot(){
+  var s = $("#auth-slot"); if(!s) return;
+  s.innerHTML = authSlotHtml();
+  var b = $("#logout-btn");
+  if(b) b.addEventListener("click", logout);
+}
+function requireLogin(app, inner){
+  if(!isLoggedIn()){
+    app.innerHTML = '<div class="card"><h2>Log in first</h2><p>This page needs your talent account. <a href="#/login">Log in</a> or <a href="#/join">join Top Tea Talents</a>.</p></div>';
+    return false;
+  }
+  return true;
+}
+
+/* ---------- (4) router ---------- */
+var ROUTES = [
+  {re:/^#\/$/, fn:screenLanding},
+  {re:/^#\/join$/, fn:screenJoin},
+  {re:/^#\/login$/, fn:screenLogin},
+  {re:/^#\/dashboard$/, fn:screenDashboard},
+  {re:/^#\/opportunities$/, fn:screenOpportunities},
+  {re:/^#\/browse$/, fn:screenBrowse},
+  {re:/^#\/opportunity\/([^\/]+)$/, fn:screenOpportunityDetail},
+  {re:/^#\/portfolio$/, fn:screenPortfolio},
+  {re:/^#\/profile$/, fn:screenProfile},
+  {re:/^#\/fast-track$/, fn:screenFastTrack},
+  {re:/^#\/consent$/, fn:screenConsent},
+  {re:/^#\/matches$/, fn:screenMatches},
+  {re:/^#\/applications$/, fn:screenApplications},
+  {re:/^#\/bookings$/, fn:screenBookings},
+  {re:/^#\/notifications$/, fn:screenNotifications},
+  {re:/^#\/settings$/, fn:screenSettings},
+  {re:/^#\/compliance$/, fn:screenCompliance},
+  {re:/^#\/agency\/([^\/]+)$/, fn:screenAgencyHistory},
+  {re:/^#\/agency$/, fn:screenAgency},
+  {re:/^#\/ledger$/, fn:screenLedger},
+  {re:/^#\/contacts$/, fn:screenContacts}
+];
+function route(){
+  var app = $("#app");
+  if(!app) return;
+  apiBanner(); bindAuthSlot(); closeSidebar();
+  document.querySelectorAll(".nav-group-body a").forEach(function(a){
+    var h = a.getAttribute("href")||"";
+    a.classList.toggle("active", ("#"+location.hash.replace(/^#/,"")) === h || location.hash === h);
+  });
+  var hash = (location.hash || "#/").split("?")[0];
+  if(!hash) hash = "#/";
+  for(var i=0;i<ROUTES.length;i++){
+    var m = hash.match(ROUTES[i].re);
+    if(m){ ROUTES[i].fn(app, m[1]); window.scrollTo(0,0); return; }
+  }
+  app.innerHTML = '<div class="card"><h2>Page not found</h2><p>That page does not exist. <a href="#/">Back to the home page</a>.</p></div>';
+}
+
+/* ---------- (5) shared UI bits ---------- */
+function oppCard(o){
+  var exp = isExpired(o);
+  var src = o.source ? esc(o.source) : "";
+  var srcLink = o.source_url ? ' · <a href="'+esc(o.source_url)+'" target="_blank" rel="noopener">Original listing</a>' : "";
+  return '<article class="opp-card'+(exp?' expired':'')+'">'
+    + '<h3><a href="#/opportunity/'+encodeURIComponent(o.id)+'">'+esc(o.title||"Untitled opportunity")+'</a></h3>'
+    + '<p class="meta">'+esc(o.production||o.employer||o.casting_org||"")+(o.production&&o.employer?" · ":"")+esc(o.employer&&o.production?o.employer:"")+' · '+esc(locText(o))+'</p>'
+    + '<p><span class="pay">'+payText(o)+'</span> '+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+    + '<p class="meta">Category: '+esc(o.category||"—")+' · Deadline: '+esc(o.deadline?fmtDate(o.deadline):"Not stated")+'</p>'
+    + '<p class="meta">Source: '+src+srcLink+'</p>'
+    + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(o.id)+'">View details</a></p>'
+    + '</article>';
+}
+function actionButtons(){
+  return '<div class="actions-row">'
+    + '<a class="btn" href="#/portfolio">VIEW MY PORTFOLIO</a>'
+    + '<a class="btn btn-ghost" href="#/profile">EDIT MY PROFILE</a>'
+    + '<a class="btn btn-ghost" href="#/portfolio">UPLOAD PHOTOS</a>'
+    + '<a class="btn btn-ghost" href="#/profile">UPDATE AVAILABILITY</a>'
+    + '<a class="btn btn-ghost" href="#/opportunities">FIND OPPORTUNITIES</a>'
+    + '<a class="btn btn-ghost" href="#/fast-track">MANAGE MY PERMISSIONS</a>'
+    + '<a class="btn btn-ghost" href="#/applications">VIEW APPLICATIONS</a>'
+    + '<a class="btn btn-ghost" href="#/bookings">VIEW BOOKINGS</a>'
+    + '</div>';
+}
+function fetchJsonOrNull(p){ return apiGet(p).catch(function(){ return null; }); }
+function checkHealth(){
+  if(!apiBase()) return;
+  apiGet("/api/v1/health").then(function(h){
+    var b = $("#api-banner");
+    if(b && h && (h.status==="ok" || h.healthy)) { /* backend reachable; banner stays hidden */ }
+  }).catch(function(){
+    var b = $("#api-banner");
+    if(b){ b.classList.remove("hidden"); b.textContent = "Backend URL is set but the API did not answer its health check — live data is unavailable right now."; }
+  });
+}
+
+/* ---------- (6) screens: landing / login / opportunities ---------- */
+function screenLanding(app){
+  app.innerHTML =
+    '<section class="hero">'
+    + '<div class="brand-mark hero-mark">'+brandMarkSVG(96)+'</div>'
+    + '<h1 class="wordmark">TOP TEA<br><span>TALENTS</span></h1>'
+    + '<p class="hero-tag">Casting discovery, matching, and bookings — nationwide, South Florida first.</p>'
+    + '<a class="btn btn-gold btn-gold-big" href="#/join">SIGN UP</a>'
+    + '<div class="hero-panel"><div class="steps-grid">'
+    + '<div class="step-tile"><div class="step-icon">🔍</div><h3>FIND</h3><p>We hunt casting calls every day — boards, streamers, music videos, commercials.</p></div>'
+    + '<div class="step-tile"><div class="step-icon">🎯</div><h3>MATCH</h3><p>We match the right jobs to your look, skills, and location.</p></div>'
+    + '<div class="step-tile"><div class="step-icon">📤</div><h3>SUBMIT</h3><p>We send your profile to the best-paying fits first.</p></div>'
+    + '<div class="step-tile"><div class="step-icon">🎬</div><h3>BOOK</h3><p>You get the call, the details, and your pay.</p></div>'
+    + '</div>'
+    + '<ul class="trust-list"><li>Free to join.</li><li>You approve before anything is sent.</li><li>10–15% only when you book.</li></ul>'
+    + '</div></section>'
+    + '<section id="live-counts"><div class="stats-row">'
+    + '<div class="stat"><b data-stat="opportunities">—</b><span>opportunities found</span></div>'
+    + '<div class="stat"><b data-stat="south_florida">—</b><span>in South Florida</span></div>'
+    + '<div class="stat"><b data-stat="sources">—</b><span>sources checked</span></div>'
+    + '</div><p class="muted small" id="stats-note"></p><p class="muted small" id="sources-line"></p></section>'
+    + '<section class="card"><h2>South Florida</h2><p>South Florida first — Miami, Fort Lauderdale, and Palm Beach castings surface here before anywhere else.</p><p><a class="btn btn-ghost" href="#/opportunities?geography=south-florida">Browse South Florida</a></p></section>'
+    + '<section><h2 style="color:var(--gold)">Browse opportunities</h2><div id="preview-list">'+loadingBox("Loading opportunities…")+'</div>'
+    + '<p><a class="btn" href="#/opportunities">See all opportunities</a> <a class="btn btn-ghost" href="#/browse">Browse all listings</a></p></section>';
+  if(!apiBase()){
+    var note = $("#stats-note");
+    if(note) note.textContent = "Live counts appear here once the backend is connected. No numbers are shown until then.";
+    var pl = $("#preview-list");
+    if(pl) pl.innerHTML = emptyBox("Opportunities load from the live backend once it is connected. Nothing is listed yet.");
+    return;
+  }
+  apiGet("/api/v1/stats").then(function(s){
+    s = s||{};
+    var set = function(k,v){ var el=document.querySelector('[data-stat="'+k+'"]'); if(el) el.textContent=(v===null||v===undefined||v==="")?"—":v; };
+    set("opportunities", s.opportunityCount ?? s.opportunities ?? s.total_opportunities ?? s.count);
+    set("south_florida", s.southFlorida ?? s.south_florida ?? (s.by_geography && s.by_geography["south-florida"]));
+    set("sources", s.sourceCount ?? s.sources ?? s.source_count ?? (s.by_source && Object.keys(s.by_source).length));
+    apiGet("/api/v1/opportunities?geography=south-florida&limit=1").then(function(d){ set("south_florida", d.total ?? d.count); }).catch(function(){});
+    var n = $("#stats-note");
+    if(n && s.generated_at) n.textContent = "Counts from the live backend, updated " + fmtDT(s.generated_at) + ".";
+  }).catch(function(){
+    var n = $("#stats-note");
+    if(n) n.textContent = "Live counts are unavailable right now — the backend could not be reached. No numbers are shown until it responds.";
+  });
+  apiGet("/api/v1/sources").then(function(d){
+    var list = d.sources||d||[];
+    var el = $("#sources-line"); if(!el) return;
+    if(Array.isArray(list) && list.length) el.textContent = "Sources checked: " + list.map(function(s){ return s.name||s.id||s; }).join(", ") + ".";
+  }).catch(function(){});
+  apiGet("/api/v1/opportunities?limit=5").then(function(d){
+    var list = (d && (d.opportunities||d.items||d.data)) || [];
+    var pl = $("#preview-list"); if(!pl) return;
+    if(!list.length){ pl.innerHTML = emptyBox("No opportunities listed yet. Check back soon."); return; }
+    pl.innerHTML = list.map(oppCard).join("");
+  }).catch(function(){
+    var pl = $("#preview-list"); if(pl) pl.innerHTML = emptyBox("Opportunities could not be loaded — the backend is unreachable right now.");
+  });
+}
+
+function screenLogin(app){
+  app.innerHTML = '<div class="card"><h2>Log in</h2><div id="login-msg"></div>'
+    + '<form id="login-form"><label for="login-email">Email</label><input id="login-email" type="email" required autocomplete="email">'
+    + '<label for="login-password">Password</label><input id="login-password" type="password" required autocomplete="current-password">'
+    + '<p><button class="btn" type="submit">Log in</button></p></form>'
+    + '<p class="muted">No account yet? <a href="#/join">Join Top Tea Talents — it is free.</a></p></div>';
+  $("#login-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var msg = $("#login-msg");
+    api("/api/v1/auth/login", {method:"POST", body:{email:$("#login-email").value.trim(), password:$("#login-password").value}})
+      .then(function(d){
+        var tok = d.token || d.access_token || "";
+        var id = (d.talent && d.talent.id) || d.talentId || d.talent_id || d.id || "";
+        if(!tok || !id) throw new Error("Login succeeded but no session was returned.");
+        try{ localStorage.setItem("ttt_token", tok); localStorage.setItem("ttt_talent_id", id); }catch(err){}
+        location.hash = "#/dashboard"; route();
+      })
+      .catch(function(err){ msg.innerHTML = errBox(err.message); });
+  });
+}
+
+function screenOpportunities(app){
+  var geo = qs("geography") || "";
+  app.innerHTML = '<h1 style="color:var(--gold)">Opportunities</h1>'
+    + '<div class="card"><div class="filters">'
+    + '<div><label for="f-geo">Geography</label><select id="f-geo"><option value="">All</option><option value="south-florida">South Florida</option><option value="florida">Florida</option><option value="nationwide">Nationwide</option></select></div>'
+    + '<div><label for="f-cat">Category</label><select id="f-cat"><option value="">All</option><option>film-tv</option><option>commercial</option><option>modeling</option><option>music-video</option><option>extras</option><option>live-event</option><option>reality-tv</option><option>brand-activation</option><option>promo</option><option>specialty</option><option>corporate</option><option>advertising</option><option>featured-extras</option><option>paid-audience</option><option>other</option></select></div>'
+    + '<div><label for="f-ver">Verification</label><select id="f-ver"><option value="">All</option><option value="VERIFIED">Verified</option><option value="PARTIALLY_VERIFIED">Partially verified</option><option value="UNVERIFIED">Unverified</option></select></div>'
+    + '<div><label for="f-q">Search</label><input id="f-q" type="search" placeholder="Title, production, location…"></div>'
+    + '<div><label class="checkbox-row"><input id="f-exp" type="checkbox"> Hide expired</label></div>'
+    + '<div><button class="btn" id="f-apply" type="button">Apply filters</button></div>'
+    + '</div></div>'
+    + '<div id="opp-msg"></div><div id="opp-list">'+loadingBox("Loading opportunities…")+'</div>';
+  if(geo) $("#f-geo").value = geo;
+  var load = function(){
+    var p = new URLSearchParams();
+    var g=$("#f-geo").value, c=$("#f-cat").value, v=$("#f-ver").value, q=$("#f-q").value.trim();
+    if(g) p.set("geography", g);
+    if(c) p.set("category", c);
+    if(v) p.set("verification_status", v);
+    if(q) p.set("q", q);
+    p.set("include_expired","true");
+    if(!apiBase()){ $("#opp-list").innerHTML = emptyBox("Opportunities load from the live backend once it is connected."); return; }
+    apiGet("/api/v1/opportunities?"+p.toString()).then(function(d){
+      var list = (d && (d.opportunities||d.items||d.data)) || [];
+      var hideExp = $("#f-exp").checked;
+      var live = [], expired = [];
+      list.forEach(function(o){ (isExpired(o)?expired:live).push(o); });
+      if(hideExp) expired = [];
+      var out = live.concat(expired);
+      var el = $("#opp-list");
+      if(!out.length){ el.innerHTML = emptyBox("No opportunities match these filters yet."); return; }
+      el.innerHTML = '<p class="muted">'+out.length+' opportunit'+(out.length===1?'y':'ies')+(expired.length && !hideExp ? ' — expired listings are shown last, never as live.' : '')+'</p>' + out.map(oppCard).join("");
+    }).catch(function(err){ $("#opp-list").innerHTML = errBox(err.message); });
+  };
+  $("#f-apply").addEventListener("click", load);
+  load();
+}
+
+var PAY_TYPES = ["daily","flat","hourly","session","unpaid","undisclosed","expense-only","deferred","residual"];
+function browseCard(o){
+  var exp = o.expired===true ? true : isExpired(o);
+  var src = o.source ? esc(o.source) : "";
+  var srcLink = o.source_url ? ' · <a href="'+esc(o.source_url)+'" target="_blank" rel="noopener">Original listing</a>' : "";
+  return '<article class="opp-card'+(exp?' expired':'')+'">'
+    + '<h3><a href="#/opportunity/'+encodeURIComponent(o.id)+'">'+esc(o.title||"Untitled opportunity")+'</a></h3>'
+    + '<p class="meta">'+esc(o.production||o.employer||o.casting_org||"")+(o.production&&o.employer?" · ":"")+esc(o.employer&&o.production?o.employer:"")+' · '+esc(locText(o))+'</p>'
+    + '<p><span class="pay">'+payText(o)+'</span> '+verBadge(o)+(exp?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+    + '<p class="meta">Listed: '+esc(o.discovered_at?fmtDate(o.discovered_at):"Not stated")+' · Category: '+esc(o.category||"—")+' · Deadline: '+esc(o.deadline?fmtDate(o.deadline):"Not stated")+'</p>'
+    + '<p class="meta">Source: '+src+srcLink+'</p>'
+    + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(o.id)+'">View details</a></p>'
+    + '</article>';
+}
+/* Browse All Listings: one scrollable list of everything, newest first by
+   default, with the full filter set. Filtering is client-side over one fetch
+   of the whole set, so every control answers instantly. "Date listed" is
+   discovered_at — the date we found the listing (the source boards gave no
+   per-listing posted date). Expired rows are dimmed + badged, never live. */
+function screenBrowse(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Browse All Listings</h1>'
+    + '<p class="muted">Every listing, newest first. Expired listings are shown dimmed with an EXPIRED badge — never as live.</p>'
+    + '<div class="card"><div class="filters">'
+    + '<div><label for="b-geo">Geography</label><select id="b-geo"><option value="">All</option><option value="south-florida">South Florida</option><option value="florida">Florida</option><option value="nationwide">Nationwide</option></select></div>'
+    + '<div><label for="b-county">County</label><select id="b-county"><option value="">All counties</option></select></div>'
+    + '<div><label for="b-cat">Category</label><select id="b-cat"><option value="">All</option></select></div>'
+    + '<div><label for="b-pay">Pay type</label><select id="b-pay"><option value="">All</option>'+PAY_TYPES.map(function(p){return '<option value="'+p+'">'+p+'</option>';}).join("")+'</select></div>'
+    + '<div><label for="b-ver">Verification</label><select id="b-ver"><option value="">All</option><option value="VERIFIED">Verified</option><option value="PARTIALLY_VERIFIED">Partially verified</option><option value="UNVERIFIED">Unverified</option></select></div>'
+    + '<div><label for="b-src">Source</label><select id="b-src"><option value="">All sources</option></select></div>'
+    + '<div><label for="b-q">Keyword</label><input id="b-q" type="search" placeholder="Title, production, location…"></div>'
+    + '<div><label>Showing</label><div class="seg-toggle" id="b-status" role="group" aria-label="Live or expired"><button type="button" data-status="all" aria-pressed="true">All</button><button type="button" data-status="live" aria-pressed="false">Live</button><button type="button" data-status="expired" aria-pressed="false">Expired</button></div></div>'
+    + '<div><label for="b-sort">Sort by date</label><select id="b-sort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></div>'
+    + '</div></div>'
+    + '<div id="browse-count"></div><div id="browse-list">'+loadingBox("Loading all listings…")+'</div>';
+  if(!apiBase()){ $("#browse-list").innerHTML = emptyBox("All listings load from the live backend once it is connected."); return; }
+  var base = [], status = "all";
+  var uniq = function(vals){ var seen={}, out=[]; vals.forEach(function(v){ if(v && !seen[v]){ seen[v]=1; out.push(v); } }); return out.sort(); };
+  var fillSelect = function(id, vals, allLabel){
+    var el = $(id); if(!el) return;
+    el.innerHTML = '<option value="">'+esc(allLabel)+'</option>' + vals.map(function(v){ return '<option value="'+esc(v)+'">'+esc(v)+'</option>'; }).join("");
+  };
+  var apply = function(){
+    var g=$("#b-geo").value, county=$("#b-county").value, c=$("#b-cat").value,
+        pay=$("#b-pay").value, v=$("#b-ver").value, src=$("#b-src").value,
+        q=$("#b-q").value.trim().toLowerCase(), sort=$("#b-sort").value;
+    var list = base.filter(function(o){
+      if(g && o.geography!==g) return false;
+      if(county && !(o.location && o.location.county===county)) return false;
+      if(c && o.category!==c) return false;
+      if(pay && o.compensation_type!==pay) return false;
+      if(v && (o.verification_status||"").toUpperCase()!==v) return false;
+      if(src && o.source!==src) return false;
+      var exp = o.expired===true ? true : isExpired(o);
+      if(status==="live" && exp) return false;
+      if(status==="expired" && !exp) return false;
+      if(q){
+        var hay = [o.title,o.production,o.employer,o.casting_org,o.category,o.compensation,locText(o),(o.location&&o.location.raw)||""].join(" ").toLowerCase();
+        if(hay.indexOf(q)===-1) return false;
+      }
+      return true;
+    });
+    var byDesc = function(a,b){ return String(b.discovered_at||"").localeCompare(String(a.discovered_at||"")) || String(b.deadline||"").localeCompare(String(a.deadline||"")) || String(a.id).localeCompare(String(b.id)); };
+    var byAsc = function(a,b){ return String(a.discovered_at||"").localeCompare(String(b.discovered_at||"")) || String(a.deadline||"").localeCompare(String(b.deadline||"")) || String(a.id).localeCompare(String(b.id)); };
+    list.sort(sort==="oldest" ? byAsc : byDesc);
+    var liveN = base.filter(function(o){ return !(o.expired===true ? true : isExpired(o)); }).length;
+    var expN = base.length - liveN;
+    var cnt = $("#browse-count");
+    if(cnt) cnt.innerHTML = '<p class="muted">Showing '+list.length+' of '+base.length+' listings · '+liveN+' live · '+expN+' expired</p>';
+    var el = $("#browse-list");
+    if(!list.length){ el.innerHTML = emptyBox("No listings match these filters yet."); return; }
+    el.innerHTML = list.map(browseCard).join("");
+  };
+  apiGet("/api/v1/opportunities?include_expired=true&limit=500&sort=newest").then(function(d){
+    base = (d && (d.opportunities||d.items||d.data)) || [];
+    fillSelect("#b-county", uniq(base.map(function(o){ return o.location && o.location.county; })), "All counties");
+    fillSelect("#b-src", uniq(base.map(function(o){ return o.source; })), "All sources");
+    fillSelect("#b-cat", uniq(base.map(function(o){ return o.category; })), "All");
+    apply();
+  }).catch(function(err){ $("#browse-list").innerHTML = errBox(err.message); });
+  ["#b-geo","#b-county","#b-cat","#b-pay","#b-ver","#b-src","#b-sort"].forEach(function(id){
+    $(id).addEventListener("change", apply);
+  });
+  var qEl = $("#b-q"), deb = null;
+  qEl.addEventListener("input", function(){ clearTimeout(deb); deb = setTimeout(apply, 200); });
+  document.querySelectorAll("#b-status button").forEach(function(b){
+    b.addEventListener("click", function(){
+      status = b.getAttribute("data-status");
+      document.querySelectorAll("#b-status button").forEach(function(x){ x.setAttribute("aria-pressed", x===b ? "true" : "false"); });
+      apply();
+    });
+  });
+}
+
+function screenOpportunityDetail(app, id){
+  try{ id = decodeURIComponent(id); }catch(e){}
+  app.innerHTML = '<p><a href="#/opportunities">&larr; Back to opportunities</a></p><div id="opp-detail">'+loadingBox("Loading opportunity…")+'</div>';
+  if(!apiBase()){ $("#opp-detail").innerHTML = emptyBox("Opportunity details load from the live backend once it is connected."); return; }
+  apiGet("/api/v1/opportunities/"+encodeURIComponent(id)).then(function(d){
+    var o = d.opportunity || d;
+    var el = $("#opp-detail"); if(!el) return;
+    el.innerHTML = '<div class="card"><h2>'+esc(o.title||"Untitled opportunity")+'</h2>'
+      + '<p>'+verBadge(o)+(isExpired(o)?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+      + '<dl class="kv">'
+      + '<dt>Production</dt><dd>'+esc(o.production||"—")+'</dd>'
+      + '<dt>Employer</dt><dd>'+esc(o.employer||"—")+'</dd>'
+      + '<dt>Location</dt><dd>'+esc(locText(o))+'</dd>'
+      + '<dt>Pay</dt><dd><span class="pay">'+payText(o)+'</span></dd>'
+      + '<dt>Category</dt><dd>'+esc(o.category||"—")+'</dd>'
+      + '<dt>Deadline</dt><dd>'+esc(o.deadline?fmtDate(o.deadline):"Not stated")+'</dd>'
+      + '<dt>Production dates</dt><dd>'+esc(o.production_dates||"—")+'</dd>'
+      + '<dt>Source</dt><dd>'+esc(o.source||"—")+(o.source_url?' · <a href="'+esc(o.source_url)+'" target="_blank" rel="noopener">Original listing</a>':"")+'</dd>'
+      + '<dt>Verification notes</dt><dd>'+esc(o.verification_notes||"—")+'</dd>'
+      + '</dl>'
+      + (o.roles?'<h3>Roles</h3><p>'+esc(o.roles)+'</p>':"")
+      + (o.submission_instructions?'<h3>How to apply</h3><p>'+esc(o.submission_instructions)+'</p>':"")
+      + '<div id="match-box"></div>'
+      + '<div class="actions-row"><button class="btn" id="check-match" type="button">Check my match</button>'
+      + '<button class="btn btn-ghost" id="apply-btn" type="button">Apply (request approval)</button></div>'
+      + '<div id="apply-msg"></div>'
+      + '<p class="muted small">TEST MODE — submissions paused, nothing is sent live. Applying here records an application request for agency review; nothing leaves the platform.</p></div>';
+    $("#check-match").addEventListener("click", function(){
+      var box = $("#match-box");
+      if(!isLoggedIn()){ box.innerHTML = errBox("Log in or join first so we can check this opportunity against your profile."); return; }
+      box.innerHTML = '<p class="muted">Checking your match…</p>';
+      api("/api/v1/talent/"+encodeURIComponent(sessionTalentId())+"/match", {method:"POST", body:{}})
+        .then(function(r){
+          var list = r.matches||[];
+          var m = null;
+          list.forEach(function(x){ if((x.opportunityId||(x.opportunity&&x.opportunity.id))===o.id) m=x; });
+          if(!m){ box.innerHTML = emptyBox("No match found for this opportunity yet. Complete your profile and run matching again."); return; }
+          var reasons = Array.isArray(m.reasons) ? m.reasons.join(" · ") : (m.reason||m.explanation||"No reason returned.");
+          box.innerHTML = '<div class="notice-box"><strong>Match: '+esc(m.classification||"—")+'</strong><br>'+esc(reasons)+'</div>';
+        })
+        .catch(function(err){ box.innerHTML = errBox(err.message); });
+    });
+    $("#apply-btn").addEventListener("click", function(){
+      var msg = $("#apply-msg");
+      if(!isLoggedIn()){ msg.innerHTML = errBox("Log in or join first to apply."); return; }
+      api("/api/v1/applications", {method:"POST", body:{talentId:sessionTalentId(), opportunityId:o.id}})
+        .then(function(){ msg.innerHTML = okBox("Application request recorded. It is pending agency review — nothing has been sent to the employer yet (TEST MODE)."); })
+        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+    });
+  }).catch(function(err){ $("#opp-detail").innerHTML = errBox(err.message); });
+}
+
+/* ---------- (7) join wizard ---------- */
+var JOIN_STEPS = ["Account & contact","Personal & location","Demographics","Professional info","Portfolio","Fast-Track Authorization"];
+var PHOTO_SLOTS = ["MAIN HEADSHOT","FULL-BODY PHOTO","PROFESSIONAL PORTRAIT","CASUAL LOOK","ALTERNATE LOOK","PROFILE OR SIDE VIEW","ADDITIONAL PHOTO","ADDITIONAL PHOTO"];
+function joinDraft(){
+  try{ return JSON.parse(localStorage.getItem("ttt_join_draft")||"{}"); }catch(e){ return {}; }
+}
+function saveDraft(d){ try{ localStorage.setItem("ttt_join_draft", JSON.stringify(d)); }catch(e){} }
+function chipSet(id, values, selected, onPick){
+  var el = document.getElementById(id); if(!el) return;
+  el.innerHTML = values.map(function(v){
+    return '<button type="button" class="chip'+(selected.indexOf(v)>=0?" on":"")+'" data-v="'+esc(v)+'">'+esc(v)+'</button>';
+  }).join("");
+  el.querySelectorAll(".chip").forEach(function(c){
+    c.addEventListener("click", function(){
+      var v = c.getAttribute("data-v");
+      var i = selected.indexOf(v);
+      if(i>=0) selected.splice(i,1); else selected.push(v);
+      c.classList.toggle("on");
+      onPick(selected);
+    });
+  });
+}
+function screenJoin(app){
+  var d = joinDraft();
+  var step = parseInt(qs("step")||"1",10) || 1;
+  if(step<1||step>6) step=1;
+  d.availability = d.availability||[]; d.categories=d.categories||[]; d.skills=d.skills||[];
+  d.fast_track = d.fast_track||{A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
+  var html = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
+    + '<h1 style="color:var(--gold)">YOUR NEXT OPPORTUNITY STARTS HERE</h1>'
+    + '<p class="progress-label">Step '+step+' of 6 — '+esc(JOIN_STEPS[step-1])+'</p>'
+    + '<div class="progress" aria-label="Join progress">'+JOIN_STEPS.map(function(_,i){
+        return '<i class="'+(i+1<step?'done':(i+1===step?'now':''))+'"></i>';
+      }).join("")+'</div>'
+    + '<div class="card"><div id="join-msg"></div><form id="join-form">';
+  if(step===1){
+    html += '<label>First name<input name="first_name" required value="'+esc(d.first_name||"")+'"></label>'
+      + '<div class="form-row"><div><label>Last name<input name="last_name" required value="'+esc(d.last_name||"")+'"></label></div>'
+      + '<div><label>Professional name<input name="professional_name" value="'+esc(d.professional_name||"")+'"></label></div></div>'
+      + '<label>Email<input name="email" type="email" required value="'+esc(d.email||"")+'"></label>'
+      + '<label>Phone<input name="phone" type="tel" required value="'+esc(d.phone||"")+'"></label>'
+      + '<label>Password<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>'
+      + '<label class="checkbox-row"><input name="terms" type="checkbox" required> <span>I agree to the terms and the likeness-release process. I understand nothing is sent to an employer without my approval.</span></label>';
+  } else if(step===2){
+    html += '<label>Height<input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
+      + '<div class="form-row"><div><label>City<input name="city" value="'+esc(d.city||"")+'"></label></div>'
+      + '<div><label>State<input name="state" value="'+esc(d.state||"")+'"></label></div></div>'
+      + '<label>ZIP<input name="zip" value="'+esc(d.zip||"")+'"></label>'
+      + '<label>Travel radius (miles)<input name="travel_radius" type="number" min="0" value="'+esc(d.travel_radius||"")+'"></label>'
+      + '<label>Availability</label><div class="chip-set" id="avail-set"></div>';
+  } else if(step===3){
+    html += '<p class="muted">Optional. Demographics are <strong>never used as a match score</strong> — they only help describe roles you may fit, and you can skip any of them.</p>'
+      + '<label>Age range<select name="age_range"><option value="">Prefer not to say</option><option>18–24</option><option>25–34</option><option>35–44</option><option>45–54</option><option>55+</option></select></label>'
+      + '<label>Gender<select name="gender"><option value="">Prefer not to say</option><option>Female</option><option>Male</option><option>Non-binary</option><option>Other</option></select></label>'
+      + '<label>Ethnicity<select name="ethnicity"><option value="">Prefer not to say</option><option>Black / African American</option><option>Hispanic / Latino</option><option>White</option><option>Asian</option><option>Other</option><option>Two or more</option></select></label>'
+      + '<label>Hair color<input name="hair_color" value="'+esc(d.hair_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
+      + '<label>Eye color<input name="eye_color" value="'+esc(d.eye_color||"")+'" placeholder="Prefer not to say — leave blank"></label>';
+  } else if(step===4){
+    html += '<label>Categories</label><div class="chip-set" id="cat-set"></div>'
+      + '<label>Skills (comma separated)<input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>'
+      + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
+      + '<label>Experience<textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>';
+  } else if(step===5){
+    html += '<p>Upload up to 8 photos. JPG, PNG, or WEBP only. Photos are downscaled in your browser to a maximum of 1200px (JPEG, quality 0.82) before upload.</p>'
+      + '<p><strong id="photo-count">0 OF 8 PHOTOS</strong></p><div class="photo-grid" id="join-photo-grid"></div>'
+      + '<p class="muted small">Photos can also be added later from your portfolio. You can continue without photos and add them after.</p>';
+  } else {
+    html += '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning it ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time. You can change this any time in Fast-Track settings.</p>'
+      + '<div id="ft-controls"></div>';
+  }
+  html += '<div class="actions-row">'
+    + (step>1?'<button class="btn btn-ghost" type="button" id="join-back">Back</button>':"")
+    + (step<6?'<button class="btn" type="submit">Save &amp; continue</button>':'<button class="btn" type="submit">Finish — create my account</button>')
+    + '</div></form></div>'
+    + '<p class="muted small">Your answers save automatically on this device as you go. If you are logged in, changes also save to your profile.</p>';
+  app.innerHTML = html;
+
+  if(step===2) chipSet("avail-set", ["Weekdays","Weekends","Mornings","Afternoons","Evenings","Nights","On call"], d.availability, function(v){ d.availability=v; saveDraft(d); });
+  if(step===4) chipSet("cat-set", ["film-tv","commercial","modeling","music-video","extras","live-event","reality-tv","brand-activation","promo","specialty"], d.categories, function(v){ d.categories=v; saveDraft(d); });
+  if(step===5) renderJoinPhotos(d);
+  if(step===6) renderFastTrackControls($("#ft-controls"), d.fast_track, function(k,v){ d.fast_track[k]=v; saveDraft(d); });
+
+  var back = $("#join-back");
+  if(back) back.addEventListener("click", function(){ location.hash = "#/join?step="+(step-1); route(); });
+  $("#join-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var fd = new FormData(e.target);
+    ["first_name","last_name","professional_name","email","phone","password","height","city","state","zip","travel_radius","age_range","gender","ethnicity","hair_color","eye_color","experience"].forEach(function(k){
+      if(fd.get(k)!==null && fd.get(k)!=="") d[k]=fd.get(k);
+    });
+    if(fd.get("skills_text")!==null) d.skills = String(fd.get("skills_text")||"").split(",").map(function(s){return s.trim();}).filter(Boolean);
+    if(fd.get("languages_text")!==null) d.languages = String(fd.get("languages_text")||"").split(",").map(function(s){return s.trim();}).filter(Boolean);
+    saveDraft(d);
+    var msg = $("#join-msg");
+    if(step===1){
+      if(!apiBase()){ msg.innerHTML = errBox("The backend is not configured yet, so the account cannot be created right now. Your answers are saved on this device."); return; }
+      api("/api/v1/auth/register", {method:"POST", body:{email:d.email, password:d.password, firstName:d.first_name, lastName:d.last_name, professionalName:d.professional_name, phone:d.phone, termsAccepted:true}})
+        .then(function(r){
+          var tok = r.token||r.access_token||"", id=(r.talent&&r.talent.id)||r.talentId||r.talent_id||r.id||"";
+          if(tok&&id){ try{ localStorage.setItem("ttt_token",tok); localStorage.setItem("ttt_talent_id",id); }catch(err){} }
+          location.hash = "#/join?step=2"; route();
+        })
+        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+      return;
+    }
+    if(step<6){
+      if(isLoggedIn()){
+        api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d)})
+          .then(function(){ location.hash = "#/join?step="+(step+1); route(); })
+          .catch(function(err){ msg.innerHTML = errBox(err.message + " — your answers are still saved on this device."); });
+      } else { location.hash = "#/join?step="+(step+1); route(); }
+      return;
+    }
+    // step 6 finish
+    if(isLoggedIn()){
+      api("/api/v1/talent/"+encodeURIComponent(sessionTalentId())+"/fast-track", {method:"POST", body:{controls:d.fast_track}})
+        .then(function(){ try{ localStorage.removeItem("ttt_join_draft"); }catch(err){} location.hash = "#/consent"; route(); })
+        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+    } else {
+      msg.innerHTML = okBox("Fast-Track choices saved on this device. Create your account (step 1) to finish, then review the likeness release.");
+      setTimeout(function(){ location.hash = "#/consent"; route(); }, 1200);
+    }
+  });
+}
+function renderJoinPhotos(d){
+  var grid = $("#join-photo-grid"); if(!grid) return;
+  d.photos = d.photos||[];
+  var count = $("#photo-count"); if(count) count.textContent = d.photos.length + " OF 8 PHOTOS";
+  grid.innerHTML = PHOTO_SLOTS.map(function(label,i){
+    var p = d.photos[i];
+    var inner = p
+      ? '<img src="'+esc(p.dataUrl)+'" alt="'+esc(label)+'"><p class="primary-tag">'+(i===0?"PRIMARY":"")+'</p><p class="small">'+esc(p.caption||"")+'</p>'
+        + '<div class="slot-actions"><button type="button" class="mini-btn" data-act="replace" data-i="'+i+'">Replace</button><button type="button" class="mini-btn" data-act="del" data-i="'+i+'">Delete</button></div>'
+      : '<p class="slot-label">'+esc(label)+'</p><p class="muted small">Empty slot</p><div class="slot-actions"><button type="button" class="mini-btn" data-act="add" data-i="'+i+'">Upload</button></div>';
+    return '<div class="photo-slot">'+inner+'<input type="file" accept="image/jpeg,image/png,image/webp" class="hidden" data-file="'+i+'"></div>';
+  }).join("");
+  grid.querySelectorAll("[data-act]").forEach(function(b){
+    b.addEventListener("click", function(){
+      var i = parseInt(b.getAttribute("data-i"),10);
+      var act = b.getAttribute("data-act");
+      if(act==="del"){ d.photos.splice(i,1); saveDraft(d); renderJoinPhotos(d); return; }
+      var inp = grid.querySelector('[data-file="'+i+'"]');
+      inp.onchange = function(){
+        var f = inp.files[0]; if(!f) return;
+        downscalePhoto(f, function(dataUrl, err){
+          if(err){ alert(err); return; }
+          if(act==="add") d.photos.push({dataUrl:dataUrl, caption:PHOTO_SLOTS[i]});
+          else d.photos[i] = {dataUrl:dataUrl, caption:PHOTO_SLOTS[i]};
+          saveDraft(d); renderJoinPhotos(d);
+        });
+      };
+      inp.click();
+    });
+  });
+}
+var FT_DEFS = [
+  ["A","Auto-submit to matches","When ON, the agency may submit your profile automatically to opportunities that fit your rules, without asking you first. OFF means you approve every submission."],
+  ["B","Only verified listings","Only auto-submit to listings marked verified or partially verified."],
+  ["C","Minimum pay rule","Only auto-submit when the stated pay meets your minimum."],
+  ["D","Maximum travel distance","Only auto-submit within the travel radius on your profile."],
+  ["E","Category limits","Only auto-submit for the categories you selected."],
+  ["F","Require approval for unpaid work","Never auto-submit to a listing with no stated pay."],
+  ["G","Notify me before each submit","Send an in-app notification before any automatic submission."],
+  ["H","Pause auto-submit","Temporarily stop all automatic submissions. (TEST MODE: submissions are paused platform-wide anyway.)"]
+];
+function renderFastTrackControls(el, state, onChange){
+  if(!el) return;
+  el.innerHTML = FT_DEFS.map(function(def){
+    var k=def[0];
+    return '<label class="checkbox-row"><input type="checkbox" data-ft="'+k+'"'+(state[k]?" checked":"")+'><span><strong>'+k+' — '+esc(def[1])+'</strong><br><span class="muted">'+esc(def[2])+'</span></span></label>';
+  }).join("");
+  el.querySelectorAll("[data-ft]").forEach(function(c){
+    c.addEventListener("change", function(){ onChange(c.getAttribute("data-ft"), c.checked); });
+  });
+}
+
+/* ---------- (8) dashboard / portfolio / profile / fast-track / consent ---------- */
+function completionPct(t){
+  if(!t) return 0;
+  var fields = ["first_name","last_name","email","phone","city","state","height","experience"];
+  var have = fields.filter(function(f){ return t[f]; }).length;
+  var pct = Math.round((have/fields.length)*70);
+  if((t.photos||[]).length>0) pct += Math.min(30, (t.photos||[]).length*5);
+  return Math.min(100, pct);
+}
+function screenDashboard(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Command Center</h1><div id="dash">'+loadingBox("Loading your dashboard…")+'</div>' + actionButtons();
+  Promise.all([
+    fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)),
+    fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/photos"),
+    fetchJsonOrNull("/api/v1/applications?talentId="+encodeURIComponent(id)),
+    fetchJsonOrNull("/api/v1/bookings?talentId="+encodeURIComponent(id)),
+    fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/notifications"),
+    fetchJsonOrNull("/api/v1/agencies")
+  ]).then(function(res){
+    var t = normTalent((res[0]&&(res[0].talent||res[0]))||{});
+    var photos = (res[1]&&(res[1].photos||res[1]))||[];
+    var apps = (res[2]&&(res[2].applications||res[2]))||[];
+    var books = (res[3]&&(res[3].bookings||res[3]))||[];
+    var notifs = (res[4]&&(res[4].notifications||res[4]))||[];
+    var agencies = (res[5]&&(res[5].agencies||res[5]))||[];
+    var pct = (typeof t.completion === "number") ? t.completion : completionPct(t);
+    var pending = apps.filter(function(a){ return (a.status||"").toLowerCase().indexOf("pend")>=0; }).length;
+    var unread = notifs.filter(function(n){ return !n.read && !n.read_at; }).length;
+    var el = $("#dash"); if(!el) return;
+    el.innerHTML = '<div class="card"><h2>Welcome, '+esc(t.professional_name||t.first_name||"talent")+'</h2>'
+      + '<p>Profile completion: <strong>'+pct+'%</strong> · Photos: <strong>'+photos.length+' of 8</strong> · Readiness: <strong>'+esc(t.readiness_status||t.status||(pct>=80?"Ready":"In progress"))+'</strong></p>'
+      + '<div class="stats-row"><div class="stat"><b>'+apps.length+'</b><span>applications</span></div>'
+      + '<div class="stat"><b>'+pending+'</b><span>pending approvals</span></div>'
+      + '<div class="stat"><b>'+books.length+'</b><span>bookings</span></div></div>'
+      + '<p class="muted">Auditions and callbacks appear here once the agency records them. Notifications: '+unread+' unread.</p></div>'
+      + '<div class="card"><h3>Matching opportunities</h3><div id="dash-matches"><p class="muted">Run a match to see your current fits.</p><p><a class="btn btn-ghost btn-sm" href="#/matches">Run matching</a></p></div></div>'
+      + '<div class="card" id="dash-agencies"><h3>Top Repeat Agencies</h3><div id="dash-agency-list"><p class="muted">Loading agency board…</p></div><p><a href="#/agency">Open the full Agency Network board &rarr;</a></p></div>';
+    renderTopRepeatWidget($("#dash-agency-list"), agencies);
+  }).catch(function(err){ $("#dash").innerHTML = errBox(err.message); });
+}
+
+function screenPortfolio(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">My Portfolio</h1><div id="pf-msg"></div><p><strong id="pf-count">0 OF 8 PHOTOS</strong></p>'
+    + '<div class="photo-grid" id="pf-grid">'+loadingBox("Loading photos…")+'</div>'
+    + '<p class="muted small">JPG, PNG, or WEBP only. Each photo is downscaled in your browser to max 1200px (JPEG, quality 0.82) before upload.</p>';
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/photos").then(function(d){
+      var photos = d.photos||d||[];
+      var grid = $("#pf-grid"); if(!grid) return;
+      $("#pf-count").textContent = photos.length + " OF 8 PHOTOS";
+      var slots = PHOTO_SLOTS.map(function(label,i){
+        var p = photos[i];
+        if(!p) return '<div class="photo-slot"><p class="slot-label">'+esc(label)+'</p><p class="muted small">Empty slot</p><div class="slot-actions"><button type="button" class="mini-btn" data-add="'+i+'">Upload</button></div><input type="file" accept="image/jpeg,image/png,image/webp" class="hidden" data-file="'+i+'"></div>';
+        var imgSrc = p.url ? (apiBase() + p.url) : (p.dataUrl||"");
+        return '<div class="photo-slot"><img src="'+esc(imgSrc)+'" alt="'+esc(p.caption||label)+'">'
+          + '<p class="primary-tag">'+(p.isPrimary||p.is_primary||i===0?"PRIMARY":"")+'</p><p class="small">'+esc(p.caption||label)+'</p>'
+          + '<div class="slot-actions"><button type="button" class="mini-btn" data-primary="'+p.id+'">Make primary</button><button type="button" class="mini-btn" data-del="'+p.id+'">Delete</button></div></div>';
+      }).join("");
+      grid.innerHTML = slots;
+      grid.querySelectorAll("[data-add]").forEach(function(b){
+        b.addEventListener("click", function(){
+          var inp = grid.querySelector('[data-file="'+b.getAttribute("data-add")+'"]');
+          inp.onchange = function(){
+            var f = inp.files[0]; if(!f) return;
+            uploadPhoto(id, parseInt(b.getAttribute("data-add"),10)+1, f, PHOTO_SLOTS[parseInt(b.getAttribute("data-add"),10)], function(err){
+              if(err) $("#pf-msg").innerHTML = errBox(err);
+              else { $("#pf-msg").innerHTML = okBox("Photo uploaded."); load(); }
+            });
+          };
+          inp.click();
+        });
+      });
+      grid.querySelectorAll("[data-del]").forEach(function(b){
+        b.addEventListener("click", function(){
+          if(!confirm("Delete this photo?")) return;
+          api("/api/v1/photos/"+encodeURIComponent(b.getAttribute("data-del")), {method:"DELETE"})
+            .then(function(){ load(); }).catch(function(err){ $("#pf-msg").innerHTML = errBox(err.message); });
+        });
+      });
+      grid.querySelectorAll("[data-primary]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/photos/"+encodeURIComponent(b.getAttribute("data-primary")), {method:"PATCH", body:{isPrimary:true}})
+            .then(function(){ load(); }).catch(function(err){ $("#pf-msg").innerHTML = errBox(err.message); });
+        });
+      });
+    }).catch(function(err){ $("#pf-grid").innerHTML = errBox(err.message); });
+  };
+  load();
+}
+
+function screenProfile(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Edit My Profile</h1><div class="card"><div id="prof-msg"></div><div id="prof-form-wrap">'+loadingBox("Loading profile…")+'</div></div>';
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)).then(function(d){
+    var t = normTalent(d.talent||d);
+    var w = $("#prof-form-wrap"); if(!w) return;
+    w.innerHTML = '<form id="prof-form">'
+      + '<div class="form-row"><div><label>First name<input name="first_name" value="'+esc(t.first_name||"")+'"></label></div><div><label>Last name<input name="last_name" value="'+esc(t.last_name||"")+'"></label></div></div>'
+      + '<label>Professional name<input name="professional_name" value="'+esc(t.professional_name||"")+'"></label>'
+      + '<label>Email<input name="email" type="email" value="'+esc(t.email||"")+'"></label>'
+      + '<label>Phone<input name="phone" type="tel" value="'+esc(t.phone||"")+'"></label>'
+      + '<label>Height<input name="height" value="'+esc(t.height||"")+'"></label>'
+      + '<div class="form-row"><div><label>City<input name="city" value="'+esc(t.city||"")+'"></label></div><div><label>State<input name="state" value="'+esc(t.state||"")+'"></label></div></div>'
+      + '<label>ZIP<input name="zip" value="'+esc(t.zip||"")+'"></label>'
+      + '<label>Travel radius (miles)<input name="travel_radius" type="number" value="'+esc(t.travel_radius||"")+'"></label>'
+      + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((t.languages||[]).join(", "))+'"></label>'
+      + '<label>Experience<textarea name="experience" rows="4">'+esc(t.experience||"")+'</textarea></label>'
+      + '<p><button class="btn" type="submit">Save profile</button></p></form>'
+      + '<hr style="border-color:var(--line)"><h3>Guardian (for talent under 18)</h3><p class="muted small">If the talent is a minor, a parent or guardian must be on file.</p>'
+      + '<form id="guardian-form"><label>Guardian name<input id="guardian-name" value="'+esc(t.guardian_name||"")+'"></label>'
+      + '<label>Guardian email<input id="guardian-email" type="email" value="'+esc((t.guardian&&t.guardian.guardianEmail)||"")+'"></label>'
+      + '<label>Guardian phone<input id="guardian-phone" type="tel" value="'+esc((t.guardian&&t.guardian.guardianPhone)||"")+'"></label>'
+      + '<label>Relationship<input id="guardian-relationship" value="'+esc((t.guardian&&t.guardian.relationship)||"")+'" placeholder="Mother, father, legal guardian…"></label>'
+      + '<label class="checkbox-row"><input type="checkbox" id="guardian-consent"'+((t.guardian&&t.guardian.consentGiven)?" checked":"")+'> <span>Guardian consents to representation and submissions for this minor.</span></label>'
+      + '<p><button class="btn btn-ghost" type="submit">Save guardian</button></p></form><div id="guardian-msg"></div>'
+      + '<hr style="border-color:var(--line)"><h3>My audit trail</h3><p class="muted small">Every change to your record, from the ledger.</p><div id="audit-box"><p class="muted">Loading…</p></div>'
+      + '<hr style="border-color:var(--line)"><h3>Delete my account</h3><p class="muted small">Deleting removes your talent record. This cannot be undone.</p><p><button class="btn btn-danger" id="del-acct" type="button">Delete my account</button></p>';
+    $("#prof-form").addEventListener("submit", function(e){
+      e.preventDefault();
+      var body = {};
+      new FormData(e.target).forEach(function(v,k){ body[k]=v; });
+      if(body.languages_text!==undefined){ body.languages = String(body.languages_text||"").split(",").map(function(s){return s.trim();}).filter(Boolean); delete body.languages_text; }
+      api("/api/v1/talent/"+encodeURIComponent(id), {method:"PATCH", body:toApiProfile(body)})
+        .then(function(){ $("#prof-msg").innerHTML = okBox("Profile saved."); })
+        .catch(function(err){ $("#prof-msg").innerHTML = errBox(err.message); });
+    });
+    $("#del-acct").addEventListener("click", function(){
+      if(!confirm("Delete your account permanently?")) return;
+      api("/api/v1/talent/"+encodeURIComponent(id), {method:"DELETE"})
+        .then(function(){ logout(); }).catch(function(err){ $("#prof-msg").innerHTML = errBox(err.message); });
+    });
+    $("#guardian-form").addEventListener("submit", function(e){
+      e.preventDefault();
+      api("/api/v1/talent/"+encodeURIComponent(id)+"/guardian", {method:"POST", body:{guardianName:$("#guardian-name").value.trim(), guardianEmail:$("#guardian-email").value.trim(), guardianPhone:$("#guardian-phone").value.trim(), relationship:$("#guardian-relationship").value.trim(), consentGiven:$("#guardian-consent").checked}})
+        .then(function(){ $("#guardian-msg").innerHTML = okBox("Guardian saved."); })
+        .catch(function(err){ $("#guardian-msg").innerHTML = errBox(err.message); });
+    });
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/audit").then(function(d){
+      var evs = d.events||d.audit||d||[];
+      var box = $("#audit-box"); if(!box) return;
+      if(!Array.isArray(evs)||!evs.length){ box.innerHTML = emptyBox("No audit events recorded yet."); return; }
+      box.innerHTML = '<table><thead><tr><th>Time</th><th>Event</th><th>Actor</th></tr></thead><tbody>'
+        + evs.map(function(ev){ return '<tr><td>'+esc(fmtDT(ev.ts||ev.created_at))+'</td><td>'+esc(ev.event_type||ev.type||"")+'</td><td>'+esc(ev.actor||"")+'</td></tr>'; }).join("")+'</tbody></table>';
+    }).catch(function(){ var b=$("#audit-box"); if(b) b.innerHTML = emptyBox("Audit trail unavailable right now."); });
+  }).catch(function(err){ $("#prof-form-wrap").innerHTML = errBox(err.message); });
+}
+
+function screenFastTrack(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Fast-Track Permissions</h1><div class="card"><div id="ft-msg"></div>'
+    + '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning control A ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time.</p>'
+    + '<div id="ft-controls">Loading…</div><p><button class="btn" id="ft-save" type="button">Save permissions</button></p></div>';
+  var state = {A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/fast-track").then(function(d){
+    var cur = (d.fastTrack&&d.fastTrack.controls)||d.fast_track||d.controls||{};
+    Object.keys(state).forEach(function(k){ if(cur[k]!==undefined) state[k]=!!cur[k]; });
+    renderFastTrackControls($("#ft-controls"), state, function(k,v){ state[k]=v; });
+  }).catch(function(){ renderFastTrackControls($("#ft-controls"), state, function(k,v){ state[k]=v; }); });
+  $("#ft-save").addEventListener("click", function(){
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/fast-track", {method:"POST", body:{controls:state}})
+      .then(function(){ $("#ft-msg").innerHTML = okBox("Fast-Track permissions saved."); })
+      .catch(function(err){ $("#ft-msg").innerHTML = errBox(err.message); });
+  });
+}
+
+function screenConsent(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Likeness Release</h1><div class="card"><div id="consent-msg"></div><div id="consent-body">'+loadingBox("Loading the release…")+'</div></div>';
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/likeness-release").then(function(d){
+    var text = d.contractText || d.text || d.contract_text || d.release_text || "";
+    var signed = !!(d.consent && d.consent.signed) || d.signed === true || d.status === "SIGNED";
+    var body = $("#consent-body"); if(!body) return;
+    body.innerHTML = '<div class="contract-box">'+esc(text || "The likeness-release contract text was not returned by the backend.")+'</div>'
+      + '<form id="consent-form"><label class="checkbox-row"><input type="checkbox" id="consent-check" required> <span>I have read the likeness release above and agree to it.</span></label>'
+      + '<label>Type your full legal name as your e-signature<input id="consent-sig" class="sig-input" required placeholder="Type your full name"></label>'
+      + '<p><button class="btn" type="submit">Sign the release</button></p></form>'
+      + '<hr style="border-color:var(--line)"><h3>Revoke</h3><p class="muted small">You can revoke your likeness release at any time from privacy settings. Revoking stops future use.</p>'
+      + '<p><button class="btn btn-danger" id="consent-revoke" type="button">Revoke my likeness release</button></p>'
+      + (signed?'<p class="success-box">This release is currently signed.</p>':"");
+    $("#consent-form").addEventListener("submit", function(e){
+      e.preventDefault();
+      var sig = $("#consent-sig").value.trim();
+      api("/api/v1/talent/"+encodeURIComponent(id)+"/likeness-release/sign", {method:"POST", body:{signature:sig, agreed:true}})
+        .then(function(){ $("#consent-msg").innerHTML = okBox("Release signed. Status: AWAITING AGENCY REVIEW."); })
+        .catch(function(err){ $("#consent-msg").innerHTML = errBox(err.message); });
+    });
+    $("#consent-revoke").addEventListener("click", function(){
+      if(!confirm("Revoke your likeness release?")) return;
+      api("/api/v1/talent/"+encodeURIComponent(id)+"/likeness-release/revoke", {method:"POST", body:{}})
+        .then(function(){ $("#consent-msg").innerHTML = okBox("Likeness release revoked."); })
+        .catch(function(err){ $("#consent-msg").innerHTML = errBox(err.message); });
+    });
+  }).catch(function(err){ $("#consent-body").innerHTML = errBox(err.message); });
+}
+
+function screenMatches(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Matches</h1><div class="card"><p><button class="btn" id="run-match" type="button">Run matching</button></p><div id="match-msg"></div><div id="match-results"></div></div>'
+    + '<div class="card"><h2>Rotation queue</h2><p class="muted">The queue orders opportunities for submission. SELECTED entries go forward; SKIPPED entries show the reason.</p><div id="queue-box"></div><p><button class="btn" id="queue-selected" type="button">Queue selected</button></p><div id="queue-msg"></div></div>';
+  $("#run-match").addEventListener("click", function(){
+    var box = $("#match-results"); box.innerHTML = '<p class="muted">Running matching…</p>';
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/match", {method:"POST", body:{}})
+      .then(function(d){
+        var list = d.matches||d.results||d||[];
+        if(!Array.isArray(list) || !list.length){ box.innerHTML = emptyBox("No matches found yet. Complete your profile and portfolio, then run matching again."); return; }
+        var renderList = function(titles){
+          box.innerHTML = list.map(function(m){
+            var o = m.opportunity||{};
+            var reasons = Array.isArray(m.reasons) ? m.reasons.join(" · ") : (m.reason||m.explanation||"");
+            var oid = m.opportunityId || (o&&o.id) || m.opportunity_id;
+            var title = o.title || m.title || (titles && titles[oid]) || oid || "Opportunity";
+            return '<div class="opp-card"><h3>'+esc(title)+'</h3><p><strong>'+esc(m.classification||m.match||"")+'</strong> — '+esc(reasons)+'</p>'
+              + (oid?'<p><a href="#/opportunity/'+encodeURIComponent(oid)+'">View opportunity</a></p>':"")+'</div>';
+          }).join("");
+        };
+        apiGet("/api/v1/opportunities?limit=500").then(function(od){
+          var titles = {};
+          ((od&&od.opportunities)||[]).forEach(function(o){ titles[o.id]=o.title; });
+          renderList(titles);
+        }).catch(function(){ renderList(null); });
+      })
+      .catch(function(err){ box.innerHTML = errBox(err.message); });
+  });
+  window.__tttQueueSelected = [];
+  api("/api/v1/talent/"+encodeURIComponent(id)+"/rotation-queue", {method:"POST", body:{}}).then(function(d){
+    var q = d.queue||d.items||d||[];
+    var box = $("#queue-box"); if(!box) return;
+    if(!Array.isArray(q) || !q.length){ box.innerHTML = emptyBox("The rotation queue is empty."); return; }
+    window.__tttQueueSelected = q.filter(function(x){ return x.decision==="SELECTED"; }).map(function(x){ return x.opportunityId||x.opportunity_id; }).filter(Boolean);
+    box.innerHTML = '<table><thead><tr><th>Opportunity</th><th>Status</th><th>Reason</th></tr></thead><tbody>'
+      + q.map(function(item){
+          var oid = item.opportunityId||item.opportunity_id||"";
+          return '<tr><td>'+(oid?'<a href="#/opportunity/'+encodeURIComponent(oid)+'">'+esc(oid)+'</a>':"—")+'</td><td>'+esc(item.status||item.decision||"—")+'</td><td>'+esc(item.reason||"")+'</td></tr>';
+        }).join("")+'</tbody></table>';
+  }).catch(function(err){ var b=$("#queue-box"); if(b) b.innerHTML = emptyBox("The rotation queue is unavailable right now." + (err && err.message ? " " + esc(err.message) : "")); });
+  $("#queue-selected").addEventListener("click", function(){
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/queue-selected", {method:"POST", body:{opportunityIds:(window.__tttQueueSelected||[])}})
+      .then(function(){ $("#queue-msg").innerHTML = okBox("Selected queue entries queued. TEST MODE: nothing is sent live."); })
+      .catch(function(err){ $("#queue-msg").innerHTML = errBox(err.message); });
+  });
+}
+
+/* ---------- (9) applications / bookings / notifications / settings / compliance ---------- */
+function screenApplications(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Applications</h1><div id="apps-list">'+loadingBox("Loading applications…")+'</div>';
+  apiGet("/api/v1/applications?talentId="+encodeURIComponent(id)).then(function(d){
+    var list = d.applications||d||[];
+    var el = $("#apps-list"); if(!el) return;
+    if(!list.length){ el.innerHTML = emptyBox("No applications yet. Browse opportunities and apply — you approve before anything is sent."); return; }
+    el.innerHTML = list.map(function(a){
+      return '<div class="card card-lift"><h3>'+esc((a.opportunity&&a.opportunity.title)||a.opportunity_title||a.opportunityId||a.opportunity_id||"Application")+'</h3>'
+        + '<p>Status: <strong>'+esc(a.status||"pending")+'</strong></p>'
+        + '<p class="muted small">Applied '+esc(fmtDT(a.createdAt||a.created_at||a.submitted_at))+'</p></div>';
+    }).join("");
+  }).catch(function(err){ $("#apps-list").innerHTML = errBox(err.message); });
+}
+
+function screenBookings(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Bookings</h1><div id="book-list">'+loadingBox("Loading bookings…")+'</div>';
+  apiGet("/api/v1/bookings?talentId="+encodeURIComponent(id)).then(function(d){
+    var list = d.bookings||d||[];
+    var el = $("#book-list"); if(!el) return;
+    if(!list.length){ el.innerHTML = emptyBox("No bookings yet. When you book, the gross, fee, and net appear here to the cent."); return; }
+    el.innerHTML = list.map(function(b){
+      var gross = b.grossCents ?? b.gross_cents ?? (b.gross!==undefined?Math.round(b.gross*100):null);
+      var fee = b.commissionCents ?? b.feeCents ?? b.fee_cents ?? (b.fee!==undefined?Math.round(b.fee*100):null);
+      var net = b.netCents ?? b.net_cents ?? (b.net!==undefined?Math.round(b.net*100):null);
+      var pct = b.rate ?? b.fee_percent ?? b.commission_percent ?? b.fee_pct ?? "";
+      return '<div class="card card-lift"><h3>'+esc(b.title||b.opportunity_title||b.opportunityId||"Booking")+'</h3>'
+        + '<p>Status: <strong>'+esc(b.status||"—")+'</strong> · Payment: <strong>'+esc(b.payment_status||"—")+'</strong></p>'
+        + '<table><tbody>'
+        + '<tr><td>Gross</td><td><strong>'+(gross!==null?money(gross):"—")+'</strong></td></tr>'
+        + '<tr><td>Agency fee'+(pct!==""?' ('+esc(pct)+'%)':"")+'</td><td><strong>'+(fee!==null?money(fee):"—")+'</strong></td></tr>'
+        + '<tr><td>Net to you</td><td><strong class="gold">'+(net!==null?money(net):"—")+'</strong></td></tr>'
+        + '</tbody></table></div>';
+    }).join("");
+  }).catch(function(err){ $("#book-list").innerHTML = errBox(err.message); });
+}
+
+function screenNotifications(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Notifications</h1><p class="notice-box">IN-APP DELIVERED · EMAIL QUEUED — email pending: integration not connected. Email is never claimed as sent.</p><div id="notif-list">'+loadingBox("Loading notifications…")+'</div>';
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/notifications").then(function(d){
+      var list = d.notifications||d||[];
+      var el = $("#notif-list"); if(!el) return;
+      if(!list.length){ el.innerHTML = emptyBox("No notifications yet."); return; }
+      el.innerHTML = list.map(function(n){
+        var read = n.read || n.read_at;
+        return '<div class="card"><p><strong>'+esc(n.title||n.type||"Notification")+'</strong> '+(read?"":'<span class="badge badge-blue">UNREAD</span>')+'</p>'
+          + '<p>'+esc(n.body||n.message||"")+'</p>'
+          + '<p class="muted small">'+esc(fmtDT(n.createdAt||n.created_at))+' · IN-APP DELIVERED · EMAIL QUEUED</p>'
+          + '<p><button class="mini-btn" data-read="'+n.id+'">Mark read</button> <button class="mini-btn" data-notif-del="'+n.id+'">Delete</button></p></div>';
+      }).join("");
+      el.querySelectorAll("[data-read]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/notifications/"+encodeURIComponent(b.getAttribute("data-read"))+"/read", {method:"PATCH", body:{read:true}}).then(load).catch(function(){});
+        });
+      });
+      el.querySelectorAll("[data-notif-del]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/notifications/"+encodeURIComponent(b.getAttribute("data-notif-del")), {method:"DELETE"}).then(load).catch(function(){});
+        });
+      });
+    }).catch(function(err){ $("#notif-list").innerHTML = errBox(err.message); });
+  };
+  load();
+}
+
+function screenSettings(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Settings &amp; Commission</h1>'
+    + '<div class="card"><h2>Commission</h2><div id="comm-box">'+loadingBox("Loading commission terms…")+'</div></div>'
+    + '<div class="card"><h2>Commission preview</h2><p class="muted">Preview from the live calculator endpoint — never hardcoded.</p><div id="comm-preview"><p class="muted">Loading preview…</p></div></div>'
+    + '<div class="card"><h2>Repeat-agency threshold</h2><div id="threshold-box"><p class="muted">Loading…</p></div></div>'
+    + '<div class="card"><h2>Pause &amp; visibility</h2><div id="set-msg"></div>'
+    + '<label class="checkbox-row"><input type="checkbox" id="pause-toggle"> <span>Pause my profile — stop new matches and submissions while paused.</span></label>'
+    + '<label class="checkbox-row"><input type="checkbox" id="vis-toggle" checked> <span>Visible to the agency for matching.</span></label>'
+    + '<p><button class="btn" id="save-settings" type="button">Save settings</button></p></div>';
+  apiGet("/api/v1/commission-settings").then(function(d){
+    var el = $("#comm-box"); if(!el) return;
+    var s = d.settings||d;
+    el.innerHTML = '<p>'+esc(s.description||s.terms||"Commission is 10–15% only when you book. The exact scale is set by the agency.")+'</p>'
+      + (s.scale?'<p>'+esc(typeof s.scale==="string"?s.scale:JSON.stringify(s.scale))+'</p>':"");
+  }).catch(function(){ var el=$("#comm-box"); if(el) el.innerHTML = '<p>Commission is 10–15% only when you book. Full terms are in <a href="#/compliance">Compliance</a>.</p>'; });
+  apiGet("/api/v1/commission/calculate?gross=550&type=daily").then(function(d){
+    var el = $("#comm-preview"); if(!el) return;
+    var c = d.calculation||d;
+    el.innerHTML = '<table><tbody><tr><td>Gross ($550/day)</td><td><strong>'+money(c.grossCents ?? Math.round((c.gross||550)*100))+'</strong></td></tr>'
+      + '<tr><td>Fee ('+esc(c.rate ?? c.fee_percent ?? c.percent ?? "—")+'%)</td><td><strong>'+money(c.feeCents ?? c.fee_cents)+'</strong></td></tr>'
+      + '<tr><td>Net to you</td><td><strong class="gold">'+money(c.netCents ?? c.net_cents)+'</strong></td></tr></tbody></table>';
+  }).catch(function(){ var el=$("#comm-preview"); if(el) el.innerHTML = '<p class="muted">Preview unavailable — the commission calculator could not be reached.</p>'; });
+  apiGet("/api/v1/settings").then(function(d){
+    var s = d.settings||d||{};
+    var th = s.repeatAgencyThreshold ?? s.repeat_agency_threshold ?? 3;
+    var tp = s.repeatAgencyTopPercent ?? s.repeat_agency_top_percent ?? 10;
+    var el = $("#threshold-box"); if(!el) return;
+    el.innerHTML = '<p>An agency is flagged as a <strong>repeat agency</strong> at <strong>'+esc(th)+' confirmed bookings</strong> (or more), or in the <strong>top '+esc(tp)+'% by booking volume</strong>.</p>'
+      + (isAdmin()
+          ? '<label>Repeat-agency threshold (admin)<input id="threshold-input" type="number" min="1" value="'+esc(th)+'"></label><p><button class="btn btn-ghost btn-sm" id="threshold-save" type="button">Save threshold</button></p><div id="threshold-msg"></div>'
+          : '<p class="muted small">Admins can change this threshold. Sign in with the admin token on the Agency page to edit it.</p>');
+    var save = $("#threshold-save");
+    if(save) save.addEventListener("click", function(){
+      var v = parseInt($("#threshold-input").value,10);
+      api("/api/v1/settings", {method:"POST", body:{repeatAgencyThreshold:v}})
+        .then(function(){ $("#threshold-msg").innerHTML = okBox("Threshold saved."); })
+        .catch(function(err){ $("#threshold-msg").innerHTML = errBox(err.message); });
+    });
+  }).catch(function(){ var el=$("#threshold-box"); if(el) el.innerHTML = '<p class="muted">Threshold unavailable — the backend could not be reached. Default is 3 confirmed bookings.</p>'; });
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)).then(function(d){
+    var t = normTalent(d.talent||d||{});
+    var pt = $("#pause-toggle"); if(pt) pt.checked = t.paused === true;
+    var vt = $("#vis-toggle"); if(vt) vt.checked = t.visibility !== "private";
+  }).catch(function(){});
+  $("#save-settings").addEventListener("click", function(){
+    api("/api/v1/talent/"+encodeURIComponent(id), {method:"PATCH", body:toApiProfile({paused:$("#pause-toggle").checked, visibility:$("#vis-toggle").checked?"public":"private"})})
+      .then(function(){ $("#set-msg").innerHTML = okBox("Settings saved."); })
+      .catch(function(err){ $("#set-msg").innerHTML = errBox(err.message); });
+  });
+}
+
+function screenCompliance(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Compliance</h1>'
+    + '<div class="card"><h2>Commission terms</h2><p>Commission is 10–15% and applies only when you book. No upfront fees. No fee is ever collected before a booking is confirmed and paid.</p><div id="comp-comm"><p class="muted">Loading terms…</p></div></div>'
+    + '<div class="card"><h2>Florida research</h2><p class="notice-box">Florida talent-agency requirements research is pending. Before charging commissions, representing talent, or entering agency agreements, applicable Florida and other state talent-agency, employment-agency, labor, contract, and fee requirements must be researched and satisfied.</p></div>'
+    + '<div class="card"><h2>Email status</h2><p><strong>QUEUED</strong> — email integration is not connected. Notifications are delivered in-app; email shows as queued and is never claimed as sent.</p></div>'
+    + '<div class="card"><h2>Ledger</h2><p>Every event on this platform is recorded in an append-only, hash-chained ledger. <a href="#/ledger">Open the Ledger view</a>.</p></div>';
+  apiGet("/api/v1/commission-settings").then(function(d){
+    var el = $("#comp-comm"); if(!el) return;
+    var s = d.settings||d;
+    el.innerHTML = '<p>'+esc(s.description||s.terms||"")+'</p>';
+  }).catch(function(){});
+}
+
+/* ---------- (10) agency / ledger / contacts ---------- */
+function repeatBadge(a, threshold){
+  var n = a.bookingsConfirmed ?? a.bookings_confirmed ?? a.bookings ?? 0;
+  if(n >= threshold) return '<span class="badge badge-verified">TOP REPEAT AGENCY · '+esc(n)+' BOOKINGS</span>';
+  return "";
+}
+function spikeBadge(a){
+  if(a.spike) return '<span class="badge badge-expired">SPIKE — bookings rising fast</span>';
+  return "";
+}
+function agencyCard(a, threshold, rank){
+  var n = a.bookingsConfirmed ?? a.bookings_confirmed ?? a.bookings ?? 0;
+  var gross = a.totalGrossCents ?? a.total_gross_cents ?? null;
+  var comm = a.totalCommissionCents ?? a.total_commission_cents ?? null;
+  return '<div class="card card-lift"><div class="agency-row"><span class="rank-num">#'+rank+'</span><div class="grow">'
+    + '<h3 style="margin-top:0"><a href="#/agency/'+encodeURIComponent(a.id)+'">'+esc(a.name||"Agency")+'</a></h3>'
+    + '<p>'+repeatBadge(a, threshold)+' '+spikeBadge(a)+'</p>'
+    + '<p class="meta">Jobs posted: <strong>'+esc(a.jobsPosted ?? a.jobs_posted ?? 0)+'</strong> · Applications sent: <strong>'+esc(a.applicationsSent ?? a.applications_sent ?? 0)+'</strong> · Bookings confirmed: <strong>'+esc(n)+'</strong></p>'
+    + '<p class="meta">Total gross: <strong>'+(gross!==null?money(gross):"—")+'</strong> · Commission tracked: <strong>'+(comm!==null?money(comm):"—")+'</strong></p>'
+    + '<p class="muted small">First booking: '+esc(a.firstBookingAt?fmtDate(a.firstBookingAt):"—")+' · Last booking: '+esc(a.lastBookingAt?fmtDate(a.lastBookingAt):"—")+'</p>'
+    + '<p><a class="btn btn-ghost btn-sm" href="#/agency/'+encodeURIComponent(a.id)+'">View full history</a></p>'
+    + '</div></div></div>';
+}
+function renderTopRepeatWidget(el, agencies){
+  if(!el) return;
+  if(!apiBase()){ el.innerHTML = emptyBox("Agency board loads from the live backend once it is connected."); return; }
+  if(!agencies.length){ el.innerHTML = emptyBox("No agencies with bookings yet. Repeat agencies will be highlighted here once bookings land."); return; }
+  apiGet("/api/v1/settings").then(function(d){
+    var s = d.settings||d||{};
+    var th = s.repeatAgencyThreshold ?? s.repeat_agency_threshold ?? 3;
+    var sorted = agencies.slice().sort(function(x,y){ return (y.bookingsConfirmed??y.bookings??0)-(x.bookingsConfirmed??x.bookings??0); });
+    var top = sorted.slice(0,3);
+    el.innerHTML = top.map(function(a,i){ return agencyCard(a, th, i+1); }).join("");
+  }).catch(function(){
+    var sorted = agencies.slice().sort(function(x,y){ return (y.bookingsConfirmed??y.bookings??0)-(x.bookingsConfirmed??x.bookings??0); });
+    el.innerHTML = sorted.slice(0,3).map(function(a,i){ return agencyCard(a, 3, i+1); }).join("");
+  });
+}
+function screenAgency(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Agency Network</h1>'
+    + '<p class="muted">TEST MODE — monitoring and highlighting only. No submissions, no contacts, no payments.</p>'
+    + '<div class="card"><h2>Top Repeat Agencies</h2><p class="muted">Ranked by booking volume. Agencies at or above the repeat threshold are flagged; spikes are flagged too. One click opens the full history.</p><div id="agency-board">'+loadingBox("Loading agencies…")+'</div></div>'
+    + '<div class="card"><h2>Production intel</h2><div id="prod-intel">'+loadingBox("Loading production intel…")+'</div></div>'
+    + '<div class="card"><h2>Staff view</h2><div id="staff-box"></div></div>';
+  var loadBoard = function(){
+    if(!apiBase()){ $("#agency-board").innerHTML = emptyBox("Agency board loads from the live backend once it is connected."); return; }
+    Promise.all([apiGet("/api/v1/agencies"), fetchJsonOrNull("/api/v1/settings")]).then(function(res){
+      var list = res[0].agencies||res[0]||[];
+      var s = (res[1]&&(res[1].settings||res[1]))||{};
+      var th = s.repeatAgencyThreshold ?? s.repeat_agency_threshold ?? 3;
+      var el = $("#agency-board"); if(!el) return;
+      if(!list.length){ el.innerHTML = emptyBox("No agencies recorded yet."); return; }
+      list = list.slice().sort(function(x,y){ return (y.bookingsConfirmed??y.bookings??0)-(x.bookingsConfirmed??x.bookings??0); });
+      el.innerHTML = '<p class="muted">Repeat threshold: <strong>'+esc(th)+' confirmed bookings</strong> (see Settings).</p>'
+        + list.map(function(a,i){ return agencyCard(a, th, i+1); }).join("");
+    }).catch(function(err){ $("#agency-board").innerHTML = errBox(err.message); });
+  };
+  loadBoard();
+  apiGet("/api/v1/production-intel").then(function(d){
+    var list = d.intel||d.items||d||[];
+    var el = $("#prod-intel"); if(!el) return;
+    if(!Array.isArray(list)||!list.length){ el.innerHTML = emptyBox("No production intel recorded yet."); return; }
+    el.innerHTML = '<ul>'+list.slice(0,20).map(function(p){
+      return '<li><strong>'+esc(p.production||p.title||p.name||"Production")+'</strong> — '+esc(p.note||p.detail||p.location||"")+'</li>';
+    }).join("")+'</ul>';
+  }).catch(function(){ var el=$("#prod-intel"); if(el) el.innerHTML = emptyBox("Production intel unavailable right now."); });
+  var staff = $("#staff-box");
+  if(isAdmin()){
+    staff.innerHTML = '<p class="muted">Signed in as staff. Talent private data (phone, email, photos) is shown only to the owner admin token — staff lists show names and status only.</p><div id="staff-lists">'+loadingBox("Loading staff lists…")+'</div><p><button class="btn btn-ghost btn-sm" id="admin-logout" type="button">Clear admin token</button></p>';
+    $("#admin-logout").addEventListener("click", function(){ try{ localStorage.removeItem("ttt_admin_token"); }catch(e){} route(); });
+    Promise.all([fetchJsonOrNull("/api/v1/reviews"), fetchJsonOrNull("/api/v1/cubicles")]).then(function(res){
+      var reviews = (res[0]&&(res[0].reviews||res[0]))||[];
+      var cubes = (res[1]&&(res[1].cubicles||res[1]))||[];
+      var el = $("#staff-lists"); if(!el) return;
+      el.innerHTML = '<h3>Review queue</h3>' + (reviews.length ? reviews.map(function(r){
+        return '<div class="card"><p><strong>'+esc(r.talent_name||r.talent_id||"Talent")+'</strong> — '+esc(r.status||"pending")+'</p><p><button class="mini-btn" data-review-pass="'+esc(r.talent_id||"")+'">PASS</button> <button class="mini-btn" data-review-fail="'+esc(r.talent_id||"")+'">FAIL</button></p></div>';
+      }).join("") : emptyBox("Review queue is empty."))
+      + '<h3>Cubicles</h3>' + (cubes.length ? '<ul>'+cubes.map(function(c){ return '<li>'+esc(c.name||c.id)+'</li>'; }).join("")+'</ul>' : emptyBox("No cubicles listed."));
+    }).catch(function(){});
+  } else {
+    staff.innerHTML = '<p>Staff screens need an admin token. It is stored in this browser only (localStorage).</p>'
+      + '<form id="admin-form"><label>Admin token<input id="admin-token" type="password" autocomplete="off"></label><p><button class="btn" type="submit">Enter staff view</button></p></form>';
+    $("#admin-form").addEventListener("submit", function(e){
+      e.preventDefault();
+      var v = $("#admin-token").value.trim();
+      if(!v) return;
+      try{ localStorage.setItem("ttt_admin_token", v); }catch(err){}
+      route();
+    });
+  }
+}
+function screenAgencyHistory(app, agencyId){
+  try{ agencyId = decodeURIComponent(agencyId); }catch(e){}
+  app.innerHTML = '<p><a href="#/agency">&larr; Back to Agency Network</a></p><div id="agency-hist">'+loadingBox("Loading agency history…")+'</div>';
+  if(!apiBase()){ $("#agency-hist").innerHTML = emptyBox("Agency history loads from the live backend once it is connected."); return; }
+  apiGet("/api/v1/agencies/"+encodeURIComponent(agencyId)+"/history").then(function(d){
+    var a = d.agency||{};
+    var jobs = d.jobs||[], apps = d.applications||[], books = d.bookings||[], pays = d.payments||[];
+    var el = $("#agency-hist"); if(!el) return;
+    var row = function(x){ return '<tr><td>'+esc(x.title||x.name||x.id||"—")+'</td><td>'+esc(x.status||"")+'</td><td>'+esc(x.date?fmtDate(x.date):(x.created_at?fmtDate(x.created_at):""))+'</td><td>'+(x.gross_cents!==undefined?money(x.gross_cents):(x.amount_cents!==undefined?money(x.amount_cents):""))+'</td></tr>'; };
+    var table = function(title, list){
+      if(!list.length) return '<h3>'+esc(title)+'</h3>'+emptyBox("None recorded yet.");
+      return '<h3>'+esc(title)+' ('+list.length+')</h3><table><thead><tr><th>Item</th><th>Status</th><th>Date</th><th>Amount</th></tr></thead><tbody>'+list.map(row).join("")+'</tbody></table>';
+    };
+    el.innerHTML = '<div class="card"><h2>'+esc(a.name||"Agency")+'</h2><p class="muted">Full history from the ledger — every job, booking, and payment.</p></div>'
+      + '<div class="card">'+table("Jobs", jobs)+'</div>'
+      + '<div class="card">'+table("Applications", apps)+'</div>'
+      + '<div class="card">'+table("Bookings", books)+'</div>'
+      + '<div class="card">'+table("Payments", pays)+'</div>';
+  }).catch(function(err){ $("#agency-hist").innerHTML = errBox(err.message); });
+}
+function screenLedger(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Ledger</h1>'
+    + '<p class="muted">Append-only, hash-chained record of everything the agency knows. Corrections are new entries — history is never edited.</p>'
+    + '<div class="card"><div class="filters">'
+    + '<div><label for="lg-type">Event type</label><select id="lg-type"><option value="">All</option><option>talent_registered</option><option>profile_updated</option><option>consent_signed</option><option>consent_revoked</option><option>review_decision</option><option>match_run</option><option>application_created</option><option>booking_created</option><option>payment_recorded</option><option>notification_sent</option><option>opportunity_ingested</option><option>agency_contact</option></select></div>'
+    + '<div><label for="lg-entity">Contact / entity ID</label><input id="lg-entity" placeholder="talent or agency ID"></div>'
+    + '<div><label for="lg-from">From</label><input id="lg-from" type="date"></div>'
+    + '<div><label for="lg-to">To</label><input id="lg-to" type="date"></div>'
+    + '<div><button class="btn" id="lg-apply" type="button">Filter</button></div>'
+    + '</div><p><button class="btn btn-ghost" id="lg-verify" type="button">Verify chain</button> <button class="btn btn-ghost" id="lg-export" type="button">Export JSONL</button></p><div id="lg-verify-out"></div></div>'
+    + '<div id="lg-list">'+loadingBox("Loading ledger…")+'</div>';
+  var load = function(){
+    if(!apiBase()){ $("#lg-list").innerHTML = emptyBox("The ledger loads from the live backend once it is connected."); return; }
+    var p = new URLSearchParams();
+    var t=$("#lg-type").value, e=$("#lg-entity").value.trim(), f=$("#lg-from").value, to=$("#lg-to").value;
+    if(t) p.set("event_type", t);
+    if(e) p.set("entity_id", e);
+    if(f) p.set("from", f);
+    if(to) p.set("to", to);
+    p.set("limit","100");
+    apiGet("/api/v1/ledger?"+p.toString()).then(function(d){
+      var events = d.events||d||[];
+      var el = $("#lg-list"); if(!el) return;
+      if(!events.length){ el.innerHTML = emptyBox("No ledger events match these filters yet."); return; }
+      el.innerHTML = '<p class="muted">'+esc(d.total ?? events.length)+' events</p><table><thead><tr><th>Seq</th><th>Time</th><th>Event</th><th>Entity</th><th>Actor</th><th>Hash</th></tr></thead><tbody>'
+        + events.map(function(ev){
+            return '<tr><td>'+esc(ev.seq)+'</td><td>'+esc(fmtDT(ev.ts))+'</td><td>'+esc(ev.event_type)+'</td><td>'+esc(ev.entity_type||"")+' '+esc(ev.entity_id||"")+'</td><td>'+esc(ev.actor||"")+'</td><td class="mono">'+esc(String(ev.hash||"").slice(0,12))+'</td></tr>';
+          }).join("")+'</tbody></table>';
+    }).catch(function(err){ $("#lg-list").innerHTML = errBox(err.message); });
+  };
+  $("#lg-apply").addEventListener("click", load);
+  $("#lg-verify").addEventListener("click", function(){
+    var out = $("#lg-verify-out");
+    out.innerHTML = '<p class="muted">Verifying chain…</p>';
+    apiGet("/api/v1/ledger/verify").then(function(d){
+      var ok = d.ok !== false && d.valid !== false;
+      if(ok) out.innerHTML = okBox("Chain VALID — "+(d.events??"")+" events, head seq "+esc(d.head_seq??"")+", head hash "+String(d.head_hash||"").slice(0,16)+"…");
+      else out.innerHTML = errBox("Chain INVALID — first bad seq: "+esc(d.first_bad_seq ?? "unknown")+".");
+    }).catch(function(err){ out.innerHTML = errBox(err.message); });
+  });
+  $("#lg-export").addEventListener("click", function(){
+    if(!apiBase()){ $("#lg-verify-out").innerHTML = errBox("Backend not configured yet."); return; }
+    var a = document.createElement("a");
+    a.href = apiBase() + "/api/v1/ledger/export";
+    a.download = "top-tea-talents-ledger.jsonl";
+    a.target = "_blank"; a.rel = "noopener";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  load();
+}
+function screenContacts(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Contact Book</h1>'
+    + '<p class="muted">Every contact in one place — talents, agencies, employers, casting professionals, and production companies — each linked to their bookings, applications, and history.</p>'
+    + '<div class="card"><label for="ct-q">Search contacts</label><input id="ct-q" type="search" placeholder="Name, city, kind…"></div>'
+    + '<div id="ct-list">'+loadingBox("Loading contacts…")+'</div>';
+  var all = [];
+  var render = function(){
+    var q = ($("#ct-q").value||"").toLowerCase();
+    var list = all.filter(function(c){
+      if(!q) return true;
+      return ((c.name||"")+" "+(c.kind||"")+" "+(c.city||"")+" "+(c.email||"")).toLowerCase().indexOf(q)>=0;
+    });
+    var el = $("#ct-list"); if(!el) return;
+    if(!list.length){ el.innerHTML = emptyBox(all.length?"No contacts match that search.":"No contacts recorded yet."); return; }
+    el.innerHTML = list.map(function(c){
+      var hist = c.historyUrl || (c.kind==="agency"||c.kind==="employer" ? "#/agency/"+encodeURIComponent(c.id) : "#/ledger?entity_id="+encodeURIComponent(c.id));
+      return '<div class="card card-lift"><h3>'+esc(c.name||"Unnamed")+' <span class="badge badge-blue">'+esc((c.kind||"").toUpperCase())+'</span></h3>'
+        + '<p class="meta">'+esc([c.email,c.phone,c.city,c.state].filter(Boolean).join(" · ")||"No contact details on file")+'</p>'
+        + '<p>Bookings: <strong>'+esc(c.bookings ?? 0)+'</strong> · Applications: <strong>'+esc(c.applications ?? 0)+'</strong></p>'
+        + '<p><a class="btn btn-ghost btn-sm" href="'+esc(hist)+'">View history</a></p></div>';
+    }).join("");
+  };
+  $("#ct-q").addEventListener("input", render);
+  if(!apiBase()){ $("#ct-list").innerHTML = emptyBox("Contacts load from the live backend once it is connected."); return; }
+  apiGet("/api/v1/contacts").then(function(d){
+    all = d.contacts||d||[];
+    render();
+  }).catch(function(err){ $("#ct-list").innerHTML = errBox(err.message); });
+}
+
+/* ---------- (11) photos ---------- */
+function downscalePhoto(file, cb){
+  if(["image/jpeg","image/png","image/webp"].indexOf(file.type)<0){ cb(null, "Only JPG, PNG, or WEBP photos are accepted."); return; }
+  var img = new Image();
+  var url = URL.createObjectURL(file);
+  img.onload = function(){
+    try{
+      var max = 1200, w = img.naturalWidth, h = img.naturalHeight;
+      var scale = Math.min(1, max/Math.max(w,h));
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.round(w*scale); canvas.height = Math.round(h*scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      cb(canvas.toDataURL("image/jpeg", 0.82), null);
+    }catch(e){ cb(null, "Could not process that photo."); }
+  };
+  img.onerror = function(){ URL.revokeObjectURL(url); cb(null, "Could not read that photo file."); };
+  img.src = url;
+}
+function uploadPhoto(talentId, slot, file, caption, cb){
+  downscalePhoto(file, function(dataUrl, err){
+    if(err){ cb(err); return; }
+    api("/api/v1/talent/"+encodeURIComponent(talentId)+"/photos", {method:"POST", body:{slot:slot, dataUrl:dataUrl, caption:caption}})
+      .then(function(){ cb(null); })
+      .catch(function(e){ cb(e.message); });
+  });
+}
+
+/* ---------- (12) init ---------- */
+function closeSidebar(){
+  var sb = $("#sidebar"); if(sb) sb.classList.remove("open");
+  var nav = $("#topbar-nav"); if(nav) nav.classList.remove("open");
+}
+function initNav(){
+  var t = $("#nav-toggle");
+  if(t) t.addEventListener("click", function(){
+    var nav = $("#topbar-nav");
+    var open = nav.classList.toggle("open");
+    t.setAttribute("aria-expanded", open?"true":"false");
+    var sb = $("#sidebar"); if(sb) sb.classList.toggle("open", open);
+  });
+  var c = $("#sidebar-close");
+  if(c) c.addEventListener("click", closeSidebar);
+  document.querySelectorAll(".nav-group-head").forEach(function(h){
+    h.addEventListener("click", function(){
+      var g = h.parentElement;
+      var closed = g.classList.toggle("closed");
+      h.setAttribute("aria-expanded", closed?"false":"true");
+    });
+  });
+  document.querySelectorAll(".sidebar a, .topbar-nav a").forEach(function(a){
+    a.addEventListener("click", closeSidebar);
+  });
+}
+document.addEventListener("DOMContentLoaded", function(){
+  initNav();
+  initSplash();
+  loadApiConfig().then(function(){ apiBanner(); bindAuthSlot(); checkHealth(); route(); });
+});
+window.addEventListener("hashchange", route);

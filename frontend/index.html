@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Top Tea Talents — Casting discovery, matching, and bookings</title>
+<meta name="description" content="Top Tea Talents finds casting calls every day, matches the right jobs to your look, skills, and location, and submits your profile to the best-paying fits first. Nationwide, South Florida first. Free to join.">
+<link rel="stylesheet" href="styles.css">
+<script>window.__TTT_API__ = "";</script>
+<!-- api-config.js is loaded dynamically by app.js when present (the deploy
+     workflow writes it from the TTT_API_URL repo variable). It is optional:
+     when absent, the app shows the honest "backend not configured yet" banner. -->
+</head>
+<body>
+<!-- Opening splash: the brand mark first, then the platform. Brief by design:
+     fades on its own (~2.4s) or on tap; the inline failsafe below hides it even
+     if app.js never loads, so it can never trap the user. -->
+<div id="splash" class="splash" role="button" tabindex="0" aria-label="Top Tea Talents — tap to enter">
+  <div class="splash-inner">
+    <div class="brand-mark" id="splash-mark"><svg viewBox="0 0 200 200" width="180" height="180" role="img" aria-label="Top Tea Talents — a golden teacup topped with a crown, steam rising">
+      <defs>
+        <linearGradient id="ttt-gold" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#f7dc6f"/><stop offset=".45" stop-color="#d4af37"/><stop offset="1" stop-color="#8a6d1f"/>
+        </linearGradient>
+        <linearGradient id="ttt-gold-deep" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#e9c767"/><stop offset="1" stop-color="#6e5613"/>
+        </linearGradient>
+        <linearGradient id="ttt-steam" x1="0" y1="1" x2="0" y2="0">
+          <stop offset="0" stop-color="#d4af37" stop-opacity=".9"/><stop offset="1" stop-color="#f7dc6f" stop-opacity=".15"/>
+        </linearGradient>
+      </defs>
+      <path d="M84 42 C78 34 90 28 84 20 C80 14 86 8 84 4" fill="none" stroke="url(#ttt-steam)" stroke-width="5" stroke-linecap="round" opacity=".85"/>
+      <path d="M116 42 C122 34 110 28 116 20 C120 14 114 8 116 4" fill="none" stroke="url(#ttt-steam)" stroke-width="5" stroke-linecap="round" opacity=".85"/>
+      <path d="M58 82 L50 48 L74 66 L100 36 L126 66 L150 48 L142 82 Z" fill="url(#ttt-gold)" stroke="#6e5613" stroke-width="2" stroke-linejoin="round"/>
+      <rect x="58" y="82" width="84" height="9" rx="3" fill="url(#ttt-gold-deep)" stroke="#6e5613" stroke-width="1.5"/>
+      <circle cx="100" cy="52" r="5" fill="#a83232" stroke="#f7dc6f" stroke-width="1.5"/>
+      <circle cx="62" cy="62" r="3.5" fill="#f7dc6f" stroke="#6e5613" stroke-width="1"/>
+      <circle cx="138" cy="62" r="3.5" fill="#f7dc6f" stroke="#6e5613" stroke-width="1"/>
+      <path d="M62 92 L138 92 C138 124 122 140 100 140 C78 140 62 124 62 92 Z" fill="url(#ttt-gold)" stroke="#6e5613" stroke-width="2"/>
+      <ellipse cx="100" cy="92" rx="38" ry="6" fill="#f7dc6f" stroke="#6e5613" stroke-width="1.5"/>
+      <path d="M138 100 C160 100 160 124 138 126" fill="none" stroke="url(#ttt-gold)" stroke-width="7" stroke-linecap="round"/>
+      <path d="M74 100 C74 118 82 128 92 132" fill="none" stroke="#fff8d6" stroke-width="4" stroke-linecap="round" opacity=".55"/>
+      <path d="M88 140 L112 140 L108 150 L92 150 Z" fill="url(#ttt-gold-deep)" stroke="#6e5613" stroke-width="1"/>
+      <ellipse cx="100" cy="156" rx="56" ry="9" fill="url(#ttt-gold-deep)" stroke="#6e5613" stroke-width="1.5"/>
+      <ellipse cx="100" cy="154" rx="44" ry="5" fill="#e9c767" opacity=".7"/>
+    </svg></div>
+    <div class="splash-word">TOP TEA <span>TALENTS</span></div>
+    <div class="splash-tag">CASTING • DISCOVERY • BOOKINGS • OPPORTUNITY</div>
+    <div class="splash-hint">Tap to enter</div>
+  </div>
+</div>
+<script>setTimeout(function(){var s=document.getElementById('splash'); if(s) s.classList.add('splash-hide');}, 3600);</script>
+<div class="test-banner" role="status">TEST MODE — submissions paused, nothing is sent live.</div>
+<div id="api-banner" class="api-banner hidden" role="status"></div>
+<header class="topbar">
+  <a class="topbar-logo" href="#/"><span class="brand-mark brand-mark-sm" id="header-mark" aria-hidden="true"></span>TOP TEA <span>TALENTS</span></a>
+  <button class="nav-toggle" id="nav-toggle" aria-label="Open navigation" aria-expanded="false">&#9776;</button>
+  <nav class="topbar-nav" id="topbar-nav" aria-label="Primary">
+    <a href="#/opportunities">Find Opportunities</a>
+    <a href="#/browse">Browse All</a>
+    <a href="#/dashboard">Dashboard</a>
+    <a href="#/matches">Matches</a>
+    <a href="#/agency">Agency</a>
+    <a href="#/join" class="btn btn-gold btn-sm topbar-signup">SIGN UP</a>
+    <span id="auth-slot"></span>
+  </nav>
+</header>
+<div class="layout">
+  <aside class="sidebar" id="sidebar" aria-label="Sections">
+    <button class="sidebar-close" id="sidebar-close" aria-label="Close navigation">&times;</button>
+    <div class="nav-group" data-group="discover">
+      <button class="nav-group-head" aria-expanded="true">Discover <span class="chev">&#9662;</span></button>
+      <div class="nav-group-body">
+        <a href="#/" data-route="">Home</a>
+        <a href="#/opportunities" data-route="opportunities">Opportunities</a>
+        <a href="#/browse" data-route="browse">Browse All Listings</a>
+        <a href="#/matches" data-route="matches">Matches</a>
+      </div>
+    </div>
+    <div class="nav-group" data-group="talent">
+      <button class="nav-group-head" aria-expanded="true">Talent <span class="chev">&#9662;</span></button>
+      <div class="nav-group-body">
+        <a href="#/join" data-route="join">Join / Sign Up</a>
+        <a href="#/dashboard" data-route="dashboard">Dashboard</a>
+        <a href="#/portfolio" data-route="portfolio">My Portfolio</a>
+        <a href="#/profile" data-route="profile">Edit My Profile</a>
+        <a href="#/fast-track" data-route="fast-track">Fast-Track Permissions</a>
+        <a href="#/consent" data-route="consent">Likeness Release</a>
+      </div>
+    </div>
+    <div class="nav-group" data-group="bookings">
+      <button class="nav-group-head" aria-expanded="true">Bookings <span class="chev">&#9662;</span></button>
+      <div class="nav-group-body">
+        <a href="#/applications" data-route="applications">Applications</a>
+        <a href="#/bookings" data-route="bookings">Bookings</a>
+        <a href="#/notifications" data-route="notifications">Notifications</a>
+      </div>
+    </div>
+    <div class="nav-group" data-group="agency">
+      <button class="nav-group-head" aria-expanded="true">Agency <span class="chev">&#9662;</span></button>
+      <div class="nav-group-body">
+        <a href="#/settings" data-route="settings">Settings &amp; Commission</a>
+        <a href="#/compliance" data-route="compliance">Compliance</a>
+        <a href="#/agency" data-route="agency">Agency / Staff</a>
+        <a href="#/ledger" data-route="ledger">Ledger</a>
+        <a href="#/contacts" data-route="contacts">Contact Book</a>
+      </div>
+    </div>
+    <p class="sidebar-note">Free to join. You approve before anything is sent. 10–15% only when you book.</p>
+  </aside>
+  <main class="content">
+    <div id="app" aria-live="polite"></div>
+    <footer class="footer">
+      <p>Top Tea Talents — casting discovery, matching, and bookings. Nationwide, South Florida first.</p>
+      <p class="muted">TEST MODE — submissions paused, nothing is sent live. Email is not connected: notifications show as in-app delivered with email queued.</p>
+    </footer>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
