@@ -41,7 +41,7 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.1.0", d
+assert d["version"]=="1.2.0", d
 print("health ok:", d["counts"])
 PY
 
@@ -154,7 +154,7 @@ check "login works" bash -c "curl -sf -X POST $BASE/auth/login -H 'Content-Type:
 # complete the profile to 100%
 curl -sf -X PATCH "$BASE/talent/$TALENT_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"city":"Miami","state":"FL","zip":"33101","height":"5ft 9in","ageRange":"25-35","adultOrMinor":"adult","languages":["English"],"skills":["Acting"],"experience":"5 years background work","categories":["Background extras"],"availability":["Weekdays","Weekends"],"minCompensation":100}' -o /tmp/ttt-body.json
-check "profile completion 100%" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==100, d['talent']; assert d['talent']['status']=='PROFILE UNDER REVIEW', d['talent']['status']"
+check "profile completion 75% richness, 100% core (no photos/gender/social)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==75, d['talent']; assert d['talent']['coreCompletion']==100, d['talent']; assert d['talent']['status']=='PROFILE UNDER REVIEW', d['talent']['status']"
 
 # consent: wrong signature -> 400, right signature -> 200
 check "consent sign with wrong signature returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT_ID/likeness-release/sign -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"agreed\":true,\"signature\":\"Wrong Name\"}' | grep -q 400"
@@ -171,15 +171,117 @@ check "review PASS -> READY FOR MATCHING" python3 -c "import json; d=json.load(o
 # rotation queue (submissions are paused by default, so unpause first via admin settings)
 curl -sf -X POST "$BASE/settings" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"submissionsPaused":false}' -o /tmp/ttt-body.json
 curl -sf -X POST "$BASE/talent/$TALENT_ID/rotation-queue" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
-check "rotation queue returns pay-first ranked queue with caps" python3 - <<'PY'
+check "rotation queue returns selectivity-first, pay-first-within-class queue with caps" python3 - <<'PY'
 import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["queue"], d
 assert d["caps"]["perDay"]==3 and d["caps"]["perWeek"]==10, d["caps"]
-pays=[q["normalizedDailyPay"] for q in d["queue"] if q["normalizedDailyPay"] is not None]
-assert pays==sorted(pays, reverse=True), "queue not pay-first ranked"
+rank={"guaranteed":0,"unknown":1,"selective":2}
+ranks=[rank[q["selectivity"]] for q in d["queue"]]
+assert ranks==sorted(ranks), "queue not selectivity-first ranked"
+for r in (0,1,2):
+    pays=[q["normalizedDailyPay"] for q in d["queue"] if rank[q["selectivity"]]==r and q["normalizedDailyPay"] is not None]
+    assert pays==sorted(pays, reverse=True), f"pay not desc within selectivity class {r}"
 assert any(q["decision"]=="SELECTED" for q in d["queue"])
+assert all("selectivity" in q and "genderRequirement" in q for q in d["queue"])
 print("queue size:", len(d["queue"]), "selected:", sum(1 for q in d["queue"] if q["decision"]=="SELECTED"))
+PY
+
+# ----- v1.2.0 GENDER FILTER + SELECTIVITY -----
+# Fourth talent: male, full profile, READY FOR MATCHING. Anchor:
+# allcasting:319858 (Miss Florida US Nation 2027) is female-only, live
+# (deadline 2026-12-28) in the seed.
+curl -sf -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d '{"email":"male@toptea.example","phone":"3055550103","firstName":"Male","lastName":"Talent","password":"secret123","termsAccepted":true}' -o /tmp/ttt-body.json
+MTALENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['talentId'])")
+MTOKEN=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
+MVCODE=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['testModeVerificationCode'])")
+curl -sf -X POST "$BASE/auth/verify-email" -H 'Content-Type: application/json' -d "{\"email\":\"male@toptea.example\",\"code\":\"$MVCODE\"}" -o /tmp/ttt-body.json
+curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' \
+  -d '{"city":"Miami","state":"FL","zip":"33101","height":"6ft 1in","ageRange":"35-44","adultOrMinor":"adult","experience":"5 years background work","categories":["Commercials"],"availability":["Weekdays"],"demographics":{"gender":"Male","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json
+check "v1.2.0: male talent profile stores gender Male, richness 80" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); t=d['talent']; assert t['demographics']['gender']=='Male' and t['completion']==80 and t['coreCompletion']==100, t"
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/likeness-release/sign" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"agreed":true,"signature":"Male Talent"}' -o /tmp/ttt-body.json
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/fast-track" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' \
+  -d '{"controls":{"A":true},"rules":{"categories":["Commercials"],"geography":"south-florida"},"autoSubmit":false}' -o /tmp/ttt-body.json
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/review" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"decision":"PASS"}' -o /tmp/ttt-body.json
+check "v1.2.0: male talent READY FOR MATCHING" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['status']=='READY FOR MATCHING', d"
+curl -sf "$BASE/opportunities/allcasting%3A319858" -o /tmp/ttt-body.json
+check "v1.2.0: anchor opp is female-only + live, carries selectivity" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))['opportunity']
+assert d['genderRequirement']=='female', d
+assert d['expired'] is False, d
+assert d['selectivity'] in ('guaranteed','selective','unknown'), d
+print('anchor:', d['id'], d['title'][:40], 'selectivity:', d['selectivity'])
+PY
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/match" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.2.0: male talent match EXCLUDES female-only anchor, genderExcluded cites it" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+ids=[m['opportunityId'] for m in d['matches']]
+assert 'allcasting:319858' not in ids, 'female-only opp matched a male talent'
+assert d['talentGender']=='male' and d['genderSet'] is True, d
+gx=[g for g in d['genderExcluded'] if g['opportunityId']=='allcasting:319858']
+assert len(gx)==1 and gx[0]['requiredGender']=='female', d['genderExcluded']
+assert d['genderExcluded'], 'genderExcluded empty'
+print('matches:', len(ids), 'genderExcluded:', len(d['genderExcluded']))
+PY
+curl -sf "$BASE/talent/$MTALENT_ID/jobs-for-you" -H "Authorization: Bearer $MTOKEN" -o /tmp/ttt-body.json
+check "v1.2.0: jobs-for-you also excludes the female-only anchor" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+ids=[j['opportunityId'] for j in d['jobs']]
+assert 'allcasting:319858' not in ids, 'female-only opp in jobs-for-you for a male talent'
+assert d['genderExcluded']>0, d
+assert all('selectivity' in j and 'genderRequirement' in j for j in d['jobs']), 'job rows lack selectivity/genderRequirement'
+print('jobs:', len(ids), 'genderExcluded:', d['genderExcluded'])
+PY
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/rotation-queue" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.2.0: rotation queue never SELECTS a female-only opp for a male talent" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+sel=[q for q in d['queue'] if q['decision']=='SELECTED']
+assert all(q.get('genderRequirement')!='female' for q in sel), 'female-only opp SELECTED for a male talent'
+row=[q for q in d['queue'] if q['opportunityId']=='allcasting:319858']
+assert len(row)==1 and row[0]['decision']=='SKIPPED' and 'Gender requirement' in row[0]['reason'], row
+print('queue:', len(d['queue']), 'selected:', len(sel))
+PY
+check "v1.2.0: manual application male + female-only opp returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications -H 'Authorization: Bearer $MTOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$MTALENT_ID\",\"opportunityId\":\"allcasting:319858\"}' | grep -q 400"
+# Flip the same talent to Female: the anchor MUST now match, with a
+# gender-fit reason on the match row.
+curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"demographics":{"gender":"Female","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/match" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.2.0: female talent DOES match the female-only anchor, reason cites gender fit" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+m=[x for x in d['matches'] if x['opportunityId']=='allcasting:319858']
+assert len(m)==1, 'female-only opp missing for a female talent'
+assert any('Gender fit' in r for r in m[0]['reasons']), m[0]['reasons']
+assert d['talentGender']=='female', d
+print('anchor match classification:', m[0]['classification'])
+PY
+# Selectivity: guaranteed ranks before selective in /match; seed has both.
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/match" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.2.0: match order is guaranteed first, selective last" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+rank={"guaranteed":0,"unknown":1,"selective":2}
+ranks=[rank[m['selectivity']] for m in d['matches']]
+assert ranks==sorted(ranks), 'match list not selectivity-ranked'
+assert any(m['selectivity']=='guaranteed' for m in d['matches']), 'no guaranteed match in seed'
+assert any(m['selectivity']=='selective' for m in d['matches']), 'no selective match in seed'
+print('matches:', len(d['matches']), 'guaranteed:', sum(1 for m in d['matches'] if m['selectivity']=='guaranteed'), 'selective:', sum(1 for m in d['matches'] if m['selectivity']=='selective'))
+PY
+curl -sf "$BASE/opportunities?limit=500&status=live" -o /tmp/ttt-body.json
+check "v1.2.0: every live opp carries selectivity + genderRequirement" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d['total']>0, d
+assert all(o.get('selectivity') in ('guaranteed','selective','unknown') for o in d['opportunities']), 'opp missing selectivity'
+assert all('genderRequirement' in o for o in d['opportunities']), 'opp missing genderRequirement'
+g=sum(1 for o in d['opportunities'] if o['selectivity']=='guaranteed')
+s=sum(1 for o in d['opportunities'] if o['selectivity']=='selective')
+print('live:', d['total'], 'guaranteed:', g, 'selective:', s, 'unknown:', d['total']-g-s)
 PY
 
 # commission calc: $550/day -> 12.5% = $68.75, net $481.25
@@ -330,14 +432,14 @@ check "v19: third talent registers" python3 -c "import json; d=json.load(open('/
 # (a) core-only profile -> 100% (optional groups NOT counted)
 curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
   -d '{"city":"Miami","state":"FL","zip":"33101","height":"5ft 9in","ageRange":"25-34","experience":"5 years background work"}' -o /tmp/ttt-body.json
-check "v19: core-only profile (zero optional groups) reaches 100%" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==100, d['talent']; assert d['talent']['status']=='PROFILE UNDER REVIEW', d['talent']['status']"
+check "v19: core-only profile (zero optional groups) reads 60% richness, 100% core" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==60, d['talent']; assert d['talent']['coreCompletion']==100, d['talent']; assert d['talent']['status']=='PROFILE UNDER REVIEW', d['talent']['status']"
 # (a2) release sign accepts a core-only profile (verify email first)
 curl -sf -X POST "$BASE/auth/verify-email" -H 'Content-Type: application/json' -d "{\"email\":\"t3@toptea.example\",\"code\":\"$VCODE3\"}" -o /tmp/ttt-body.json
 check "v19: core-only talent signs the likeness release" bash -c "curl -sf -X POST $BASE/talent/$TALENT3_ID/likeness-release/sign -H 'Authorization: Bearer $TOKEN3' -H 'Content-Type: application/json' -d '{\"agreed\":true,\"signature\":\"Third Talent\"}' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['status']=='AWAITING AGENCY REVIEW', d\""
 # (b) adding optional groups keeps 100% (never hurts)
 curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
   -d '{"languages":["English","Spanish"],"skills":["Acting"],"categories":["Background extras"],"availability":["Weekdays"]}' -o /tmp/ttt-body.json
-check "v19: optional groups filled still 100%" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==100, d['talent']"
+check "v19: optional groups filled -> 75% richness (60 core + 10 categories + 5 availability)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==75, d['talent']"
 # (d) wizard step saves persist: step-2-style PATCH with languages, then a
 # step-3-style PATCH that omits languages entirely -> languages survive
 curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
@@ -362,7 +464,7 @@ check "v19: photo slot 9 rejected (400)" bash -c "curl -s -o /dev/null -w '%{htt
 check "v19: photo with bad mime rejected (400)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT3_ID/photos -H 'Authorization: Bearer $TOKEN3' -H 'Content-Type: application/json' -d '{\"slot\":2,\"dataUrl\":\"data:image/gif;base64,$T3_PNG_B64\"}' | grep -q 400"
 # (e) repopulation source: GET talent returns the full profile for the wizard
 curl -sf "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -o /tmp/ttt-body.json
-check "v19: GET talent returns full profile (wizard repopulation source)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); t=d['talent']; assert t['languages']==['English','Spanish'] and t['categories']==['Background extras'] and t['availability']==['Weekdays'] and t['completion']==100, t"
+check "v19: GET talent returns full profile (wizard repopulation source)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); t=d['talent']; assert t['languages']==['English','Spanish'] and t['categories']==['Background extras'] and t['availability']==['Weekdays'] and t['completion']==85, t"
 # (f) same-email re-registration never creates a second profile; login resumes the original
 check "v19: duplicate email returns 409 (no second profile)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/register -H 'Content-Type: application/json' -d '{\"email\":\"t3@toptea.example\",\"phone\":\"3055550102\",\"firstName\":\"Third\",\"lastName\":\"Talent\",\"password\":\"secret123\",\"termsAccepted\":true}' | grep -q 409"
 check "v19: login after duplicate attempt returns the ORIGINAL talent id" bash -c "curl -sf -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"t3@toptea.example\",\"password\":\"secret123\"}' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talentId']=='$TALENT3_ID', d\""
@@ -618,7 +720,7 @@ parsed = [json.loads(l) for l in lines]
 assert all(set(("mirror_prev", "mirror_hash", "state")) <= set(p) for p in parsed), "mirror line missing chain/state keys"
 assert [p["seq"] for p in parsed] == list(range(1, len(parsed) + 1)), "mirror seqs not 1..N"
 reg = [p for p in parsed if p["event_type"] == "talent.register"]
-assert len(reg) == 3, reg  # talent1 + talent2 (v11) + talent3 (v19 signup-flow fix)
+assert len(reg) == 4, reg  # talent1 + talent2 (v11) + talent3 (v19 signup-flow fix) + male talent (v1.2.0 gender checks)
 reg1 = [p for p in reg if p["state"]["talent"]["id"] == talent_id]
 assert len(reg1) == 1, reg
 assert reg1[0]["state"]["talent"]["email"] == "test@toptea.example", reg1[0]["state"]
@@ -677,7 +779,7 @@ PY
 curl -sf "$BASE/ledger?limit=100" -o /tmp/ttt-body.json
 check "wipe sim: ledger.restore event recorded the restore" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); types=[e['event_type'] for e in d['events']]; assert 'ledger.restore' in types, types; print('restore event present')"
 curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/talent/$TALENT_ID" -o /tmp/ttt-body.json
-check "wipe sim: talent profile restored (100%, READY FOR MATCHING)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['talent']; assert d['completion']==100 and d['status']=='READY FOR MATCHING' and d['firstName']=='Testy', d"
+check "wipe sim: talent profile restored (75% richness, READY FOR MATCHING)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['talent']; assert d['completion']==75 and d['status']=='READY FOR MATCHING' and d['firstName']=='Testy', d"
 curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/bookings" -o /tmp/ttt-body.json
 check "wipe sim: booking + notification restored, money reconciles" python3 - <<'PY'
 import json

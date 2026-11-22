@@ -59,6 +59,16 @@ function isExpired(o){
   var d = new Date(o.deadline);
   return !isNaN(d.getTime()) && d < new Date(new Date().toDateString());
 }
+function selBadge(o){
+  var s = o.selectivity||"unknown";
+  if(s==="guaranteed") return '<span class="badge" style="border-color:var(--gold);color:var(--gold)">GUARANTEED — open call'+(o.selectivityReason?" · "+esc(o.selectivityReason):"")+'</span>';
+  if(s==="selective") return '<span class="badge">SELECTIVE — audition'+(o.selectivityReason?" · "+esc(o.selectivityReason):"")+'</span>';
+  return '<span class="badge">Selectivity unknown</span>';
+}
+function genderReqLine(o){
+  if(!o.genderRequirement) return "Open to all genders";
+  return (o.genderRequirement==="female"?"Female only":"Male only")+" — roles that require a different gender never appear in your matches";
+}
 function verBadge(o){
   var v = (o.verification_status||"").toUpperCase();
   if(v==="VERIFIED") return '<span class="badge badge-verified">VERIFIED</span>';
@@ -569,10 +579,12 @@ function screenOpportunityDetail(app, id){
     var o = d.opportunity || d;
     var el = $("#opp-detail"); if(!el) return;
     el.innerHTML = '<div class="card"><h2>'+esc(o.title||"Untitled opportunity")+'</h2>'
-      + '<p class="pay-line">'+verBadge(o)+(isExpired(o)?'<span class="badge badge-expired">EXPIRED</span>':"")+'</p>'
+      + '<p class="pay-line">'+verBadge(o)+(isExpired(o)?'<span class="badge badge-expired">EXPIRED</span>':"")+' '+selBadge(o)+'</p>'
       + '<dl class="kv">'
       + '<dt>Production</dt><dd>'+esc(o.production||"—")+'</dd>'
-      + '<dt>Employer</dt><dd>'+esc(o.employer||"—")+'</dd>'
+      + '<dt>Employer</dt><dd>'+esc(o.employer||o.casting_org||o.casting_professional||"—")+'</dd>'
+      + (o.casting_org && o.casting_org!==o.employer ? '<dt>Casting organization</dt><dd>'+esc(o.casting_org)+'</dd>' : "")
+      + (o.casting_professional && o.casting_professional!==o.employer ? '<dt>Casting professional</dt><dd>'+esc(o.casting_professional)+'</dd>' : "")
       + '<dt>Location</dt><dd>'+esc(locText(o))+'</dd>'
       + '<dt>Pay</dt><dd><span class="pay">'+payText(o)+'</span></dd>'
       + '<dt>Category</dt><dd>'+esc(o.category||"—")+'</dd>'
@@ -580,6 +592,17 @@ function screenOpportunityDetail(app, id){
       + '<dt>Production dates</dt><dd>'+esc(o.production_dates||"—")+'</dd>'
       + '<dt>Source</dt><dd>'+esc(o.source||"—")+(o.source_url?' · <a href="'+esc(o.source_url)+'" target="_blank" rel="noopener">Original listing</a>':"")+'</dd>'
       + '<dt>Verification notes</dt><dd>'+esc(o.verification_notes||"—")+'</dd>'
+      + '</dl>'
+      + '<h3>Requirements to qualify</h3><dl class="kv">'
+      + '<dt>Gender</dt><dd>'+esc(genderReqLine(o))+'</dd>'
+      + '<dt>Selectivity</dt><dd>'+(o.selectivity==="guaranteed"?"Guaranteed — open call, everyone who shows up and meets the basics gets hired and paid":o.selectivity==="selective"?"Selective — many apply, only a few are picked":"Unknown — the listing does not say how selective it is")+(o.selectivityReason?" ("+esc(o.selectivityReason)+")":"")+'</dd>'
+      + (o.age?'<dt>Age</dt><dd>'+esc(o.age)+'</dd>':"")
+      + (o.eligibility?'<dt>Eligibility</dt><dd>'+esc(o.eligibility)+'</dd>':"")
+      + (o.appearance?'<dt>Appearance</dt><dd>'+esc(o.appearance)+'</dd>':"")
+      + (o.skills?'<dt>Skills</dt><dd>'+esc(o.skills)+'</dd>':"")
+      + (o.travel?'<dt>Travel</dt><dd>'+esc(o.travel)+'</dd>':"")
+      + (o.positions?'<dt>Spots</dt><dd>'+esc(String(o.positions))+' position'+(Number(o.positions)===1?"":"s")+'</dd>':"")
+      + (o.usage_exclusivity?'<dt>Usage / exclusivity</dt><dd>'+esc(o.usage_exclusivity)+'</dd>':"")
       + '</dl>'
       + (o.roles?'<h3>Roles</h3><p>'+esc(o.roles)+'</p>':"")
       + (o.submission_instructions?'<h3>How to apply</h3><p>'+esc(o.submission_instructions)+'</p>':"")
@@ -597,7 +620,11 @@ function screenOpportunityDetail(app, id){
           var list = r.matches||[];
           var m = null;
           list.forEach(function(x){ if((x.opportunityId||(x.opportunity&&x.opportunity.id))===o.id) m=x; });
-          if(!m){ box.innerHTML = emptyBox("No match found for this opportunity yet. Complete your profile and run matching again."); return; }
+          if(!m){
+            var gx = (r.genderExcluded||[]).filter(function(g){ return g.opportunityId===o.id; })[0];
+            if(gx){ box.innerHTML = emptyBox("This role requires "+gx.requiredGender+" talent, so it never appears in your matches."); return; }
+            box.innerHTML = emptyBox("No match found for this opportunity yet. Complete your profile and run matching again."); return;
+          }
           var reasons = Array.isArray(m.reasons) ? m.reasons.join(" · ") : (m.reason||m.explanation||"No reason returned.");
           box.innerHTML = '<div class="notice-box"><strong>Match: '+esc(m.classification||"—")+'</strong><br>'+esc(reasons)+'</div>';
         })
@@ -743,16 +770,16 @@ function renderJoin(app, d, step){
       + '<label>Preferred contact method<select name="contact_method"><option value="">No preference</option><option value="email">Email</option><option value="phone">Phone call</option><option value="text">Text</option></select></label>'
       + '<label class="checkbox-row"><input name="terms" type="checkbox" required> <span>I agree to the terms and the likeness-release process. I understand nothing is sent to an employer without my approval.</span></label>';
   } else if(step===2){
-    html += '<p class="muted">About you — height, ZIP and age range are needed to reach 100% and sign the release. Availability, languages and skills are optional — pick them only if they apply to you; skipping them never blocks you and never lowers your completion %.</p>'
-      + '<label>Height <span class="muted small">(needed for 100%)</span><input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
-      + '<div class="form-row"><div><label>ZIP <span class="muted small">(needed for 100%)</span><input name="zip" value="'+esc(d.zip||"")+'"></label></div>'
+    html += '<p class="muted">About you — height, ZIP and age range are needed to sign the release. Availability, languages and skills are optional — pick them only if they apply to you; skipping them never blocks you and never lowers your core completion.</p>'
+      + '<label>Height <span class="muted small">(needed to sign the release)</span><input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
+      + '<div class="form-row"><div><label>ZIP <span class="muted small">(needed to sign the release)</span><input name="zip" value="'+esc(d.zip||"")+'"></label></div>'
       + '<div><label>Travel radius (miles)<input name="travel_radius" type="number" min="0" value="'+esc(d.travel_radius||"")+'"></label></div></div>'
       + '<label>Availability <span class="muted small">(optional — pick only what applies, never blocks signing)</span></label><div class="chip-set" id="avail-set"></div>'
-      + '<label>Age range <span class="muted small">(needed for 100%)</span><select name="age_range"><option value="">Prefer not to say</option><option>18–24</option><option>25–34</option><option>35–44</option><option>45–54</option><option>55+</option></select></label>'
-      + '<label>Adult or minor<select name="adult_or_minor"><option value="">Prefer not to say</option><option value="adult">Adult (18+)</option><option value="minor">Minor (under 18 — guardian required)</option></select></label>'
-      + '<p class="muted">Optional demographics — never used as a match score. You control whether any of it is shared.</p>'
-      + '<label>Gender<select name="gender"><option value="">Prefer not to say</option><option>Female</option><option>Male</option><option>Non-binary</option><option>Other</option></select></label>'
-      + '<label>Ethnicity<select name="ethnicity"><option value="">Prefer not to say</option><option>Black / African American</option><option>Hispanic / Latino</option><option>White</option><option>Asian</option><option>Other</option><option>Two or more</option></select></label>'
+      + '<label>Age range <span class="muted small">(needed to sign the release)</span><select name="age_range"><option value="">Prefer not to say</option>'+["18–24","25–34","35–44","45–54","55+"].map(function(a){ return '<option'+(String(d.age_range||"").replace("–","-")===a.replace("–","-")?" selected":"")+'>'+a+'</option>'; }).join("")+'</select></label>'
+      + '<label>Adult or minor<select name="adult_or_minor"><option value="">Prefer not to say</option><option value="adult"'+(d.adultOrMinor==="adult"?" selected":"")+'>Adult (18+)</option><option value="minor"'+(d.adultOrMinor==="minor"?" selected":"")+'>Minor (under 18 — guardian required)</option></select></label>'
+      + '<p class="muted">Gender is used only as a hard eligibility filter — a role that requires a different gender never appears in your matches. It never adds or subtracts match points. You control whether any of it is shared.</p>'
+      + '<label>Gender<select name="gender"><option value=""'+(!d.gender?" selected":"")+'>Prefer not to say</option>'+["Female","Male","Non-binary","Other"].map(function(g){ return '<option'+(d.gender===g?" selected":"")+'>'+g+'</option>'; }).join("")+'</select></label>'
+      + '<label>Ethnicity<select name="ethnicity"><option value=""'+(!d.ethnicity?" selected":"")+'>Prefer not to say</option>'+["Black / African American","Hispanic / Latino","White","Asian","Other","Two or more"].map(function(e){ return '<option'+(d.ethnicity===e?" selected":"")+'>'+e+'</option>'; }).join("")+'</select></label>'
       + '<label>Hair color<input name="hair_color" value="'+esc(d.hair_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
       + '<label>Eye color<input name="eye_color" value="'+esc(d.eye_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
       + '<label>Languages (comma separated) <span class="muted small">(optional)</span><input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
@@ -760,7 +787,7 @@ function renderJoin(app, d, step){
   } else {
     html += '<p class="muted">Professional info &amp; permissions. Experience is needed to reach 100%; categories are optional — pick only what applies. Photos go in your portfolio (up to 8) — add them right below, now or later.</p>'
       + '<label>Categories <span class="muted small">(optional — pick only what applies, never blocks signing)</span></label><div class="chip-set" id="cat-set"></div>'
-      + '<label>Experience <span class="muted small">(needed for 100%)</span><textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
+      + '<label>Experience <span class="muted small">(needed to sign the release)</span><textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
       + '<label>Minimum daily pay you will accept ($)<input name="min_compensation" type="number" min="0" value="'+esc(d.min_compensation||"")+'"></label>'
       + '<label>Union affiliation<input name="union_affiliation" value="'+esc(d.union_affiliation||"")+'" placeholder="e.g. SAG-AFTRA (optional)"></label>'
       + '<div id="join-photos"><h3>Portfolio photos <span class="muted small">(optional — add now or later, never blocks signing)</span></h3>'
@@ -966,10 +993,12 @@ function renderFastTrackControls(el, state, onChange){
 }
 
 /* ---------- (8) dashboard / portfolio / profile / fast-track / consent ---------- */
-/* Fallback completion % — mirrors the server COMPLETION_ITEMS exactly (6 core
-   items only; languages/skills/categories/availability are optional extras
-   and photos never count). The dashboard prefers the server value; this must
-   never disagree with it. */
+/* Fallback completion % — used ONLY when the server sends no completion
+   value. It sees only the 6 core items, so it reports on the same richness
+   scale as the server: core is worth 60 of 100, and a bare 6-core record
+   reads 60%, never 100%. Photos, categories, availability, gender and
+   verified social links supply the rest — the server counts them; this
+   fallback cannot, so it never claims the top of the scale. */
 function completionPct(t){
   if(!t) return 0;
   var core = [
@@ -981,7 +1010,7 @@ function completionPct(t){
     !!t.experience
   ];
   var done = core.filter(function(x){ return x; }).length;
-  return Math.round((done/core.length)*100);
+  return Math.round((done/core.length)*60);
 }
 function screenDashboard(app){
   if(!requireLogin(app)) return;
@@ -1002,11 +1031,14 @@ function screenDashboard(app){
     var notifs = (res[4]&&(res[4].notifications||res[4]))||[];
     var agencies = (res[5]&&(res[5].agencies||res[5]))||[];
     var pct = (typeof t.completion === "number") ? t.completion : completionPct(t);
+    var missing = (t.completionChecklist||[]).filter(function(c){ return !c.done; }).map(function(c){ return c.label; });
     var pending = apps.filter(function(a){ return (a.status||"").toLowerCase().indexOf("pend")>=0; }).length;
     var unread = notifs.filter(function(n){ return !n.read && !n.read_at; }).length;
     var el = $("#dash"); if(!el) return;
     el.innerHTML = '<div class="card"><h2>Welcome, '+esc(t.professional_name||t.first_name||"talent")+'</h2>'
       + '<p>Profile completion: <strong>'+pct+'%</strong> · Photos: <strong>'+photos.length+' of 8</strong> · Readiness: <strong>'+esc(t.readiness_status||t.status||(pct>=80?"Ready":"In progress"))+'</strong></p>'
+      + (pct<100 && missing.length ? '<p class="muted small">To reach 100%: '+esc(missing.join(", "))+'.</p>' : "")
+      + (t.gender ? "" : '<p class="muted small">Set your gender in <a href="#/profile">Edit My Profile</a> — roles that require a different gender can only filter once it is set.</p>')
       + '<div class="stats-row"><div class="stat"><b>'+apps.length+'</b><span>applications</span></div>'
       + '<div class="stat"><b>'+pending+'</b><span>pending approvals</span></div>'
       + '<div class="stat"><b>'+books.length+'</b><span>bookings</span></div></div>'
@@ -1105,6 +1137,9 @@ function screenProfile(app){
       + '<div class="form-row"><div><label>City<input name="city" value="'+esc(t.city||"")+'"></label></div><div><label>State<input name="state" value="'+esc(t.state||"")+'"></label></div></div>'
       + '<label>ZIP<input name="zip" value="'+esc(t.zip||"")+'"></label>'
       + '<label>Travel radius (miles)<input name="travel_radius" type="number" value="'+esc(t.travel_radius||"")+'"></label>'
+      + '<label>Gender<select name="gender"><option value=""'+(!t.gender?" selected":"")+'>Prefer not to say</option>'+["Female","Male","Non-binary","Other"].map(function(g){ return '<option'+(t.gender===g?" selected":"")+'>'+g+'</option>'; }).join("")+'</select></label>'
+      + '<label>Ethnicity<select name="ethnicity"><option value=""'+(!t.ethnicity?" selected":"")+'>Prefer not to say</option>'+["Black / African American","Hispanic / Latino","White","Asian","Other","Two or more"].map(function(e){ return '<option'+(t.ethnicity===e?" selected":"")+'>'+e+'</option>'; }).join("")+'</select></label>'
+      + '<p class="muted small">Gender is used only as a hard filter — roles that require a different gender never appear in your matches. Set it so the filter works for you.</p>'
       + '<label>Languages (comma separated) <span class="muted small">(optional)</span><input name="languages_text" value="'+esc((t.languages||[]).join(", "))+'"></label>'
       + '<label>Skills (comma separated) <span class="muted small">(optional)</span><input name="skills_text" value="'+esc((t.skills||[]).join(", "))+'"></label>'
       + '<label>Categories <span class="muted small">(optional — pick only what applies)</span></label><div class="chip-set" id="prof-cat-set"></div>'
@@ -1225,12 +1260,16 @@ function screenMatches(app){
         var list = d.matches||d.results||d||[];
         if(!Array.isArray(list) || !list.length){ box.innerHTML = emptyBox("No matches found yet. Complete your profile and portfolio, then run matching again."); return; }
         var renderList = function(titles){
-          box.innerHTML = list.map(function(m){
+          box.innerHTML = (d.genderExcluded && d.genderExcluded.length ? '<p class="muted">'+d.genderExcluded.length+' listing'+(d.genderExcluded.length===1?"":"s")+' hidden by the gender filter.</p>' : "")
+            + (d.genderSet===false ? '<p class="notice-box">Set your gender in <a href="#/profile">Edit My Profile</a> so gender-restricted roles filter correctly for you.</p>' : "")
+            + list.map(function(m){
             var o = m.opportunity||{};
             var reasons = Array.isArray(m.reasons) ? m.reasons.join(" · ") : (m.reason||m.explanation||"");
             var oid = m.opportunityId || (o&&o.id) || m.opportunity_id;
             var title = o.title || m.title || (titles && titles[oid]) || oid || "Opportunity";
             return '<div class="opp-card"><h3>'+esc(title)+'</h3><p><strong>'+esc(m.classification||m.match||"")+'</strong> — '+esc(reasons)+'</p>'
+              + '<p>'+selBadge(m)+'</p>'
+              + '<p class="meta">Gender: '+esc(m.genderRequirement ? (m.genderRequirement==="female"?"Female only":"Male only") : "Open to all genders")+'</p>'
               + (oid?'<p><a href="#/opportunity/'+encodeURIComponent(oid)+'">View opportunity</a></p>':"")+'</div>';
           }).join("");
         };
@@ -1272,10 +1311,13 @@ function screenJobsForYou(app){
     var list = d.jobs||[];
     var el = $("#jobs-list"); if(!el) return;
     if(!list.length){ el.innerHTML = emptyBox("No jobs for you yet. Complete your profile and portfolio, then check back — new matches appear as listings land."); return; }
-    el.innerHTML = '<p class="muted">'+list.length+' job'+(list.length===1?"":"s")+' for you · Automation is <strong>'+(d.automationEnabled?"ON":"OFF")+'</strong> · '+esc(d.note||"")+'</p>'
+    el.innerHTML = '<p class="muted">'+list.length+' job'+(list.length===1?"":"s")+' for you · Automation is <strong>'+(d.automationEnabled?"ON":"OFF")+'</strong> · '+esc(d.note||"")+(d.genderExcluded? ' · '+d.genderExcluded+' hidden by the gender filter':'')+'</p>'
+      + (d.genderSet===false ? '<p class="notice-box">Set your gender in <a href="#/profile">Edit My Profile</a> so gender-restricted roles filter correctly for you.</p>' : "")
       + list.map(function(j){
         return '<div class="opp-card"><h3>'+esc(j.title||"Job")+'</h3>'
           + '<p><strong>'+esc(j.classification||"")+'</strong> — '+esc((j.reasons||[]).join(" · "))+'</p>'
+          + '<p>'+selBadge(j)+'</p>'
+          + '<p class="meta">Gender: '+esc(j.genderRequirement ? (j.genderRequirement==="female"?"Female only":"Male only") : "Open to all genders")+'</p>'
           + '<p class="meta">'+esc(j.agency||"")+' · '+esc(j.location?((j.location.city||"")+", "+(j.location.state||"")):"")+' · Pay: '+esc(j.compensation||"Not stated")+'</p>'
           + '<p class="meta">Reference code: <strong class="mono">'+esc(j.referenceCode||"")+'</strong> · '+esc(j.automationNote||"")+'</p>'
           + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(j.opportunityId)+'">View opportunity</a></p></div>';

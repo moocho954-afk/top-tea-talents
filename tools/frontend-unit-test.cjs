@@ -78,31 +78,34 @@ check("toApiProfile maps snake_case to camelCase", () => {
   eq(b.ageRange, "25-34"); eq(b.firstName, "Testy"); eq(b.travelRadius, 50);
 });
 
-// --- completionPct: 6 core items only, photos never count (Fix 1) ---
+// --- completionPct (fallback, v1.2.0): core items only, on the richness
+// scale — core is worth 60 of 100, so a bare 6-core record reads 60, never
+// 100. Photos never count here; the server adds photos/categories/
+// availability/gender/verified-social on top. ---
 const SIX_CORE = { email: "a@b.c", phone: "3055550100", first_name: "Testy", last_name: "Talent", city: "Miami", state: "FL", zip: "33101", height: "5ft 9in", age_range: "25-34", experience: "5 years" };
-check("completionPct: 6 core items only, zero optionals -> 100", () => {
-  eq(completionPct(SIX_CORE), 100);
+check("completionPct: 6 core items only, zero optionals -> 60 (core is 60 of 100)", () => {
+  eq(completionPct(SIX_CORE), 60);
 });
 check("completionPct: optional groups filled or empty never change it", () => {
   const withOpt = { ...SIX_CORE, languages: ["English"], skills: ["Acting"], categories: ["Background extras"], availability: ["Weekdays"] };
-  eq(completionPct(withOpt), 100);
-  eq(completionPct({ ...SIX_CORE, languages: [], skills: [], categories: [], availability: [] }), 100);
+  eq(completionPct(withOpt), 60);
+  eq(completionPct({ ...SIX_CORE, languages: [], skills: [], categories: [], availability: [] }), 60);
 });
-check("completionPct: missing ageRange -> 83", () => {
+check("completionPct: missing ageRange -> 50", () => {
   const t = { ...SIX_CORE }; delete t.age_range;
-  eq(completionPct(t), 83);
+  eq(completionPct(t), 50);
 });
-check("completionPct: missing height + experience -> 67", () => {
+check("completionPct: missing height + experience -> 40", () => {
   const t = { ...SIX_CORE }; delete t.height; delete t.experience;
-  eq(completionPct(t), 67);
+  eq(completionPct(t), 40);
 });
 check("completionPct: photos never count", () => {
-  eq(completionPct({ ...SIX_CORE, photos: [{}, {}, {}, {}, {}, {}, {}, {}] }), 100);
+  eq(completionPct({ ...SIX_CORE, photos: [{}, {}, {}, {}, {}, {}, {}, {}] }), 60);
   const t = { ...SIX_CORE }; delete t.height;
-  eq(completionPct({ ...t, photos: [{}, {}, {}] }), 83);
+  eq(completionPct({ ...t, photos: [{}, {}, {}] }), 50);
 });
 check("completionPct: camelCase profile also works", () => {
-  eq(completionPct({ email: "a@b.c", phone: "1", firstName: "T", lastName: "T", city: "M", state: "FL", zip: "1", height: "5", ageRange: "25-34", experience: "x" }), 100);
+  eq(completionPct({ email: "a@b.c", phone: "1", firstName: "T", lastName: "T", city: "M", state: "FL", zip: "1", height: "5", ageRange: "25-34", experience: "x" }), 60);
 });
 
 // --- mergeDraftWithProfile: repopulation (new requirement) ---

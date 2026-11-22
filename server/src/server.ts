@@ -7,7 +7,7 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
@@ -203,13 +203,18 @@ async function saveProfile(id: string, profile: any): Promise<void> {
   await db.run("UPDATE talents SET profile_json = ?, updated_at = ? WHERE id = ?", [JSON.stringify(profile), nowIso(), id]);
 }
 
-// Completion checklist: 6 CORE items only (owner order 2026-11-22).
-// Languages, skills, categories and availability are OPTIONAL extras: they
-// still save on the profile and feed matching when provided, but they never
-// count toward completion and never block the likeness-release signature.
-// (Before: 10 items x 10% — the 4 checkbox/chip groups blocked signing
-// for people they did not apply to; the girlfriend's signup stalled at
-// 60% = 6/10 for exactly that reason.)
+// Completion: TWO numbers, kept apart on purpose (owner orders 2026-11-22).
+// - corePercent: the 6 CORE items only (contact, name, location, height,
+//   age range, experience). THIS is the release/status gate: nothing
+//   optional ever blocks signing, so a talent who skips categories,
+//   photos, or social links can still sign and be READY FOR MATCHING.
+// - percent: honest profile richness (core 60 + photos 10 + categories 10
+//   + availability 5 + gender 5 + social-verified 10). A bare record with
+//   only the 6 core items reads 60%, never 100% — the Dashboard shows
+//   this number. Photos/social need live counts, so completionOf takes an
+//   optional extras param; callers without it get core-only richness.
+// (Before v1.2.0 the Dashboard showed the 6-core number alone, so a bare
+// record with 0 photos and no categories read "100%".)
 const COMPLETION_ITEMS: { key: string; label: string; check: (p: any) => boolean }[] = [
   { key: "contact", label: "Contact info (email + phone)", check: (p) => !!p.email && !!p.phone },
   { key: "name", label: "Legal name", check: (p) => !!p.firstName && !!p.lastName },
@@ -218,16 +223,26 @@ const COMPLETION_ITEMS: { key: string; label: string; check: (p: any) => boolean
   { key: "age_range", label: "Age range", check: (p) => !!p.ageRange },
   { key: "experience", label: "Experience", check: (p) => !!p.experience },
 ];
-function completionOf(p: any): { percent: number; checklist: { key: string; label: string; done: boolean }[] } {
-  const checklist = COMPLETION_ITEMS.map((i) => ({ key: i.key, label: i.label, done: i.check(p) }));
-  const done = checklist.filter((c) => c.done).length;
-  return { percent: Math.round((done / checklist.length) * 100), checklist };
+const RICHNESS_ITEMS: { key: string; label: string; points: number; check: (p: any, x?: { photos?: number; socialVerified?: boolean }) => boolean }[] = [
+  { key: "photos", label: "Portfolio photos", points: 10, check: (p, x) => (x?.photos ?? 0) > 0 },
+  { key: "categories", label: "Categories", points: 10, check: (p) => Array.isArray(p.categories) && p.categories.length > 0 },
+  { key: "availability", label: "Availability", points: 5, check: (p) => Array.isArray(p.availability) && p.availability.length > 0 },
+  { key: "gender", label: "Gender", points: 5, check: (p) => !!(p.demographics?.gender || p.gender) },
+  { key: "social", label: "Verified social link", points: 10, check: (p, x) => x?.socialVerified === true },
+];
+function completionOf(p: any, extras?: { photos?: number; socialVerified?: boolean }): { percent: number; corePercent: number; checklist: { key: string; label: string; done: boolean; points: number }[] } {
+  const core = COMPLETION_ITEMS.map((i) => ({ key: i.key, label: i.label, done: i.check(p), points: 10 }));
+  const coreDone = core.filter((c) => c.done).length;
+  const corePercent = Math.round((coreDone / core.length) * 100);
+  const rich = RICHNESS_ITEMS.map((i) => ({ key: i.key, label: i.label, done: i.check(p, extras), points: i.points }));
+  const richPoints = rich.filter((c) => c.done).reduce((s, c) => s + c.points, 0);
+  return { percent: coreDone * 10 + richPoints, corePercent, checklist: [...core, ...rich] };
 }
 async function deriveStatus(talentId: string, profile: any): Promise<string> {
   const c = await db.all("SELECT signed, status FROM consents WHERE talent_id = ?", [talentId]);
   const consent = c.length ? c[0] : null;
   if (consent && String(consent.status) === "REVOKED") return "REVOKED";
-  const pct = completionOf(profile).percent;
+  const pct = completionOf(profile).corePercent;
   if (pct < 100) return "PROFILE INCOMPLETE";
   const r = await db.all("SELECT decision FROM reviews WHERE talent_id = ? ORDER BY created_at DESC LIMIT 1", [talentId]);
   if (r.length && String(r[0].decision) === "PASS") return "READY FOR MATCHING";
@@ -261,7 +276,9 @@ async function allSources(): Promise<any[]> {
   return rows.map((r) => JSON.parse(String(r.data_json)));
 }
 function oppWithExpiry(o: any): any {
-  return { ...o, expired: oppExpired(o) };
+  const sel = deriveSelectivity(o);
+  const dg = deriveOppGenders(o);
+  return { ...o, expired: oppExpired(o), selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: dg.genders === "open" ? null : dg.genders };
 }
 
 // ---------- seed ----------
@@ -385,7 +402,10 @@ async function talentView(id: string): Promise<any | null> {
   const t = await loadTalent(id);
   if (!t) return null;
   const p = t.profile;
-  const comp = completionOf(p);
+  const comp = completionOf(p, {
+    photos: await photoCount(id),
+    socialVerified: (await db.all("SELECT id FROM social_links WHERE talent_id = ? AND status = 'AUTHORIZED'", [id])).length > 0,
+  });
   const status = p.status || (await deriveStatus(id, p));
   const ft = await db.all("SELECT version, authorized_at FROM fast_track WHERE talent_id = ?", [id]);
   const gd = await db.all("SELECT data_json FROM guardians WHERE talent_id = ?", [id]);
@@ -394,6 +414,7 @@ async function talentView(id: string): Promise<any | null> {
     id,
     ...p,
     completion: comp.percent,
+    coreCompletion: comp.corePercent,
     completionChecklist: comp.checklist,
     status,
     emailVerified: p.emailVerified === true,
@@ -1526,7 +1547,10 @@ async function handle(req: Request): Promise<Response> {
       const prof = String(t.profile.professionalName || "").trim().toLowerCase();
       if (sig.toLowerCase() !== legal && sig.toLowerCase() !== prof) return err(400, "signature must match your legal name or professional name");
       const comp = completionOf(t.profile);
-      if (comp.percent < 100) return err(400, `profile must be 100% complete before signing (currently ${comp.percent}%)`);
+      if (comp.corePercent < 100) {
+        const missing = comp.checklist.filter((c) => !c.done && COMPLETION_ITEMS.some((i) => i.key === c.key)).map((c) => c.label).join(", ");
+        return err(400, `profile core must be 100% complete before signing (currently ${comp.corePercent}% — missing: ${missing})`);
+      }
       const ts = nowIso();
       await db.run("INSERT INTO consents (talent_id, signed, signed_at, signature, status, version, updated_at) VALUES (?, 1, ?, ?, 'SIGNED', 'TTT-LIKENESS-v1.0', ?) ON CONFLICT(talent_id) DO UPDATE SET signed = 1, signed_at = excluded.signed_at, signature = excluded.signature, status = 'SIGNED', version = 'TTT-LIKENESS-v1.0', updated_at = excluded.updated_at",
         [talentId, ts, sig, ts]);
@@ -1570,9 +1594,11 @@ async function handle(req: Request): Promise<Response> {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       const t = await loadTalent(talentId);
       if (!t) return err(404, "talent not found");
-      const matches = matchTalent(t.profile, await allOpps());
-      await audit("talent.match", "talent", talentId, talentId, { evaluated: matches.length, strong: matches.filter((m: any) => m.classification === "STRONG MATCH").length });
-      return ok({ matches, demographicsNote: "Demographics are never used as a matching score. Matching uses location/travel radius, age/eligibility, skills, experience, availability, and compensation preferences only." });
+      const mStats: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> } = {};
+      const matches = matchTalent(t.profile, await allOpps(), mStats);
+      const genderExcluded = mStats.genderExcluded || [];
+      await audit("talent.match", "talent", talentId, talentId, { evaluated: matches.length, strong: matches.filter((m: any) => m.classification === "STRONG MATCH").length, genderExcluded: genderExcluded.length });
+      return ok({ matches, genderExcluded, talentGender: talentGender(t.profile), genderSet: !!(t.profile?.demographics?.gender || t.profile?.gender), demographicsNote: "Gender is a hard eligibility filter, never a score: a listing that requires a different gender never appears in your matches. Other demographics are never used as a matching score. Matching scores use location/travel radius, age/eligibility, skills, experience, availability, and compensation preferences only." });
     }
     if (rest.length === 3 && rest[2] === "rotation-queue" && method === "POST") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
@@ -1593,11 +1619,16 @@ async function handle(req: Request): Promise<Response> {
       const b = await body(req);
       if (!b || !Array.isArray(b.opportunityIds)) return err(400, "opportunityIds array is required");
       const created: any[] = []; const skipped: any[] = [];
+      const tp = await loadTalent(talentId);
+      const tg = talentGender(tp?.profile);
       for (const oppId of b.opportunityIds) {
         const dup = await db.all("SELECT id FROM applications WHERE talent_id = ? AND opportunity_id = ?", [talentId, oppId]);
         if (dup.length) { skipped.push({ opportunityId: oppId, reason: "duplicate application" }); continue; }
         const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [oppId]);
         if (!oppRows.length) { skipped.push({ opportunityId: oppId, reason: "opportunity not found" }); continue; }
+        const opp = JSON.parse(String(oppRows[0].data_json));
+        const dg = deriveOppGenders(opp);
+        if (genderBlocksTalent(dg.genders, tg)) { skipped.push({ opportunityId: oppId, reason: `gender requirement (${dg.genders}-only) does not match talent gender` }); continue; }
         const id = genId("app");
         const ts = nowIso();
         await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, talentId, oppId, ts, ts]);
@@ -1616,7 +1647,8 @@ async function handle(req: Request): Promise<Response> {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       const t = await loadTalent(talentId);
       if (!t) return err(404, "talent not found");
-      const matches = matchTalent(t.profile, await allOpps());
+      const jStats: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> } = {};
+      const matches = matchTalent(t.profile, await allOpps(), jStats);
       const automation = await loadAutomation(talentId);
       const opps = await allOpps();
       const byId = new Map(opps.map((o: any) => [String(o.id), o]));
@@ -1632,6 +1664,8 @@ async function handle(req: Request): Promise<Response> {
             compensation: o.compensation || null, compensationType: o.compensation_type || null,
             deadline: o.deadline || null, verificationStatus: o.verification_status || null,
             classification: m.classification, reasons: m.reasons, score: m.score,
+            selectivity: m.selectivity || "unknown", selectivityReason: m.selectivityReason || null,
+            genderRequirement: m.genderRequirement || null,
             referenceCode: refCode(talentId, String(m.opportunityId)),
             automationEligible: autoEligible,
             automationNote: automation.enabled !== true
@@ -1641,7 +1675,7 @@ async function handle(req: Request): Promise<Response> {
                 : "Automation is ON but this job needs your approval first.",
           };
         });
-      return ok({ jobs, total: jobs.length, automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
+      return ok({ jobs, total: jobs.length, genderExcluded: (jStats.genderExcluded || []).length, talentGender: talentGender(t.profile), genderSet: !!(t.profile?.demographics?.gender || t.profile?.gender), automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
     }
     // ----- v8: BIG automation toggle -----
     if (rest.length === 3 && rest[2] === "automation") {
@@ -2082,6 +2116,10 @@ async function handle(req: Request): Promise<Response> {
       if (dup.length) return err(409, "application already exists for this talent and opportunity");
       const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [b.opportunityId]);
       if (!oppRows.length) return err(404, "opportunity not found");
+      const tp = await loadTalent(String(b.talentId));
+      const opp = JSON.parse(String(oppRows[0].data_json));
+      const dg = deriveOppGenders(opp);
+      if (genderBlocksTalent(dg.genders, talentGender(tp?.profile))) return err(400, `This opportunity requires ${dg.genders} talent and does not match this talent's gender (derived from listing text, ${dg.source}).`);
       const id = genId("app");
       const ts = nowIso();
       await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, b.talentId, b.opportunityId, ts, ts]);
@@ -2303,21 +2341,132 @@ async function countsAll(): Promise<any> {
   };
 }
 
+// ---------- gender gate (owner order 2026-11-22) ----------
+// Gender is never a SCORE — it is a hard eligibility gate. A listing that
+// requires female must NEVER match a male talent, and vice versa. Listings
+// carry no gender column (opportunities store data_json only), so the
+// requirement is derived from the listing text at match time: per-role
+// "(Female; …)" / "(Male; …)" / "(Both genders; …)" annotations in roles
+// first, then the listing prose (title / eligibility / appearance). A
+// listing with no gender requirement matches every gender. Derivation is
+// logged, never silent: matchTalent counts gender-excluded listings in
+// stats.genderExcluded and names each one, and the rotation queue marks
+// them SKIPPED with the reason on the row.
+const FEMALE_WORDS = /\b(female|females|woman|women|girl|girls|actress|actresses)\b/i;
+const MALE_WORDS = /\b(male|males|man|men|boy|boys)\b/i;
+// Explicit open-to-all signals — these override any single-gender mention
+// (e.g. a grooming note "Men should stop cutting hair" inside an
+// "All roles and types welcome" listing is not a male-only requirement).
+const OPEN_GENDER_SIGNALS = /\b(both genders|all genders|male and female|female and male|men and women|women and men|male or female|female or male|male\/female|female\/male|female\s*&\s*male|male\s*&\s*female|all roles and types welcome|open to all|everyone welcome)\b/i;
+const ROLE_GENDER_ANN = /\((Female|Male|Both genders|All genders)[^)]*\)/gi;
+type OppGenders = "female" | "male" | "open";
+function deriveOppGenders(o: any): { genders: OppGenders; source: string } {
+  const roles = String(o.roles || "");
+  const prose = [o.title, o.eligibility, o.appearance].map((x) => String(x || "")).join(" ");
+  if (OPEN_GENDER_SIGNALS.test(roles + " " + prose)) return { genders: "open", source: "open-signal" };
+  const anns: string[] = [];
+  ROLE_GENDER_ANN.lastIndex = 0;
+  let am: RegExpExecArray | null;
+  while ((am = ROLE_GENDER_ANN.exec(roles)) !== null) anns.push(am[1].toLowerCase());
+  if (anns.length) {
+    const s = new Set<string>();
+    for (const a of anns) {
+      if (a.includes("both") || a.includes("all")) { s.add("female"); s.add("male"); }
+      else if (a.includes("female")) s.add("female");
+      else if (a.includes("male")) s.add("male");
+    }
+    if (s.has("female") && s.has("male")) return { genders: "open", source: "roles-both" };
+    if (s.has("female")) {
+      if (MALE_WORDS.test(prose)) return { genders: "open", source: "roles+prose" };
+      return { genders: "female", source: "roles" };
+    }
+    if (s.has("male")) {
+      if (FEMALE_WORDS.test(prose)) return { genders: "open", source: "roles+prose" };
+      return { genders: "male", source: "roles" };
+    }
+    return { genders: "open", source: "roles-unreadable" };
+  }
+  const f = FEMALE_WORDS.test(prose);
+  const ml = MALE_WORDS.test(prose);
+  if (f && !ml) return { genders: "female", source: "prose" };
+  if (ml && !f) return { genders: "male", source: "prose" };
+  return { genders: "open", source: "prose-none-or-both" };
+}
+// The talent's gender lives at profile.demographics.gender (the wizard
+// saves it nested; the frontend also mirrors it flat as profile.gender).
+// Only a definite Male/Female gates anything: non-binary, other, and
+// prefer-not-to-say are never hard-excluded by this filter.
+function talentGender(profile: any): "male" | "female" | null {
+  const g = profile?.demographics?.gender ?? profile?.gender ?? null;
+  if (!g) return null;
+  const n = String(g).trim().toLowerCase();
+  if (n === "male") return "male";
+  if (n === "female") return "female";
+  return null;
+}
+function genderBlocksTalent(oppGenders: OppGenders, tg: "male" | "female" | null): boolean {
+  if (!tg) return false;
+  if (oppGenders === "female" && tg === "male") return true;
+  if (oppGenders === "male" && tg === "female") return true;
+  return false;
+}
+
+// ---------- selectivity (owner order 2026-11-22) ----------
+// Every casting is classed by how selective it is, derived from the
+// listing text — never guessed as guaranteed:
+// - "guaranteed": the text says it outright — open call / open casting /
+//   walk-in / everyone welcome / immediate hire / no audition. These are
+//   the everybody-gets-picked jobs; they rank first in Jobs For You and
+//   are preferred by the auto-submit rotation.
+// - "selective": audition / callback / limited spots / only a few picked /
+//   competitive / by invitation. Clearly labeled so a talent knows the
+//   odds before applying; ranked below guaranteed.
+// - "unknown": neither signal is present. Shown as "selectivity unknown",
+//   never promoted to guaranteed. Audition language wins ties: an "open
+//   casting call" that still holds auditions is selective, not guaranteed.
+// ("Open to all ethnicities/ages" is an inclusivity statement, not a hire
+// guarantee — the lookahead excludes it. "No experience necessary" only
+// speaks to requirements, not hiring odds, so it is not a signal either.)
+type SelectivityClass = "guaranteed" | "selective" | "unknown";
+const GUARANTEED_SIGNALS = /\b(open call|open casting|walk[\s-]?in|everyone welcome|all welcome|all are welcome|everyone hired|immediate hire|hiring immediately|no audition|all sizes welcome|all types welcome|open to all(?!\s+(ethnicities|ages))|everyone who (shows? up|applies|attends)|guaranteed (hire|work|pay|booking))\b/i;
+const SELECTIVE_SIGNALS = /\b(audition|callback|call back|limited spots?|limited openings?|only (a )?few|only \d+ (will be|to be) (selected|chosen|picked)|competitive|by invitation|invite only|invitation only|screening|must have experience|experienced only|highly selective|shortlist)\b/i;
+function deriveSelectivity(o: any): { class: SelectivityClass; reason: string | null } {
+  const text = [o.title, o.roles, o.eligibility, o.appearance, o.skills, o.category].map((x) => String(x || "")).join(" ");
+  const g = GUARANTEED_SIGNALS.exec(text);
+  const s = SELECTIVE_SIGNALS.exec(text);
+  if (g && !s) return { class: "guaranteed", reason: g[0] };
+  if (s) return { class: "selective", reason: s[0] };
+  return { class: "unknown", reason: null };
+}
+const SELECTIVITY_RANK: Record<SelectivityClass, number> = { guaranteed: 0, unknown: 1, selective: 2 };
+
 // ---------- matching ----------
 function parseAgeRange(s: string | null | undefined): [number, number] | null {
   if (!s) return null;
   const m = String(s).match(/(\d+)\s*-\s*(\d+)/);
   return m ? [Number(m[1]), Number(m[2])] : null;
 }
-function matchTalent(profile: any, opps: any[]): any[] {
+function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> }): any[] {
   const out: any[] = [];
   const mySkills: Set<string> = new Set((profile.skills || []).map((s: string) => String(s).toLowerCase()));
   const myCats = new Set((profile.categories || []).map((s: string) => String(s).toLowerCase()));
   const myAvail = new Set((profile.availability || []).map((s: string) => String(s).toLowerCase()));
   const myAge = parseAgeRange(profile.ageRange);
   const myMin = profile.minCompensation != null ? Number(profile.minCompensation) : null;
+  const tg = talentGender(profile);
   for (const o of opps) {
     if (oppExpired(o)) continue;
+    // Gender gate FIRST: a listing that requires the other gender is never
+    // a match — it is excluded, not down-scored, and the exclusion is
+    // counted + named in stats so it is never a silent drop.
+    const dg = deriveOppGenders(o);
+    if (genderBlocksTalent(dg.genders, tg)) {
+      if (stats) {
+        stats.genderExcluded = stats.genderExcluded || [];
+        stats.genderExcluded.push({ opportunityId: String(o.id), requiredGender: dg.genders as "female" | "male", source: dg.source });
+      }
+      continue;
+    }
     const reasons: string[] = [];
     let score = 0;
     // Location / travel radius
@@ -2354,9 +2503,16 @@ function matchTalent(profile: any, opps: any[]): any[] {
     else if (score >= 4) classification = "QUALIFIED MATCH";
     else if (score >= 2) classification = "POTENTIAL MATCH";
     else if (daily === null) classification = "NEEDS TALENT APPROVAL";
-    out.push({ opportunityId: o.id, classification, reasons, score });
+    // Gender fit is cited on the match itself when the listing restricts
+    // by gender, so the talent can see WHY it fits — never a silent pass.
+    const sel = deriveSelectivity(o);
+    if (dg.genders !== "open") reasons.push(`Gender fit: ${dg.genders}-only role`);
+    out.push({ opportunityId: o.id, classification, reasons, score, selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: dg.genders === "open" ? null : dg.genders });
   }
-  out.sort((a, b) => b.score - a.score);
+  // Guaranteed (everybody-gets-picked) castings rank first, then unknown,
+  // then selective — within each class, best score first. The score and
+  // its classification thresholds are unchanged; only the order moves.
+  out.sort((a, b) => (SELECTIVITY_RANK[a.selectivity as SelectivityClass] - SELECTIVITY_RANK[b.selectivity as SelectivityClass]) || (b.score - a.score));
   return out;
 }
 
@@ -2403,16 +2559,28 @@ function extractDateTokens(text: string | null | undefined): string[] {
   return [...tokens];
 }
 function rotationQueue(profile: any, opps: any[], caps: { perDay: number; perWeek: number }, booked: any[]): any[] {
+  const tg = talentGender(profile);
   const live = opps.filter((o) => !oppExpired(o));
   const ranked = live
-    .map((o) => ({ o, daily: normalizedDaily(o.compensation_type, o.compensation, o.hours) }))
-    .sort((a, b) => (b.daily ?? -1) - (a.daily ?? -1));
+    .map((o) => ({ o, daily: normalizedDaily(o.compensation_type, o.compensation, o.hours), sel: deriveSelectivity(o) }))
+    // Guaranteed (everybody-gets-picked) first, then unknown, then
+    // selective — within each class, best pay first. (Before: pay-first
+    // only, so a selective audition could outrank an open-call hire.)
+    .sort((a, b) => (SELECTIVITY_RANK[a.sel.class] - SELECTIVITY_RANK[b.sel.class]) || ((b.daily ?? -1) - (a.daily ?? -1)));
   const selected: any[] = [];
   const queue: any[] = [];
   const bookedTokens = new Set<string>();
   for (const b of booked) for (const t of extractDateTokens(b.production_dates || b.deadline)) bookedTokens.add(t);
   const bookedLocs = new Set(booked.map((b) => normName(String(b.location?.raw || ""))));
-  for (const { o, daily } of ranked) {
+  for (const { o, daily, sel } of ranked) {
+    const dg = deriveOppGenders(o);
+    const genderReq = dg.genders === "open" ? null : dg.genders;
+    // Gender gate: a listing that requires the other gender is never
+    // selected for auto-submit — SKIPPED with the reason on the row.
+    if (genderBlocksTalent(dg.genders, tg)) {
+      queue.push({ opportunityId: o.id, decision: "SKIPPED", reason: `Gender requirement is ${dg.genders}-only — does not match the talent's gender (derived from listing text, ${dg.source})`, normalizedDailyPay: daily, selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: genderReq });
+      continue;
+    }
     const tokens = extractDateTokens(o.production_dates || o.deadline);
     const loc = normName(String(o.location?.raw || ""));
     const hasTimes = tokens.length > 0;
@@ -2435,7 +2603,7 @@ function rotationQueue(profile: any, opps: any[], caps: { perDay: number; perWee
     else if (daily === null) { reason = "times not stated — verify before submitting; pay undisclosed, ranked last"; }
     if (sameAddressCluster) reason += "; same-address non-overlapping cluster included";
     if (decision === "SELECTED") selected.push(o);
-    queue.push({ opportunityId: o.id, decision, reason, normalizedDailyPay: daily });
+    queue.push({ opportunityId: o.id, decision, reason, normalizedDailyPay: daily, selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: genderReq });
   }
   return queue;
 }
