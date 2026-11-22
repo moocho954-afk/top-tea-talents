@@ -32,6 +32,39 @@ function tursoVal(v: any): any {
   return v.value;
 }
 
+function stripSqlComments(sql: string): string {
+  // Remove -- line comments and /* */ block comments, respecting
+  // single-quoted string literals (a -- inside '...' is data, not a comment).
+  // Needed because Turso rejects a comment-only statement ("SQL string does
+  // not contain any statement") while bun:sqlite swallows the whole file.
+  let out = "";
+  let i = 0;
+  let inStr = false;
+  while (i < sql.length) {
+    const c = sql[i];
+    const n = sql[i + 1];
+    if (inStr) {
+      out += c;
+      if (c === "'") inStr = false;
+      i++;
+      continue;
+    }
+    if (c === "'") { inStr = true; out += c; i++; continue; }
+    if (c === "-" && n === "-") {
+      while (i < sql.length && sql[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 class TursoDb implements Db {
   storage: "turso" = "turso";
   durable = true;
@@ -73,7 +106,7 @@ class TursoDb implements Db {
     };
   }
   async exec(sql: string): Promise<void> {
-    const stmts = sql.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
+    const stmts = stripSqlComments(sql).split(";").map((s) => s.trim()).filter((s) => s.length > 0);
     if (!stmts.length) return;
     await this.pipeline(stmts.map((s) => ({ type: "execute", stmt: { sql: s, args: [] } })));
   }
