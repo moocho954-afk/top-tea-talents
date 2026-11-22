@@ -7,10 +7,11 @@ cd "$(dirname "$0")"
 PORT="${TEST_PORT:-3457}"
 DB="$(mktemp /tmp/ttt-test-XXXXXX.db)"
 rm -f "$DB"
+MIRROR="${DB%.db}-mirror.jsonl" # wipe-proof ledger mirror lives next to the DB
 export PORT DATABASE_PATH="$DB" ADMIN_TOKEN="test-admin-token"
 bun run src/server.ts > /tmp/ttt-selftest-server.log 2>&1 &
 SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$DB" "$DB-wal" "$DB-shm"; }
+cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$DB" "$DB-wal" "$DB-shm" "$MIRROR" "$MIRROR".fetch-tmp "$MIRROR".rebuild-tmp "$MIRROR".tampered-*; }
 trap cleanup EXIT
 
 BASE="http://127.0.0.1:$PORT/api/v1"
@@ -27,13 +28,20 @@ for i in $(seq 1 30); do
   if curl -sf "$BASE/health" -o /tmp/ttt-body.json 2>/dev/null; then break; fi
   sleep 0.5
 done
+wait_health() { # reused after every restart in the wipe tests below
+  for i in $(seq 1 30); do
+    if curl -sf "$BASE/health" -o /tmp/ttt-body.json 2>/dev/null; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
 
 check "health returns ok + test_mode + sqlite storage" python3 - <<'PY'
 import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.0.0", d
+assert d["version"]=="1.1.0", d
 print("health ok:", d["counts"])
 PY
 
@@ -127,6 +135,17 @@ curl -sf -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
 TALENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['talentId'])")
 TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
 check "register returns talentId + token" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talentId'].startswith('tal_') and d['token'], d"
+# v7 email verification gate: consent sign + rotation require a verified
+# email. TEST MODE: the code comes back once in the register response
+# (email is not connected), so verify it here before consent.
+VCODE=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['testModeVerificationCode'])")
+check "register returns verificationRequired + TEST MODE code (email not connected)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['verificationRequired'] is True and len(d['testModeVerificationCode'])==6 and d['testModeVerificationCode'].isdigit(), d"
+curl -sf -X POST "$BASE/auth/verify-email" -H 'Content-Type: application/json' -d "{\"email\":\"test@toptea.example\",\"code\":\"$VCODE\"}" -o /tmp/ttt-body.json
+check "email verification with TEST MODE code succeeds" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['verified'] is True, d"
+
+check "verify with wrong code returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/verify-email -H 'Content-Type: application/json' -d '{\"email\":\"test@toptea.example\",\"code\":\"000000\"}' | grep -q 400"
+curl -sf "$BASE/auth/verification-status?email=test@toptea.example" -o /tmp/ttt-body.json
+check "verification status: verified after code entry" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['verified'] is True, d"
 
 check "duplicate email returns 409" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/register -H 'Content-Type: application/json' -d '{\"email\":\"test@toptea.example\",\"phone\":\"3055550100\",\"firstName\":\"Testy\",\"lastName\":\"Talent\",\"password\":\"secret123\",\"termsAccepted\":true}' | grep -q 409"
 
@@ -184,7 +203,7 @@ check "application created AWAITING APPROVAL (TEST MODE)" python3 -c "import jso
 check "duplicate application returns 409" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$TALENT_ID\",\"opportunityId\":\"$OPP_ID\"}' | grep -q 409"
 check "booking without evidence returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/bookings -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{\"applicationId\":\"$APP_ID\"}' | grep -q 400"
 curl -sf -X POST "$BASE/bookings" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' \
-  -d "{\"applicationId\":\"$APP_ID\",\"evidence\":\"confirmation email from casting\"}" -o /tmp/ttt-body.json
+  -d "{\"applicationId\":\"$APP_ID\",\"evidence\":\"confirmation email from casting\",\"gross\":550}" -o /tmp/ttt-body.json
 check "booking with evidence succeeds + gross-fee=net in cents" python3 - <<'PY'
 import json
 d=json.load(open('/tmp/ttt-body.json'))
@@ -275,6 +294,259 @@ assert d["payments"][0]["note"].startswith("Payment tracking only"), d["payments
 assert len(d["events"])>=1, d
 print("history jobs:", len(d["jobs"]), "bookings:", len(d["bookings"]))
 PY
+
+# ----- v11 PARITY: verification gate, reset, jobs, automation, earnings, owner, portfolio, social, replies -----
+# Second talent: consent is gated on verified email.
+curl -sf -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d '{"email":"second@toptea.example","phone":"3055550101","firstName":"Second","lastName":"Talent","password":"secret123","city":"Fort Lauderdale","state":"FL","contactMethod":"text","termsAccepted":true}' -o /tmp/ttt-body.json
+TALENT2_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['talentId'])")
+TOKEN2=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
+VCODE2=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['testModeVerificationCode'])")
+check "register accepts screen-1 city/state/contactMethod" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talentId'].startswith('tal_') and d['verificationRequired'] is True, d"
+curl -sf -X PATCH "$BASE/talent/$TALENT2_ID" -H "Authorization: Bearer $TOKEN2" -H 'Content-Type: application/json' \
+  -d '{"city":"Fort Lauderdale","state":"FL","zip":"33301","height":"5ft 6in","ageRange":"25-35","adultOrMinor":"adult","languages":["English"],"skills":["Acting"],"experience":"2 years extras","categories":["Background extras"],"availability":["Weekends"],"minCompensation":100}' -o /tmp/ttt-body.json
+check "consent sign BLOCKED before email verification (400)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT2_ID/likeness-release/sign -H 'Authorization: Bearer $TOKEN2' -H 'Content-Type: application/json' -d '{\"agreed\":true,\"signature\":\"Second Talent\"}' | grep -q 400"
+curl -sf -X POST "$BASE/auth/verify-email" -H 'Content-Type: application/json' -d "{\"email\":\"second@toptea.example\",\"code\":\"$VCODE2\"}" -o /tmp/ttt-body.json
+check "second talent verifies, then consent sign succeeds" bash -c "curl -sf -X POST $BASE/talent/$TALENT2_ID/likeness-release/sign -H 'Authorization: Bearer $TOKEN2' -H 'Content-Type: application/json' -d '{\"agreed\":true,\"signature\":\"Second Talent\"}' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['status']=='AWAITING AGENCY REVIEW', d\""
+
+# password reset on talent2 (keeps talent1's session alive for later checks)
+curl -sf -X POST "$BASE/auth/request-password-reset" -H 'Content-Type: application/json' -d '{"email":"second@toptea.example"}' -o /tmp/ttt-body.json
+RCODE=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['testModeResetCode'])")
+check "password reset request returns a TEST MODE code" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['testModeResetCode'])==6 and d['testModeResetCode'].isdigit(), d"
+check "reset with wrong code returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/reset-password -H 'Content-Type: application/json' -d '{\"email\":\"second@toptea.example\",\"code\":\"000000\",\"newPassword\":\"newsecret123\"}' | grep -q 400"
+curl -sf -X POST "$BASE/auth/reset-password" -H 'Content-Type: application/json' -d "{\"email\":\"second@toptea.example\",\"code\":\"$RCODE\",\"newPassword\":\"newsecret123\"}" -o /tmp/ttt-body.json
+check "reset with the right code succeeds" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['reset'] is True, d"
+check "login works with the new password, old password fails" bash -c "curl -sf -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"second@toptea.example\",\"password\":\"newsecret123\"}' -o /tmp/ttt-body.json && grep -q token /tmp/ttt-body.json && curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"second@toptea.example\",\"password\":\"secret123\"}' | grep -q 401"
+TOKEN2=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
+
+# Jobs For You feed
+curl -sf "$BASE/talent/$TALENT_ID/jobs-for-you" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "jobs-for-you returns ranked jobs with per-job reference codes" python3 - <<'PYEOF'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["jobs"], d
+assert all(j["referenceCode"].startswith("TTT-") for j in d["jobs"]), d["jobs"][0]
+assert all("automationEligible" in j for j in d["jobs"])
+print("jobs-for-you:", d["total"], "jobs; first ref:", d["jobs"][0]["referenceCode"])
+PYEOF
+
+# Automation toggle
+curl -sf "$BASE/talent/$TALENT_ID/automation" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "automation defaults OFF" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['automation']['enabled'] is False, d"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/automation" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"enabled":true,"geography":"south-florida","minDaily":100}' -o /tmp/ttt-body.json
+check "automation toggle turns ON and persists" bash -c "curl -sf $BASE/talent/$TALENT_ID/automation -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['automation']['enabled'] is True and d['automation']['geography']=='south-florida', d\""
+curl -sf -X POST "$BASE/talent/$TALENT_ID/automation" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"enabled":false}' -o /tmp/ttt-body.json
+
+# Talent earnings: own net ONLY — no commission/fee anywhere in the payload
+BOOKING_NET=$(curl -sf "$BASE/bookings?talentId=$TALENT_ID" -H 'Authorization: Bearer test-admin-token' | python3 -c "import sys,json; print(json.load(sys.stdin)['bookings'][0]['netCents'])")
+curl -sf "$BASE/talent/$TALENT_ID/earnings" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "talent earnings: own net + running total, NO agency money in payload" python3 - "$BOOKING_NET" <<'PYEOF'
+import sys, json
+d = json.load(open('/tmp/ttt-body.json'))
+raw = json.dumps(d)
+assert "commission" not in raw.lower() and "fee" not in raw.lower(), raw
+assert d["totalNetCents"] == int(sys.argv[1]), d
+assert d["jobCount"] == 1 and len(d["jobs"]) == 1 and d["jobs"][0]["netCents"] == int(sys.argv[1]), d
+print("talent net:", d["totalNetCents"], "cents; jobs:", d["jobCount"])
+PYEOF
+
+# Owner gate + agency earnings
+curl -sf "$BASE/owner/gate" -o /tmp/ttt-body.json
+check "owner gate: not configured before a passcode is set" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['configured'] is False and d['unlocked'] is False, d"
+check "agency earnings without auth returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/agency-earnings | grep -q 401"
+check "agency earnings as talent returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/agency-earnings -H 'Authorization: Bearer $TOKEN' | grep -q 401"
+check "set owner passcode without admin returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/owner/set-passcode -H 'Content-Type: application/json' -d '{\"passcode\":\"ownerpass1\"}' | grep -q 401"
+curl -sf -X POST "$BASE/owner/set-passcode" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"passcode":"ownerpass1"}' -o /tmp/ttt-body.json
+check "owner passcode sets (admin only)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['configured'] is True, d"
+check "owner unlock with wrong passcode returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/owner/unlock -H 'Content-Type: application/json' -d '{\"passcode\":\"wrongpass\"}' | grep -q 401"
+curl -sf -X POST "$BASE/owner/unlock" -H 'Content-Type: application/json' -d '{"passcode":"ownerpass1"}' -o /tmp/ttt-body.json
+OWNER_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['ownerToken'])")
+check "owner unlock returns a 12h session token" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['unlocked'] is True and d['ownerToken'], d"
+curl -sf "$BASE/agency-earnings" -H "Authorization: Bearer $OWNER_TOKEN" -o /tmp/ttt-body.json
+check "agency earnings WITH owner token shows commission totals" python3 - <<'PYEOF'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["totalCommissionCents"] > 0 and d["bookingCount"] == 1, d
+assert d["totalGrossCents"] - d["totalCommissionCents"] == d["totalNetCents"], d
+print("agency commission total:", d["totalCommissionCents"], "cents")
+PYEOF
+curl -sf -X POST "$BASE/owner/lock" -H "Authorization: Bearer $OWNER_TOKEN" -o /tmp/ttt-body.json
+check "owner lock invalidates the session token" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/agency-earnings -H 'Authorization: Bearer $OWNER_TOKEN' | grep -q 401"
+
+# Public portfolio: private by default, then public + casting-safe only
+check "public portfolio is 404 while private (default)" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/public/talent/$TALENT_ID | grep -q 404"
+curl -sf "$BASE/talent/$TALENT_ID/portfolio-link" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "portfolio link is #/talent/<id>, never the front page" python3 - "$TALENT_ID" <<'PYEOF'
+import sys, json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["path"] == "#/talent/" + sys.argv[1], d
+assert d["visibility"] == "private", d
+print("portfolio path:", d["path"])
+PYEOF
+curl -sf -X PATCH "$BASE/talent/$TALENT_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"visibility":"public","sharePhotos":true}' -o /tmp/ttt-body.json
+curl -sf "$BASE/public/talent/$TALENT_ID" -o /tmp/ttt-body.json
+check "public portfolio resolves and hides private fields" python3 - <<'PYEOF'
+import json
+d=json.load(open('/tmp/ttt-body.json'))["portfolio"]
+raw=json.dumps(d)
+for banned in ("test@toptea.example", "3055550100", "demographics", "commission", "password"):
+    assert banned not in raw, "private field leaked: " + banned
+assert d["firstName"]=="Testy" and d["city"]=="Miami" and d["visibility"]=="public", d
+print("public portfolio ok:", d["firstName"], d["city"], "credits:", len(d["credits"]))
+PYEOF
+
+# Social links: begin -> confirm -> photo -> bio-checked -> unlink
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","handle":"@testytalent"}' -o /tmp/ttt-body.json
+SOC_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['socialLink']['id'])")
+check "social link begins PENDING" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='PENDING', d"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"confirm"}' -o /tmp/ttt-body.json
+check "social link confirms to LINKED" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLink']['status']=='LINKED', d"
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-photos" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"platform":"instagram","photoUrl":"https://example.com/photo1.jpg","caption":"Headshot preview"}' -o /tmp/ttt-body.json
+SPH_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['socialPhoto']['id'])")
+curl -sf -X POST "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"action":"bio-checked","checked":true}' -o /tmp/ttt-body.json
+check "social photo added + bio-checked flag set" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['socialPhotos'])==1 and d['socialLinks'][0]['bioChecked'] is True, d\""
+curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-photos/$SPH_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+curl -sf -X DELETE "$BASE/talent/$TALENT_ID/social-links/$SOC_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "social photo + link unlink cleanly" bash -c "curl -sf $BASE/talent/$TALENT_ID/social-links -H 'Authorization: Bearer $TOKEN' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['socialLinks']==[] and d['socialPhotos']==[], d\""
+
+# Inbound replies: admin records, talent reads
+curl -sf -X POST "$BASE/application-replies" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d "{\"applicationId\":\"$APP_ID\",\"fromName\":\"Project Casting\",\"channel\":\"email\",\"body\":\"We would like to invite Testy to an audition on Friday.\"}" -o /tmp/ttt-body.json
+check "admin records an inbound reply on the application" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['reply']['fromName']=='Project Casting', d"
+curl -sf "$BASE/application-replies?talentId=$TALENT_ID" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "talent lists the inbound reply on their application" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['total']==1 and 'audition' in d['replies'][0]['body'].lower(), d"
+
+# Complete the booking -> proof-of-work credits
+BOOKING_ID=$(curl -sf "$BASE/bookings?talentId=$TALENT_ID" -H 'Authorization: Bearer test-admin-token' | python3 -c "import sys,json; print(json.load(sys.stdin)['bookings'][0]['id'])")
+curl -sf -X POST "$BASE/bookings/$BOOKING_ID/complete" -H 'Authorization: Bearer test-admin-token' -o /tmp/ttt-body.json
+check "completebooking marks COMPLETED" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['booking']['status']=='COMPLETED', d"
+curl -sf "$BASE/talent/$TALENT_ID/credits" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "proof-of-work credits list the completed job" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['completedCount']==1 and len(d['credits'])==1, d"
+
+# Mirror must never carry secrets from the new flows
+check "mirror carries no passcode hash, code hash, or password hash" bash -c "! grep -q 'owner_passcode_hash' $MIRROR && ! grep -q 'code_hash' $MIRROR && ! grep -q 'password_hash' $MIRROR && echo 'mirror clean of secrets'"
+
+# ----- WIPE-PROOF LEDGER MIRROR (a) append -> verify -----
+# The mirror file is written on every ledger append, one line per event,
+# each line carrying the full state snapshot + its own mirror hash chain.
+check "mirror file exists with one line per ledger event, state carried" python3 - "$MIRROR" "$TALENT_ID" <<'PY'
+import sys, json
+mirror, talent_id = sys.argv[1], sys.argv[2]
+lines = open(mirror).read().splitlines()
+assert len(lines) >= 12, f"mirror has {len(lines)} lines, expected >= 12"
+parsed = [json.loads(l) for l in lines]
+assert all(set(("mirror_prev", "mirror_hash", "state")) <= set(p) for p in parsed), "mirror line missing chain/state keys"
+assert [p["seq"] for p in parsed] == list(range(1, len(parsed) + 1)), "mirror seqs not 1..N"
+reg = [p for p in parsed if p["event_type"] == "talent.register"]
+assert len(reg) == 2, reg  # talent1 + talent2 (v11 second-talent checks)
+reg1 = [p for p in reg if p["state"]["talent"]["id"] == talent_id]
+assert len(reg1) == 1, reg
+assert reg1[0]["state"]["talent"]["email"] == "test@toptea.example", reg1[0]["state"]
+bk = [p for p in parsed if p["event_type"] == "booking.create"]
+assert len(bk) == 1 and bk[0]["state"]["booking"]["gross_cents"] == bk[0]["data"]["grossCents"], bk
+assert bk[0]["state"]["notification"] and bk[0]["state"]["email"], "booking state must carry notification + email rows"
+assert all("password_hash" not in json.dumps(p.get("state") or {}) for p in parsed), "mirror must never carry a password hash"
+print(f"mirror ok: {len(lines)} lines, register + booking state present, no secrets")
+PY
+curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/ledger/mirror/verify" -o /tmp/ttt-body.json
+check "mirror verify endpoint: valid, events == ledger events" python3 - <<'PY'
+import json
+d = json.load(open('/tmp/ttt-body.json'))["mirror"]
+assert d["exists"] is True and d["valid"] is True and d["first_bad_seq"] is None, d
+assert d["events"] >= 12, d
+print("mirror verify:", d)
+PY
+check "mirror download is admin-only (401 without token)" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/ledger/mirror | grep -q 401"
+curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/ledger/mirror" -o /tmp/ttt-body.json
+check "mirror download returns NDJSON, one line per event" bash -c "python3 -c \"import json; ls=open('/tmp/ttt-body.json').read().splitlines(); assert len(ls)>=12 and all(json.loads(l)['mirror_hash'] for l in ls); print('mirror download lines:', len(ls))\""
+
+# ----- WIPE-PROOF LEDGER MIRROR (b) wipe simulation -----
+# Record exact counts, delete ONLY the DB files (keep the mirror — that is
+# the whole point), restart on the same DATABASE_PATH, and prove zero loss.
+curl -sf "$BASE/stats" -o /tmp/ttt-stats.json
+curl -sf "$BASE/ledger/verify" -o /tmp/ttt-body.json
+BEFORE_EVENTS=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['events'])")
+BEFORE_TALENTS=$(python3 -c "import json; print(json.load(open('/tmp/ttt-stats.json'))['talentCount'])")
+BEFORE_BOOKINGS=$(python3 -c "import json; print(json.load(open('/tmp/ttt-stats.json'))['bookingCount'])")
+kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+rm -f "$DB" "$DB-wal" "$DB-shm"
+test -f "$MIRROR" # the mirror must survive the wipe (sanity, not a check)
+bun run src/server.ts > /tmp/ttt-selftest-server.log 2>&1 &
+SERVER_PID=$!
+wait_health
+curl -sf "$BASE/stats" -o /tmp/ttt-body.json
+check "wipe sim: talent + booking + seed counts restored exactly" python3 - "$BEFORE_TALENTS" "$BEFORE_BOOKINGS" <<'PY'
+import sys, json
+d = json.load(open('/tmp/ttt-body.json'))
+assert d["talentCount"] == int(sys.argv[1]), d
+assert d["bookingCount"] == int(sys.argv[2]), d
+assert d["opportunityCount"] == 423, d
+print(f"restored: talents={d['talentCount']} bookings={d['bookingCount']} opps={d['opportunityCount']}")
+PY
+curl -sf "$BASE/ledger/verify" -o /tmp/ttt-body.json
+check "wipe sim: ledger verifies, events == before + 2 (restore + seed.import)" python3 - "$BEFORE_EVENTS" <<'PY'
+import sys, json
+d = json.load(open('/tmp/ttt-body.json'))
+before = int(sys.argv[1])
+assert d["valid"] is True and d["first_bad_seq"] is None, d
+assert d["events"] == before + 2, d
+assert d["head_seq"] == d["events"], d
+assert d["mirror"]["valid"] is True and d["mirror"]["events"] == before + 2, d["mirror"]
+print(f"ledger after wipe: {d['events']} events (before {before} + ledger.restore + seed.import), mirror matches")
+PY
+curl -sf "$BASE/ledger?limit=100" -o /tmp/ttt-body.json
+check "wipe sim: ledger.restore event recorded the restore" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); types=[e['event_type'] for e in d['events']]; assert 'ledger.restore' in types, types; print('restore event present')"
+curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/talent/$TALENT_ID" -o /tmp/ttt-body.json
+check "wipe sim: talent profile restored (100%, READY FOR MATCHING)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['talent']; assert d['completion']==100 and d['status']=='READY FOR MATCHING' and d['firstName']=='Testy', d"
+curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/bookings" -o /tmp/ttt-body.json
+check "wipe sim: booking + notification restored, money reconciles" python3 - <<'PY'
+import json
+d = json.load(open('/tmp/ttt-body.json'))
+assert d["total"] == 1, d
+b = d["bookings"][0]
+assert b["status"] in ("BOOKED", "COMPLETED") and b["grossCents"] - b["commissionCents"] == b["netCents"], b
+print("restored booking:", b["id"], "gross", b["grossCents"], "fee", b["commissionCents"], "net", b["netCents"])
+PY
+curl -sf -H 'Authorization: Bearer test-admin-token' "$BASE/talent/$TALENT_ID/notifications" -o /tmp/ttt-body.json
+check "wipe sim: booking notification restored" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['notifications'])>=1 and any('Booking confirmed' in n['title'] for n in d['notifications']), d"
+
+# ----- WIPE-PROOF LEDGER MIRROR (c) tamper test -----
+# Corrupt ONE mirror line (change data, do NOT recompute any hash), wipe
+# the DB again, restart: the server must REFUSE the tampered mirror, boot
+# from seed only, quarantine the tampered file, and say so loudly.
+kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
+rm -f "$DB" "$DB-wal" "$DB-shm"
+TAMPERED_SEQ=$(python3 - "$MIRROR" <<'PY'
+import sys, json
+p = sys.argv[1]
+lines = open(p).read().splitlines()
+d = json.loads(lines[2])  # seq 3: change data without recomputing any hash
+d["data"]["tampered"] = True
+lines[2] = json.dumps(d)
+open(p, "w").write("\n".join(lines) + "\n")
+print(d["seq"])
+PY
+)
+bun run src/server.ts > /tmp/ttt-selftest-server.log 2>&1 &
+SERVER_PID=$!
+wait_health
+curl -sf "$BASE/stats" -o /tmp/ttt-body.json
+check "tamper test: nothing restored from the tampered mirror (seed only)" python3 - <<'PY'
+import json
+d = json.load(open('/tmp/ttt-body.json'))
+assert d["talentCount"] == 0 and d["bookingCount"] == 0, d
+assert d["opportunityCount"] == 423, d
+print("seed-only boot: talents=0 bookings=0 opps=423")
+PY
+curl -sf "$BASE/ledger/verify" -o /tmp/ttt-body.json
+check "tamper test: ledger is just the fresh seed.import, live mirror fresh + valid" python3 - <<'PY'
+import json
+d = json.load(open('/tmp/ttt-body.json'))
+assert d["valid"] is True and d["events"] == 1, d
+assert d["mirror"]["valid"] is True and d["mirror"]["events"] == 1, d["mirror"]
+print("ledger events:", d["events"], "mirror events:", d["mirror"]["events"])
+PY
+check "tamper test: refusal + quarantine logged loudly" bash -c "grep -q 'MIRROR REFUSED' /tmp/ttt-selftest-server.log && grep -q 'MIRROR QUARANTINED' /tmp/ttt-selftest-server.log"
+check "tamper test: tampered file quarantined for forensics, bytes kept" bash -c "ls $MIRROR.tampered-* >/dev/null 2>&1 && grep -q tampered $MIRROR.tampered-*"
 
 echo
 echo "SELFTEST: $PASS passed, $FAIL failed"
