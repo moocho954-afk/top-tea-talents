@@ -199,14 +199,14 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
 .code-input{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:1.5rem;letter-spacing:.5em;text-align:center}
 #version-stamp{font-size:.8rem;letter-spacing:.08em;color:var(--gold);opacity:.85}
 
-/* ---------- v16: Community Board ---------- */
+/* ---------- v17: Community Board — docked bubble, never over the feed ---------- */
 .board-layout{display:flex;gap:1rem;align-items:flex-start}
 .board-layout #board-posts{flex:1;min-width:0}
-.board-layout #board-bubble{flex:0 0 360px;min-width:0}
+.board-layout #board-bubble{flex:0 0 360px;min-width:0;position:sticky;top:1rem}
 .board-post-mentioned{border:1px solid var(--gold);box-shadow:0 0 0 1px var(--gold),var(--shadow)}
 .mention{font-weight:700;color:#e8c766;background:rgba(212,175,55,.15);border-radius:4px;padding:0 .25rem}
 .mention-me{background:var(--gold);color:#111}
-.board-suggest{position:absolute;left:0;right:0;top:100%;margin-top:.25rem;z-index:30;border-radius:12px;overflow:hidden;background:#141414;border:1px solid rgba(212,175,55,.55);box-shadow:0 14px 30px rgba(0,0,0,.6)}
+.board-suggest{position:absolute;left:0;right:0;top:100%;margin-top:.25rem;z-index:30;border-radius:12px;overflow:hidden;background:#141414;border:1px solid rgba(212,175,55,.55);box-shadow:0 14px 30px rgba(0,0,0,.6);max-height:240px;overflow-y:auto}
 .board-suggest-item{display:block;width:100%;text-align:left;padding:.75rem 1rem;background:none;border:0;border-bottom:1px solid #2a2410;cursor:pointer;font-size:1rem;color:var(--white)}
 .board-suggest-item:hover{background:#1e1b17}
 .board-suggest-empty{padding:.75rem 1rem;font-size:.9rem;color:var(--gray)}
@@ -214,8 +214,15 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
 .board-bubble-msg{border-radius:12px;padding:.5rem .75rem;margin-bottom:.5rem;background:#1e1e1e}
 .board-bubble-mine{background:rgba(212,175,55,.16);margin-left:2rem}
 .board-bubble-msg:not(.board-bubble-mine){margin-right:2rem}
+.board-bubble-chip{display:flex;align-items:center;gap:.5rem;background:#141414;border:1px solid var(--gold);border-radius:999px;padding:.5rem .75rem;box-shadow:0 10px 24px rgba(0,0,0,.55);cursor:pointer}
+.board-bubble-chip>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
 @media (max-width:900px){
   .board-layout{flex-direction:column}
-  .board-layout #board-bubble{flex:1 1 auto;width:100%}
-  .board-bubble{position:static}
+  .board-layout #board-bubble{flex:1 1 auto;width:100%;position:static}
+  /* Docked bottom sheet: fixed to the viewport bottom, and the feed is
+     padded clear of it so no post ever hides underneath. */
+  .board-layout.bubble-open #board-bubble{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:40;border-radius:16px 16px 0 0;max-height:55vh;overflow-y:auto}
+  .board-layout.bubble-open #board-posts{padding-bottom:58vh}
+  .board-layout.bubble-min #board-bubble{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:40}
+  .board-layout.bubble-min #board-posts{padding-bottom:72px}
 }

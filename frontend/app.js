@@ -244,6 +244,8 @@ function route(){
   // Community Board timers (15s refresh + 30s bubble auto-close) belong
   // to that screen only — clear them on every navigation.
   if(window.__tttBoardTimers){ window.__tttBoardTimers.forEach(function(t){ clearInterval(t); }); window.__tttBoardTimers = []; }
+  if(window.__tttBoardOutsideTap){ document.removeEventListener("pointerdown", window.__tttBoardOutsideTap); window.__tttBoardOutsideTap = null; }
+  if(window.__tttBoardEsc){ document.removeEventListener("keydown", window.__tttBoardEsc); window.__tttBoardEsc = null; }
   apiBanner(); bindAuthSlot(); closeSidebar();
   document.querySelectorAll(".nav-group-body a").forEach(function(a){
     var h = a.getAttribute("href")||"";
@@ -1584,18 +1586,22 @@ function screenNotifications(app){
   load();
 }
 
-/* ---------- (6b) Community Board (v16, Phase 0) ----------
+/* ---------- (6b) Community Board (v17, Phase 0 + bubble fix) ----------
    One public board: everybody talks in it, everybody sees everybody's
    messages — there are no private DMs. @ mentions autocomplete live
    (narrowing per letter, tap to insert) and are highlighted to the
    named talent (+ an in-app notification). The direct-talk bubble is
    ONLY a filtered view of the same public posts — its header says so
-   in plain words — and it closes on "End chat" or 30 seconds after the
-   last typing; the messages themselves stay on the board. The composer
+   in plain words. It is DOCKED (sticky side panel on desktop, bottom
+   sheet on phones) and never covers the feed; it closes the instant you
+   tap the x, End chat, anywhere outside it, or Talk to / Reply again
+   for the same person, or minimizes to a small chip — the 30-second
+   auto-close is only a backup. The messages themselves stay on the
+   board. @ suggestions dismiss the instant one is picked. The composer
    is a plain textarea with NO autocorrect/autocomplete suppression, so
    the phone keyboard's predictive spelling works exactly as ordered.
    Audio/carousel buttons call the honest-refusal endpoint and create
-   nothing. Ported from artifact top-tea-talents v16. */
+   nothing. Ported from artifact top-tea-talents v17. */
 function screenCommunity(app){
   var me = sessionTalentId();
   var signedIn = isLoggedIn();
@@ -1607,9 +1613,13 @@ function screenCommunity(app){
   var partner = null; // {talentId, name, handle}
   var bubbleText = "";
   var lastActivity = 0;
+  var bubbleMin = false; // bubble minimized to a chip (never over the feed)
   var reported = {};
   var refreshTick = 0;
 
+  // Instant dismiss: every close path below clears the partner at once —
+  // no timer, no delay. The 30s auto-close in the tick is only a backup.
+  function closeBubble(){ partner = null; bubbleText = ""; bubbleMin = false; lastActivity = 0; renderBubble(); }
   function boardBodyHTML(post){
     var text = esc(post.body||"");
     var handles = (post.mentions||[]).map(function(m){ return m.handle; }).filter(Boolean);
@@ -1649,12 +1659,31 @@ function screenCommunity(app){
   }
   function renderBubble(){
     var el = $("#board-bubble"); if(!el) return;
-    if(!partner || !signedIn){ el.innerHTML = ""; return; }
+    var layout = el.closest(".board-layout");
+    if(!partner || !signedIn){
+      el.innerHTML = "";
+      if(layout) layout.classList.remove("bubble-open", "bubble-min");
+      return;
+    }
+    if(layout){ layout.classList.toggle("bubble-open", !bubbleMin); layout.classList.toggle("bubble-min", bubbleMin); }
+    if(bubbleMin){
+      el.innerHTML = '<div class="board-bubble-chip" id="bubble-chip" role="button" tabindex="0" aria-label="Re-open talk with '+esc(partner.name)+'">'
+        + '<span>Talking with <strong style="color:var(--gold)">'+esc(partner.name)+'</strong> — tap to open</span>'
+        + '<button class="btn btn-sm" id="bubble-chip-close" type="button" aria-label="Close talk">×</button></div>';
+      var chip = $("#bubble-chip");
+      chip.addEventListener("click", function(){ bubbleMin = false; lastActivity = Date.now(); renderBubble(); });
+      chip.addEventListener("keydown", function(e){ if(e.key === "Enter" || e.key === " "){ e.preventDefault(); bubbleMin = false; lastActivity = Date.now(); renderBubble(); } });
+      $("#bubble-chip-close").addEventListener("click", function(e){ e.stopPropagation(); closeBubble(); });
+      return;
+    }
     var thread = threadPosts();
     var h = '<div class="board-bubble"><div style="display:flex;justify-content:space-between;gap:.5rem;align-items:flex-start">'
       + '<h2 style="margin:0;color:var(--gold)">Talking with '+esc(partner.name)+'</h2>'
-      + '<button class="btn btn-sm" id="bubble-end" type="button">End chat</button></div>'
-      + '<p class="muted small">Everyone on the board can see this conversation — the bubble just makes it easier to follow. It closes on its own 30 seconds after the last typing; the messages stay on the board.</p>'
+      + '<span style="display:flex;gap:.25rem;flex:none">'
+      + '<button class="btn btn-sm" id="bubble-min" type="button" aria-label="Minimize talk">–</button>'
+      + '<button class="btn btn-sm" id="bubble-close" type="button" aria-label="Close talk">×</button>'
+      + '<button class="btn btn-sm" id="bubble-end" type="button">End chat</button></span></div>'
+      + '<p class="muted small">Everyone on the board can see this conversation — the bubble just makes it easier to follow. Tap ×, End chat, or anywhere outside it and it is gone at once; it also closes on its own 30 seconds after the last typing. The messages stay on the board.</p>'
       + '<div id="bubble-thread" style="max-height:320px;overflow-y:auto;margin-bottom:.75rem">'
       + (thread.length ? thread.map(function(p){
           var mine = p.talentId === me;
@@ -1667,7 +1696,9 @@ function screenCommunity(app){
       + '<textarea id="bubble-text" rows="2" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" placeholder="Message @'+esc(partner.handle)+'…" aria-label="Message '+esc(partner.name)+' on the public board">'+esc(bubbleText)+'</textarea>'
       + '<p style="margin-top:.5rem"><button class="btn" id="bubble-send" type="button">Send to @'+esc(partner.handle)+'</button></p></div>';
     el.innerHTML = h;
-    $("#bubble-end").addEventListener("click", function(){ partner = null; bubbleText = ""; renderBubble(); });
+    $("#bubble-min").addEventListener("click", function(){ bubbleMin = true; renderBubble(); });
+    $("#bubble-close").addEventListener("click", function(){ closeBubble(); });
+    $("#bubble-end").addEventListener("click", function(){ closeBubble(); });
     var ta = $("#bubble-text");
     ta.addEventListener("input", function(){ bubbleText = ta.value; lastActivity = Date.now(); });
     $("#bubble-send").addEventListener("click", function(){
@@ -1688,8 +1719,9 @@ function screenCommunity(app){
     el.innerHTML = posts.map(postCardHTML).join("");
     el.querySelectorAll("[data-talk]").forEach(function(b){
       b.addEventListener("click", function(){
+        if(partner && partner.talentId === b.getAttribute("data-talk")){ closeBubble(); return; }
         partner = {talentId:b.getAttribute("data-talk"), name:b.getAttribute("data-talk-name"), handle:b.getAttribute("data-talk-handle")};
-        bubbleText = ""; lastActivity = Date.now(); renderBubble();
+        bubbleText = ""; bubbleMin = false; lastActivity = Date.now(); renderBubble();
       });
     });
     el.querySelectorAll("[data-del]").forEach(function(b){
@@ -1721,7 +1753,7 @@ function screenCommunity(app){
       posts = d.posts||[]; renderPosts(); renderBubble();
     }).catch(function(e){ var el2=$("#board-posts"); if(el2) el2.innerHTML = errBox(e.message); });
   }
-  function openBubble(p){ partner = p; bubbleText = ""; lastActivity = Date.now(); renderBubble(); }
+  function openBubble(p){ partner = p; bubbleText = ""; bubbleMin = false; lastActivity = Date.now(); renderBubble(); }
   function onComposerChange(value, cursor){
     var upto = cursor == null ? value : value.slice(0, cursor);
     var m = /(?:^|\s)@([A-Za-z0-9]*)$/.exec(upto);
@@ -1745,7 +1777,7 @@ function screenCommunity(app){
       return '<button type="button" class="board-suggest-item" data-sugg="'+i+'"><span aria-hidden="true">⭐</span> <strong style="color:var(--gold)">@'+esc(p.handle)+'</strong> <span class="muted">'+esc(p.name)+'</span></button>';
     }).join("");
     box.querySelectorAll("[data-sugg]").forEach(function(b){
-      b.addEventListener("click", function(){ chooseMention(suggestions[Number(b.getAttribute("data-sugg"))]); });
+      b.addEventListener("pointerdown", function(e){ e.preventDefault(); chooseMention(suggestions[Number(b.getAttribute("data-sugg"))]); });
     });
   }
   function chooseMention(p){
@@ -1823,14 +1855,36 @@ function screenCommunity(app){
     $("#board-audio-btn").addEventListener("click", function(){ mediaAttempt("audio"); });
     $("#board-carousel-btn").addEventListener("click", function(){ mediaAttempt("carousel"); });
   }
+  // Instant dismiss, part 2: a tap anywhere outside the bubble closes it
+  // at once (so it never sits over the feed while you read), and Escape
+  // closes the bubble and any open @ suggestions. Taps inside the bubble,
+  // on a Talk to / Reply button (toggle), or on a suggestion are left
+  // alone. Stored on window so route() removes them on navigation,
+  // same pattern as the timers.
+  if(window.__tttBoardOutsideTap) document.removeEventListener("pointerdown", window.__tttBoardOutsideTap);
+  if(window.__tttBoardEsc) document.removeEventListener("keydown", window.__tttBoardEsc);
+  window.__tttBoardOutsideTap = function(e){
+    var t = e.target;
+    if(!t || !t.closest) return;
+    if(partner && !t.closest("#board-bubble") && !t.closest("[data-talk]")) closeBubble();
+    if(mentionQuery !== null && !t.closest("#board-suggestions") && !t.closest("#board-text")){ mentionQuery = null; renderSuggestions(); }
+  };
+  window.__tttBoardEsc = function(e){
+    if(e.key !== "Escape") return;
+    if(partner) closeBubble();
+    if(mentionQuery !== null){ mentionQuery = null; renderSuggestions(); }
+  };
+  document.addEventListener("pointerdown", window.__tttBoardOutsideTap);
+  document.addEventListener("keydown", window.__tttBoardEsc);
   loadPosts();
   // Refresh the board every 15s while this screen is open; the
-  // 1-second tick also auto-closes the bubble 30s after last typing.
-  // Timers are cleared by route() on every navigation (see below).
+  // 1-second tick also auto-closes the bubble 30s after last typing
+  // (backup only — every close path above is instant). Timers and the
+  // outside-tap / Escape handlers are cleared by route() on navigation.
   window.__tttBoardTimers = window.__tttBoardTimers || [];
   window.__tttBoardTimers.push(setInterval(function(){
     refreshTick++;
-    if(partner && lastActivity && Date.now() - lastActivity > 30000){ partner = null; bubbleText = ""; renderBubble(); }
+    if(partner && lastActivity && Date.now() - lastActivity > 30000){ closeBubble(); }
     if(refreshTick % 15 === 0) loadPosts();
   }, 1000));
 }
