@@ -785,7 +785,7 @@ function renderJoin(app, d, step){
       + '<label>Languages (comma separated) <span class="muted small">(optional)</span><input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
       + '<label>Skills (comma separated) <span class="muted small">(optional)</span><input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>';
   } else {
-    html += '<p class="muted">Professional info &amp; permissions. Experience is needed to reach 100%; categories are optional — pick only what applies. Photos go in your portfolio (up to 8) — add them right below, now or later.</p>'
+    html += '<p class="muted">Professional info &amp; permissions. Experience is needed to sign the release; categories are optional — pick only what applies. Photos go in your portfolio (up to 8) — add them right below, now or later.</p>'
       + '<label>Categories <span class="muted small">(optional — pick only what applies, never blocks signing)</span></label><div class="chip-set" id="cat-set"></div>'
       + '<label>Experience <span class="muted small">(needed to sign the release)</span><textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
       + '<label>Minimum daily pay you will accept ($)<input name="min_compensation" type="number" min="0" value="'+esc(d.min_compensation||"")+'"></label>'
