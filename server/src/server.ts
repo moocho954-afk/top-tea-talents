@@ -203,18 +203,20 @@ async function saveProfile(id: string, profile: any): Promise<void> {
   await db.run("UPDATE talents SET profile_json = ?, updated_at = ? WHERE id = ?", [JSON.stringify(profile), nowIso(), id]);
 }
 
-// Completion checklist: 10 items, 10% each.
+// Completion checklist: 6 CORE items only (owner order 2026-11-22).
+// Languages, skills, categories and availability are OPTIONAL extras: they
+// still save on the profile and feed matching when provided, but they never
+// count toward completion and never block the likeness-release signature.
+// (Before: 10 items x 10% — the 4 checkbox/chip groups blocked signing
+// for people they did not apply to; the girlfriend's signup stalled at
+// 60% = 6/10 for exactly that reason.)
 const COMPLETION_ITEMS: { key: string; label: string; check: (p: any) => boolean }[] = [
   { key: "contact", label: "Contact info (email + phone)", check: (p) => !!p.email && !!p.phone },
   { key: "name", label: "Legal name", check: (p) => !!p.firstName && !!p.lastName },
   { key: "location", label: "Location (city, state, zip)", check: (p) => !!p.city && !!p.state && !!p.zip },
   { key: "height", label: "Height", check: (p) => !!p.height },
   { key: "age_range", label: "Age range", check: (p) => !!p.ageRange },
-  { key: "languages", label: "Languages", check: (p) => Array.isArray(p.languages) && p.languages.length > 0 },
-  { key: "skills", label: "Skills", check: (p) => Array.isArray(p.skills) && p.skills.length > 0 },
   { key: "experience", label: "Experience", check: (p) => !!p.experience },
-  { key: "categories", label: "Categories", check: (p) => Array.isArray(p.categories) && p.categories.length > 0 },
-  { key: "availability", label: "Availability", check: (p) => Array.isArray(p.availability) && p.availability.length > 0 },
 ];
 function completionOf(p: any): { percent: number; checklist: { key: string; label: string; done: boolean }[] } {
   const checklist = COMPLETION_ITEMS.map((i) => ({ key: i.key, label: i.label, done: i.check(p) }));
