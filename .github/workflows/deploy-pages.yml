@@ -1,0 +1,53 @@
+# Deploy the Top Tea Talents front end to GitHub Pages
+# Static site only — no build step, no Bun, no npm. Publishes frontend/ as-is.
+# Requires Pages to be enabled on the repo with source "GitHub Actions":
+#   Settings → Pages → Build and deployment → Source: GitHub Actions.
+# (That switch is a manual step in the GitHub web UI — the API cannot set it.)
+# Set the repo variable TTT_API_URL to the Render backend URL to go live.
+# Leave it empty for a front-end-only deploy (the page then shows the honest
+# "backend not configured yet" banner and landing copy only — never fake numbers).
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write API config
+        run: |
+          if [ -n "${{ vars.TTT_API_URL }}" ]; then
+            printf 'window.__TTT_API__ = "%s";\n' "${{ vars.TTT_API_URL }}" > frontend/api-config.js
+          else
+            printf 'window.__TTT_API__ = "";\n' > frontend/api-config.js
+          fi
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
