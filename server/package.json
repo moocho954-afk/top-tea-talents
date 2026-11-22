@@ -1,0 +1,14 @@
+{
+  "name": "top-tea-talents-api",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch run src/server.ts",
+    "start": "bun run src/server.ts",
+    "typecheck": "bun x tsc --noEmit -p tsconfig.json"
+  },
+  "type": "module",
+  "version": "1.0.0",
+  "devDependencies": {
+    "bun-types": "^1.4.5"
+  }
+}
