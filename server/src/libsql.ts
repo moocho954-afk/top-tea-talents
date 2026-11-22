@@ -87,7 +87,10 @@ class TursoDb implements Db {
     return results;
   }
   async all(sql: string, args: any[] = []): Promise<Row[]> {
-    const [r] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg) } }]);
+    // Hrana: a statement returns NO rows unless want_rows is set — without
+    // it every SELECT comes back empty (writes still land, so the failure
+    // looks like duplicate-key crashes instead of a read bug).
+    const [r] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg), want_rows: true } }]);
     const result = r?.result;
     if (!result) return [];
     const cols: string[] = (result.cols ?? []).map((c: any) => c.name);
