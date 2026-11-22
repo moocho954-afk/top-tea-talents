@@ -103,12 +103,48 @@ Dockerfile           oven/bun:1.3-slim, no install step
 
 ## Version
 
-- **Artifact parity: v11.** The footer carries a visible stamp
-  (`TOP TEA TALENTS • v11 • updated <date>`, from
+- **Artifact parity: v14.** The footer carries a visible stamp
+  (`TOP TEA TALENTS • v14 • updated <date>`, from
   `window.__TTT_BUILD__` in `frontend/index.html`), and
   `/api/v1/health` reports the backend version (`1.1.0`). If the stamp
   and the artifact disagree, the package is stale — that is the drift
   check.
+
+## Social linking + Instagram auto-pull — what is real here (v12–v14)
+
+- **v12 — per-talent social linking.** A talent links THEIR OWN
+  Instagram/Facebook: begin issues a unique ownership code, the talent
+  puts it in their bio, then signs (typed name must match the profile,
+  same standard as the Likeness Release). Preview photos are uploads
+  with the link to the original post on the talent's own AUTHORIZED
+  account, so every photo is traceable to the talent's own post.
+- **v13 — authorization-state hardening.** An account is AUTHORIZED
+  only when the live bio check confirmed the code
+  (`verificationStatus: "code_confirmed"`). Signing never authorizes
+  by itself. Any record reading AUTHORIZED without a confirmed code is
+  demoted to pending on read (and at boot migration), with the reason
+  recorded — it can never stay authorized.
+- **v14 — Instagram auto-pull: HONEST LIMIT.** The artifact pulls a
+  talent's first three Instagram photos plus their most popular post
+  by dispatching a browser task that visits the public profile
+  signed-out and face-matches each snapshot against the portfolio.
+  **This standalone public site has no background-task dispatch, so it
+  cannot run that pull.** A pull request here is recorded as
+  `pullStatus: "unavailable"` with the reason shown in the UI — never
+  faked. What IS ported: the full pull state model, the admin pull
+  callback (`POST /api/v1/social-photo-pull-callback`, admin token
+  only) that places only identity-matched photos (`identity_verdict:
+  "match"`, max 4; everything else is counted rejected, never shown),
+  and the honest UI note on the Social page. The pull itself runs
+  from the agency app, which reports back through the callback.
+- **Bio check, same adaptation.** The live bio check is also
+  dispatched from the agency app. The standalone reports its outcome
+  through the admin bio-check route
+  (`POST /api/v1/talent/:id/social-links/:linkId` with
+  `{"action":"bio-check","outcome":"found"|"not_found"|"unreadable"}`,
+  admin token only) — same precedent as the staff-marked email
+  dispatch (`auth/mark-email-verification-dispatched`). A talent token
+  can never call it; a wrong admin token is refused (401).
 
 ## Run locally
 
@@ -119,7 +155,7 @@ PORT=3101 DATABASE_PATH=/tmp/ttt.db ADMIN_TOKEN=dev-token bun run src/server.ts
 # in another shell, serve the frontend with the API pointed at it:
 #   echo 'window.__TTT_API__ = "http://localhost:3101";' > ../frontend/api-config.js
 #   python3 -m http.server 8123 --directory ../frontend
-bash server/selftest.sh   # 87 checks, boots its own temp DB
+bash server/selftest.sh   # 108 checks, boots its own temp DB
 bun x tsc --noEmit -p server/tsconfig.json
 ```
 
