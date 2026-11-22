@@ -2337,22 +2337,69 @@ function screenContacts(app){
 }
 
 /* ---------- (11) photos ---------- */
+// Encode ladder for the server's 500KB photo limit: try the largest/best
+// first, then step down until the JPEG fits. Android camera photos are
+// often 3–12MB, so a single 1200px pass is not enough — the ladder is
+// what gets a big phone photo under the cap. The last step is the floor —
+// a photo that still does not fit is rejected instead of ever being sent
+// over the limit.
+function photoEncodeSteps(){
+  return [
+    { max: 1200, quality: 0.82 },
+    { max: 900, quality: 0.70 },
+    { max: 700, quality: 0.60 }
+  ];
+}
+var PHOTO_MAX_BYTES = 480 * 1024; // stay under the server's 500KB cap
+var PHOTO_HARD_LIMIT = 500 * 1024; // server rejects anything over this
+function dataUrlByteSize(dataUrl){
+  var b64 = String(dataUrl || "").split(",")[1] || "";
+  var pad = (b64.match(/=+$/) || [""])[0].length;
+  return Math.floor(b64.length * 3 / 4) - pad;
+}
 function downscalePhoto(file, cb){
-  if(["image/jpeg","image/png","image/webp"].indexOf(file.type)<0){ cb(null, "Only JPG, PNG, or WEBP photos are accepted."); return; }
+  var t = String(file.type || "").toLowerCase();
+  // HEIC/HEIF (iPhone camera-roll photos) are accepted and attempted —
+  // Safari decodes them natively. Only fail if the load actually errors.
+  // An empty type is also attempted; only genuinely unsupported types
+  // are rejected up front, in plain words.
+  if(t && ["image/jpeg","image/png","image/webp","image/heic","image/heif"].indexOf(t)<0){
+    cb(null, "That photo format can't be used — please choose a JPG or PNG, or on iPhone set Camera > Formats > Most Compatible and take it again.");
+    return;
+  }
   var img = new Image();
   var url = URL.createObjectURL(file);
   img.onload = function(){
-    try{
-      var max = 1200, w = img.naturalWidth, h = img.naturalHeight;
-      var scale = Math.min(1, max/Math.max(w,h));
-      var canvas = document.createElement("canvas");
-      canvas.width = Math.round(w*scale); canvas.height = Math.round(h*scale);
-      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      cb(canvas.toDataURL("image/jpeg", 0.82), null);
-    }catch(e){ cb(null, "Could not process that photo."); }
+    // Each step is guarded on its own: on a low-memory phone a big
+    // canvas draw can throw, so a failed step falls through to the
+    // next smaller one instead of failing the whole upload. The last
+    // encode that succeeded is kept as a fallback.
+    var w = img.naturalWidth, h = img.naturalHeight;
+    var steps = photoEncodeSteps(), best = null, i = 0;
+    while(i < steps.length){
+      try{
+        var step = steps[i];
+        var scale = Math.min(1, step.max/Math.max(w,h));
+        var canvas = document.createElement("canvas");
+        canvas.width = Math.round(w*scale); canvas.height = Math.round(h*scale);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        best = canvas.toDataURL("image/jpeg", step.quality);
+        if(dataUrlByteSize(best) <= PHOTO_MAX_BYTES) break;
+      }catch(e){ /* step failed (e.g. low memory) — try the smaller step */ }
+      i++;
+    }
+    URL.revokeObjectURL(url);
+    if(!best){
+      cb(null, "Could not process that photo — please try a smaller photo or a different one.");
+      return;
+    }
+    if(dataUrlByteSize(best) > PHOTO_HARD_LIMIT){
+      cb(null, "That photo is still too large even after shrinking — please choose a smaller photo.");
+      return;
+    }
+    cb(best, null);
   };
-  img.onerror = function(){ URL.revokeObjectURL(url); cb(null, "Could not read that photo file."); };
+  img.onerror = function(){ URL.revokeObjectURL(url); cb(null, "That photo couldn't be read — please try a different photo, or on iPhone set Camera > Formats > Most Compatible and take it again."); };
   img.src = url;
 }
 function uploadPhoto(talentId, slot, file, caption, cb){

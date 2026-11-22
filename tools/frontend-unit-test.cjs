@@ -53,8 +53,10 @@ const factorySrc =
   extractFn(appSrc, "function toApiProfile") + "\n" +
   extractFn(appSrc, "function completionPct") + "\n" +
   extractFn(appSrc, "function mergeDraftWithProfile") + "\n" +
-  "return { toApiProfile, completionPct, mergeDraftWithProfile };";
-const { toApiProfile, completionPct, mergeDraftWithProfile } = new Function(factorySrc)();
+  extractFn(appSrc, "function photoEncodeSteps") + "\n" +
+  extractFn(appSrc, "function dataUrlByteSize") + "\n" +
+  "return { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize };";
+const { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize } = new Function(factorySrc)();
 
 // --- toApiProfile: wizard mode must never send empty arrays (Fix 3) ---
 check("toApiProfile wizard mode skips empty arrays (no wipe)", () => {
@@ -130,6 +132,49 @@ check("mergeDraftWithProfile: server scalar wins over stale draft scalar", () =>
 check("mergeDraftWithProfile: null profile is a no-op", () => {
   const d = { height: "x" };
   eq(mergeDraftWithProfile(d, null), { height: "x" });
+});
+
+// --- photo encode ladder (HEIC fix): steps descend, sizes decode right ---
+check("photoEncodeSteps: 3 steps, 1200/0.82 -> 900/0.70 -> 700/0.60", () => {
+  const steps = photoEncodeSteps();
+  eq(steps.length, 3);
+  eq(steps[0], { max: 1200, quality: 0.82 });
+  eq(steps[1], { max: 900, quality: 0.70 });
+  eq(steps[2], { max: 700, quality: 0.60 });
+});
+check("dataUrlByteSize: decodes base64 size with padding handled", () => {
+  const b64 = (s) => "data:image/jpeg;base64," + Buffer.from(s).toString("base64");
+  eq(dataUrlByteSize(b64("hello")), 5);
+  eq(dataUrlByteSize(b64("ab")), 2);
+  eq(dataUrlByteSize(b64("a")), 1);
+  eq(dataUrlByteSize(b64("")), 0);
+  eq(dataUrlByteSize(""), 0);
+  eq(dataUrlByteSize(null), 0);
+  // 480KB of bytes -> 640KB of base64 chars, size must round-trip
+  const big = Buffer.alloc(480 * 1024, 0x41).toString("base64");
+  eq(dataUrlByteSize("data:image/jpeg;base64," + big), 480 * 1024);
+});
+check("downscalePhoto accepts HEIC/HEIF and never rejects them up front", () => {
+  const fn = appSrc.slice(appSrc.indexOf("function downscalePhoto"), appSrc.indexOf("function uploadPhoto"));
+  assert(fn.includes('"image/heic"') && fn.includes('"image/heif"'), "HEIC/HEIF not in accepted types");
+  assert(!fn.includes("Only JPG, PNG, or WEBP photos are accepted."), "old upfront rejection still present");
+  assert(fn.includes("Most Compatible"), "friendly iPhone guidance missing");
+});
+check("downscalePhoto falls through to the next step when a step throws", () => {
+  const fn = appSrc.slice(appSrc.indexOf("function downscalePhoto"), appSrc.indexOf("function uploadPhoto"));
+  const loop = fn.slice(fn.indexOf("while(i < steps.length)"));
+  assert(loop.includes("try{"), "encode step not guarded");
+  assert(loop.includes("catch(e)"), "failed step does not fall through");
+  assert(fn.includes("best = canvas.toDataURL"), "no last-good-encode fallback");
+  assert(fn.includes("if(!best)"), "all-steps-failed case not handled");
+  assert(fn.includes("Could not process that photo"), "all-steps-failed friendly error missing");
+});
+check("downscalePhoto walks the ladder and enforces the 500KB hard limit", () => {
+  const fn = appSrc.slice(appSrc.indexOf("function downscalePhoto"), appSrc.indexOf("function uploadPhoto"));
+  assert(fn.includes("photoEncodeSteps()"), "ladder not used by downscalePhoto");
+  assert(fn.includes("PHOTO_MAX_BYTES"), "480KB target not enforced");
+  assert(fn.includes("PHOTO_HARD_LIMIT"), "500KB hard limit not enforced");
+  assert(fn.includes("still too large"), "over-limit friendly error missing");
 });
 
 // --- static checks: the shipped code carries the fix ---
