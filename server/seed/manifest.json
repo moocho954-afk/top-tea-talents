@@ -1,0 +1,110 @@
+{
+ "generated": "2026-11-21 seed export for top-tea-talents-public",
+ "opportunity_records_collected": 437,
+ "opportunity_records_unique": 423,
+ "duplicate_groups": 9,
+ "records_in_duplicate_groups": 23,
+ "merged_groups": {
+  "dup-001": {
+   "canonical_id": "allcasting:325026",
+   "dropped_ids": [
+    "commercial:allcasting:325026"
+   ]
+  },
+  "dup-002": {
+   "canonical_id": "backstage:3336976",
+   "dropped_ids": [
+    "commercial:backstage:3336976"
+   ]
+  },
+  "dup-003": {
+   "canonical_id": "commercial:backstage:3341063",
+   "dropped_ids": [
+    "backstage:3341063"
+   ]
+  },
+  "dup-004": {
+   "canonical_id": "backstage:3333623",
+   "dropped_ids": [
+    "commercial:backstage:3333623"
+   ]
+  },
+  "dup-005": {
+   "canonical_id": "commercial:castingnetworks:art-basel-activations",
+   "dropped_ids": [
+    "castingnetworks:art-basel-activations-16068919"
+   ]
+  },
+  "miami-vice-general": {
+   "canonical_id": "castingtaylormade:miami-vice-85-general",
+   "dropped_ids": [
+    "instagram:miami-vice-general-interest-list",
+    "auditionsfree:miami-vice-extras-miami",
+    "projectcasting:miami-vice-starring-michael-b-jordan-casting-call",
+    "projectcasting:miami-vice-starring-michael-b-jordan-open-casting-call"
+   ]
+  },
+  "dup-008": {
+   "canonical_id": "instagram:miami-vice-classic-cars",
+   "dropped_ids": [
+    "projectcasting:miami-vice-casting-call-for-classic-cars"
+   ]
+  },
+  "dup-007": {
+   "canonical_id": "rapvideo:allcasting:hispanic-men-music-video-325327",
+   "dropped_ids": [
+    "musicvideo:projectcasting:miami-guitarist-1100",
+    "musicvideo:projectcasting:miami-drummer-1100",
+    "musicvideo:projectcasting:miami-lead-singer-1100"
+   ]
+  },
+  "dup-006": {
+   "canonical_id": "musicvideo:allcasting:herrcules-from-the-bottom",
+   "dropped_ids": [
+    "rapvideo:allcasting:herrcules-from-the-bottom-323612"
+   ]
+  }
+ },
+ "production_intel_records": 96,
+ "by_source": {
+  "allcasting": 120,
+  "backstage": 25,
+  "mandy": 10,
+  "projectcasting": 225,
+  "castingnetworks": 12,
+  "castingtaylormade": 1,
+  "instagram": 9,
+  "centralcasting": 1,
+  "castingandacting": 3,
+  "heybooker": 4,
+  "actorsandextras": 5,
+  "other": 2,
+  "other-social": 6
+ },
+ "by_geography": {
+  "south-florida": 121,
+  "florida": 86,
+  "nationwide": 216
+ },
+ "by_verification": {
+  "PARTIALLY_VERIFIED": 385,
+  "UNVERIFIED": 38
+ },
+ "by_category": {
+  "film-tv": 85,
+  "commercial": 88,
+  "modeling": 46,
+  "other": 27,
+  "brand-activation": 5,
+  "specialty": 9,
+  "music-video": 33,
+  "live-event": 28,
+  "reality-tv": 8,
+  "promo": 13,
+  "extras": 59,
+  "corporate": 1,
+  "advertising": 10,
+  "featured-extras": 9,
+  "paid-audience": 2
+ }
+}
