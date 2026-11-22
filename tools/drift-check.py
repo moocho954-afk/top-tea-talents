@@ -149,7 +149,13 @@ def main():
                 try:
                     stamp = json.loads(m.group(1))
                 except Exception:
+                    # The stamp is a JS object literal (unquoted keys), not
+                    # strict JSON — parse key: "value" pairs instead of
+                    # giving up and reporting artifact None (false SITE
+                    # STALE on every run; the live stamp really says v14).
                     stamp = {"raw": m.group(1)}
+                    for k, v in re.findall(r'(\w+)\s*:\s*"([^"]*)"', m.group(1)):
+                        stamp[k] = v
                 checks["site"]["stamp"] = stamp
                 want = version.get("artifact_version")
                 if want and stamp.get("artifact_version") != want:
