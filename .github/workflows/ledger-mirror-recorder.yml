@@ -74,6 +74,24 @@ jobs:
           ref: ledger
           fetch-depth: 0
 
+      - name: Wake the API (Render free tier sleeps)
+        env:
+          API_URL: ${{ vars.TTT_API_URL }}
+        run: |
+          set -eu
+          if [ -z "${API_URL:-}" ]; then echo "TTT_API_URL repo variable is not set"; exit 1; fi
+          # The free service sleeps after 15 min idle and the first request
+          # can 502/503 while it wakes (~50s). Warm it on the public health
+          # endpoint first so the authenticated mirror fetch below hits a
+          # live service. Without this, the first scheduled run after a
+          # sleep fails the fetch (seen 2026-11-22 10:45 UTC).
+          for i in $(seq 1 18); do
+            if curl -sf "$API_URL/api/v1/health" -o /dev/null; then echo "API awake after ${i} tries"; exit 0; fi
+            echo "waiting for API to wake (try $i/18)…"
+            sleep 10
+          done
+          echo "API did not wake in 3 minutes"; exit 1
+
       - name: Fetch the mirror from the live API
         env:
           API_URL: ${{ vars.TTT_API_URL }}
@@ -83,7 +101,8 @@ jobs:
           if [ -z "${API_URL:-}" ]; then echo "TTT_API_URL repo variable is not set"; exit 1; fi
           if [ -z "${ADMIN_TOKEN:-}" ]; then echo "TTT_ADMIN_TOKEN repo secret is not set"; exit 1; fi
           mkdir -p ledger
-          curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+          curl -sf --retry 3 --retry-all-errors --retry-delay 10 \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
             "$API_URL/api/v1/ledger/mirror" -o ledger/top-tea-talents-mirror.jsonl.new
           # The mirror must be a valid chain before it is committed: every
           # line carries seq + mirror_hash. A corrupt fetch commits nothing.
