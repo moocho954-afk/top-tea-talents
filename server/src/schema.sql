@@ -295,3 +295,60 @@ CREATE TABLE IF NOT EXISTS application_replies (
 );
 CREATE INDEX IF NOT EXISTS idx_replies_app ON application_replies(application_id);
 CREATE INDEX IF NOT EXISTS idx_replies_talent ON application_replies(talent_id);
+
+-- Community board (v16, Phase 0 — MODULE-COMMUNITY-LEARNING.md §7 +
+-- REQUIREMENT-COMMUNITY-BOARD-2026-11-21.md; artifact top-tea-talents
+-- v16). ONE public board: everybody sees everybody's posts; there are
+-- no private DMs — the direct-talk bubble is only a filtered view of
+-- these same public posts. @ mentions are resolved at post time from
+-- the autocomplete selection, so board_mentions stores the talent id,
+-- never just parsed text. Media is photo-only in v1 (jpeg/png/webp,
+-- 500KB decoded cap); audio/carousel kinds exist in the design but are
+-- refused honestly by the API ("coming soon") until a later phase.
+-- Board posts + photo bytes live in this same ephemeral SQLite, like
+-- portfolio photos: the ledger mirror carries the board ledger EVENTS
+-- (ids + counts only, never post bodies or photo bytes), not the posts
+-- themselves — a full restart wipes board posts, same as photos.
+CREATE TABLE IF NOT EXISTS board_posts (
+  id TEXT PRIMARY KEY,
+  talent_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  edited_at TEXT,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+  deleted_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_board_posts_talent ON board_posts(talent_id);
+CREATE INDEX IF NOT EXISTS idx_board_posts_created ON board_posts(created_at);
+
+CREATE TABLE IF NOT EXISTS board_post_media (
+  id TEXT PRIMARY KEY,
+  post_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'photo',
+  mime TEXT,
+  data_base64 TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_board_media_post ON board_post_media(post_id);
+
+CREATE TABLE IF NOT EXISTS board_mentions (
+  id TEXT PRIMARY KEY,
+  post_id TEXT NOT NULL,
+  mentioned_talent_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_board_mentions_post ON board_mentions(post_id);
+CREATE INDEX IF NOT EXISTS idx_board_mentions_talent ON board_mentions(mentioned_talent_id);
+
+-- Board reports: a report on a post, for owner review. No automated
+-- action is ever taken from a report in v1 — the owner reviews it.
+CREATE TABLE IF NOT EXISTS board_reports (
+  id TEXT PRIMARY KEY,
+  post_id TEXT NOT NULL,
+  reporter_talent_id TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_board_reports_post ON board_reports(post_id);

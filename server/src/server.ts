@@ -413,6 +413,56 @@ async function requireTalentOrAdmin(req: Request, talentId: string): Promise<{ o
   return { ok: false, res: err(403, "not authorized for this talent") };
 }
 
+// ---------- v16: community board helpers (Phase 0) ----------
+// A talent's board handle: professional name (or full name) with
+// spaces/punctuation stripped, lowercased — @moocho style. Mentions
+// match on this handle and on the display name. Ported from artifact
+// top-tea-talents v16 (boardDisplayName/boardHandle).
+function boardDisplayName(p: any): string {
+  const prof = String(p?.professionalName || "").trim();
+  if (prof) return prof;
+  const full = `${p?.firstName ?? ""} ${p?.lastName ?? ""}`.trim();
+  return full || "Talent";
+}
+function boardHandle(p: any): string {
+  const raw = boardDisplayName(p).toLowerCase().replace(/[^a-z0-9]/g, "");
+  return raw || "talent";
+}
+// Owner token carried in a request BODY (the artifact's removeBoardPost
+// takes ownerToken as a param). Validated against owner_sessions the
+// same way ownerFromToken validates the Authorization header — a talent
+// session token never passes this check.
+async function ownerTokenValid(token: string): Promise<boolean> {
+  if (!token) return false;
+  const rows = await db.all("SELECT expires_at FROM owner_sessions WHERE token = ?", [token]);
+  if (!rows.length) return false;
+  if (new Date(String(rows[0].expires_at)).getTime() < Date.now()) {
+    await db.run("DELETE FROM owner_sessions WHERE token = ?", [token]);
+    return false;
+  }
+  return true;
+}
+async function boardPostView(r: any, viewerTalentId: string): Promise<any> {
+  const author = await loadTalent(String(r.talent_id));
+  const media = await db.all("SELECT * FROM board_post_media WHERE post_id = ? ORDER BY sort_order ASC LIMIT 1", [r.id]);
+  const mentions = await db.all("SELECT * FROM board_mentions WHERE post_id = ?", [r.id]);
+  const mentionViews: any[] = [];
+  for (const m of mentions) {
+    const t = await loadTalent(String(m.mentioned_talent_id));
+    mentionViews.push({ talentId: String(m.mentioned_talent_id), name: t ? boardDisplayName(t.profile) : "Talent", handle: t ? boardHandle(t.profile) : "" });
+  }
+  return {
+    id: String(r.id), talentId: String(r.talent_id),
+    authorName: author ? boardDisplayName(author.profile) : "Talent",
+    authorHandle: author ? boardHandle(author.profile) : "",
+    body: String(r.body || ""),
+    photoUrl: media.length ? `/api/v1/board/photos/${media[0].id}` : "",
+    mentions: mentionViews,
+    mentionsViewer: !!viewerTalentId && mentionViews.some((m) => m.talentId === viewerTalentId),
+    createdAt: String(r.created_at),
+  };
+}
+
 // ---------- v11: verification codes (hash-only, 15-min expiry, 5-attempt lock) ----------
 // Codes are stored as sha256 hashes ONLY — the plaintext code is never
 // written to the DB, the ledger, or the mirror. TEST MODE honesty: email
@@ -972,6 +1022,187 @@ async function handle(req: Request): Promise<Response> {
       await db.run("INSERT INTO sources (id, data_json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json", [id, JSON.stringify(rec)]);
       await audit("source.create", "source", id, "admin", { name: rec.name }, { source: rec });
       return json({ ok: true, source: rec }, 201);
+    }
+    return err(404, "not found");
+  }
+
+  // ----- community board (v16, Phase 0) -----
+  // One public board: everybody sees everybody's posts — there are no
+  // private DMs in this product, and the direct-talk bubble is only a
+  // filtered view of these same public posts. Action names mirror the
+  // artifact (searchBoardMentions, createBoardPost, listBoardPosts,
+  // createBoardMediaPost, deleteBoardPost, removeBoardPost,
+  // reportBoardPost). Photo storage adapts the artifact's blob storage
+  // to this package's pattern: bytes in board_post_media.data_base64,
+  // same as portfolio photos. Ledger events carry ids + counts only —
+  // never post bodies or photo bytes (see MIRROR.md).
+  if (rest[0] === "board") {
+    // GET /board/photos/:id — public: the board itself is public.
+    if (method === "GET" && rest[1] === "photos" && rest.length === 3) {
+      const rows = await db.all("SELECT * FROM board_post_media WHERE id = ?", [rest[2]]);
+      if (!rows.length || !rows[0].data_base64) return err(404, "photo not found");
+      const buf = Buffer.from(String(rows[0].data_base64), "base64");
+      return new Response(buf, { headers: { "Content-Type": String(rows[0].mime || "image/jpeg"), "Access-Control-Allow-Origin": "*" } });
+    }
+    // GET /board/posts?viewerTalentId= — newest first, deleted excluded.
+    if (method === "GET" && rest.join("/") === "board/posts") {
+      const viewer = String(q.get("viewerTalentId") || "");
+      const rows = await db.all("SELECT * FROM board_posts ORDER BY created_at DESC LIMIT 200");
+      const posts: any[] = [];
+      for (const r of rows) {
+        if (Number(r.deleted) === 1) continue;
+        posts.push(await boardPostView(r, viewer));
+      }
+      return ok({ posts });
+    }
+    // GET /board/mentions/search?q= — live @ autocomplete: handle or
+    // name starts with the fragment, narrowing with each letter.
+    if (method === "GET" && rest.join("/") === "board/mentions/search") {
+      const frag = String(q.get("q") || q.get("query") || "").trim().toLowerCase().replace(/^@/, "");
+      const talents = await db.all("SELECT * FROM talents");
+      const matched = talents.filter((row: any) => {
+        let p: any = {};
+        try { p = JSON.parse(String(row.profile_json || "{}")); } catch { p = {}; }
+        if (!frag) return true;
+        const handle = boardHandle(p);
+        const name = boardDisplayName(p).toLowerCase();
+        return handle.startsWith(frag) || name.startsWith(frag) || name.split(/\s+/).some((w: string) => w.startsWith(frag));
+      });
+      matched.sort((a: any, b: any) => {
+        const pa = JSON.parse(String(a.profile_json || "{}")); const pb = JSON.parse(String(b.profile_json || "{}"));
+        return boardHandle(pa).localeCompare(boardHandle(pb));
+      });
+      return ok({
+        profiles: matched.slice(0, 8).map((row: any) => {
+          let p: any = {};
+          try { p = JSON.parse(String(row.profile_json || "{}")); } catch { p = {}; }
+          return { talentId: String(row.id), name: boardDisplayName(p), handle: boardHandle(p) };
+        }),
+      });
+    }
+    // POST /board/posts — text + optional ONE photo, resolved @mentions.
+    if (method === "POST" && rest.join("/") === "board/posts") {
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const talentId = String(b.talentId || "");
+      if (!talentId) return err(400, "talentId is required");
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const author = await loadTalent(talentId);
+      if (!author) return err(404, "talent profile not found — sign up or pick your profile before posting");
+      const postBody = String(b.body || "").trim();
+      if (postBody.length > 1000) return err(400, "board posts are limited to 1000 characters");
+      const photo = isObj(b.photo) ? b.photo : null;
+      if (!postBody && !photo) return err(400, "Write something or add a photo before posting.");
+      // Photo gate — same pattern as portfolio photos, 500KB decoded cap.
+      let photoB64: string | null = null; let photoMime = "";
+      if (photo) {
+        const allowed = ["image/jpeg", "image/png", "image/webp"];
+        photoMime = String(photo.mimeType || photo.mime || "").toLowerCase();
+        if (!allowed.includes(photoMime)) return err(400, "Board photos must be JPG, PNG, or WEBP.");
+        const rawB64 = String(photo.dataBase64 || photo.data_base64 || "");
+        if (!/^[A-Za-z0-9+/=]+$/.test(rawB64)) return err(400, "That photo appears empty or corrupted. Choose a different photo.");
+        const buf = Buffer.from(rawB64, "base64");
+        if (buf.length === 0) return err(400, "That photo appears empty or corrupted. Choose a different photo.");
+        if (buf.length > 500 * 1024) return err(400, "That photo is too large for the board — 500 KB maximum. Pick a smaller photo.");
+        photoB64 = rawB64;
+      }
+      const mentionedIds: string[] = Array.isArray(b.mentionedTalentIds) ? b.mentionedTalentIds.map((x: any) => String(x)) : [];
+      if (mentionedIds.length > 10) return err(400, "at most 10 mentions per post");
+      const postId = genId("brd");
+      const ts = nowIso();
+      if (photo && photoB64) {
+        await db.run("INSERT INTO board_post_media (id, post_id, kind, mime, data_base64, sort_order, created_at) VALUES (?, ?, 'photo', ?, ?, 0, ?)",
+          [genId("brm"), postId, photoMime, photoB64, ts]);
+      }
+      await db.run("INSERT INTO board_posts (id, talent_id, body, created_at, deleted, deleted_by) VALUES (?, ?, ?, ?, 0, '')", [postId, talentId, postBody, ts]);
+      // Resolve mentions: only real talents, never the author, no dupes.
+      const wanted = [...new Set(mentionedIds)].filter((id) => id !== talentId);
+      const mentioned: any[] = [];
+      for (const mid of wanted) {
+        const t = await loadTalent(mid);
+        if (!t) continue;
+        mentioned.push(t);
+        await db.run("INSERT INTO board_mentions (id, post_id, mentioned_talent_id, created_at) VALUES (?, ?, ?, ?)", [genId("bmn"), postId, mid, ts]);
+      }
+      const authorName = boardDisplayName(author.profile);
+      await audit("BOARD_POST_CREATED", "board_post", postId, `talent:${talentId}`,
+        { hasPhoto: !!photo, mentionCount: mentioned.length },
+        { boardPost: { id: postId, talent_id: talentId, created_at: ts, deleted: false, hasPhoto: !!photo, mentionCount: mentioned.length } });
+      for (const m of mentioned) {
+        const mProfile = m.profile;
+        await notify(String(m.row.id), `${authorName} mentioned you on the Community Board`,
+          `@${boardHandle(author.profile)} mentioned you on the public board — open the Community Board to reply. The board is public: everyone can see the conversation.`);
+        await audit("BOARD_MENTION_DELIVERED", "board_post", postId, "system",
+          { postId, fromTalentId: talentId, mentionedTalentId: String(m.row.id) },
+          { boardMention: { post_id: postId, from_talent_id: talentId, mentioned_talent_id: String(m.row.id) } });
+      }
+      return json({ ok: true, id: postId, message: "Posted to the Community Board — everyone on the board can see it." }, 201);
+    }
+    // POST /board/media-posts — honest refusal for audio/carousel.
+    // Nothing is stored, nothing is ledger-recorded: no post exists.
+    if (method === "POST" && rest.join("/") === "board/media-posts") {
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const kind = String(b.kind || "");
+      if (kind === "audio") return json({ ok: false, message: "Audio posts coming soon — the board takes text and photos today. Your post was not created." });
+      if (kind === "carousel") return json({ ok: false, message: "Carousel posts coming soon — the board takes text and one photo per post today. Your post was not created." });
+      return err(400, "kind must be 'audio' or 'carousel'");
+    }
+    // POST /board/posts/:id/delete — own post only (soft delete).
+    if (method === "POST" && rest.length === 4 && rest[1] === "posts" && rest[3] === "delete") {
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const talentId = String(b.talentId || "");
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const rows = await db.all("SELECT * FROM board_posts WHERE id = ?", [rest[2]]);
+      const post = rows[0];
+      if (!post || Number(post.deleted) === 1) return err(404, "That post is already gone.");
+      if (String(post.talent_id) !== talentId) return err(403, "You can only delete your own posts.");
+      await db.run("UPDATE board_posts SET deleted = 1, deleted_at = ?, deleted_by = 'talent' WHERE id = ?", [nowIso(), rest[2]]);
+      await audit("BOARD_POST_DELETED", "board_post", String(rest[2]), `talent:${talentId}`,
+        { postId: String(rest[2]) },
+        { boardPost: { id: String(rest[2]), deleted: true, deleted_by: "talent" } });
+      return ok({ message: "Your post was deleted from the board." });
+    }
+    // POST /board/posts/:id/remove — OWNER ONLY (owner session token
+    // via Authorization header, admin token, or ownerToken in the body).
+    if (method === "POST" && rest.length === 4 && rest[1] === "posts" && rest[3] === "remove") {
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const viaHeader = isAdmin(req) || (await ownerFromToken(req));
+      const viaBody = await ownerTokenValid(String(b.ownerToken || ""));
+      if (!viaHeader && !viaBody) return err(401, "Owner sign-in required — only the agency owner can remove another talent's post.");
+      const rows = await db.all("SELECT * FROM board_posts WHERE id = ?", [rest[2]]);
+      const post = rows[0];
+      if (!post || Number(post.deleted) === 1) return err(404, "That post is already gone.");
+      await db.run("UPDATE board_posts SET deleted = 1, deleted_at = ?, deleted_by = 'owner' WHERE id = ?", [nowIso(), rest[2]]);
+      await audit("BOARD_POST_REMOVED_BY_OWNER", "board_post", String(rest[2]), "owner",
+        { postId: String(rest[2]), authorTalentId: String(post.talent_id) },
+        { boardPost: { id: String(rest[2]), deleted: true, deleted_by: "owner" } });
+      await notify(String(post.talent_id), "One of your board posts was removed",
+        "The agency owner removed one of your Community Board posts. The board is moderated by the owner — there is no automatic filter.");
+      return ok({ message: "Post removed from the board (recorded in the ledger)." });
+    }
+    // POST /board/posts/:id/report — recorded for owner review; no
+    // automated action is ever taken from a report in v1.
+    if (method === "POST" && rest.length === 4 && rest[1] === "posts" && rest[3] === "report") {
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const rows = await db.all("SELECT * FROM board_posts WHERE id = ?", [rest[2]]);
+      const post = rows[0];
+      if (!post || Number(post.deleted) === 1) return err(404, "That post is already gone.");
+      const reporterId = String(b.reporterTalentId || "");
+      if (reporterId) {
+        const chk = await requireTalentOrAdmin(req, reporterId); if (!chk.ok) return chk.res!;
+      }
+      const reportId = genId("brp");
+      const reason = String(b.reason || "").trim().slice(0, 300);
+      await db.run("INSERT INTO board_reports (id, post_id, reporter_talent_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+        [reportId, String(rest[2]), reporterId, reason, nowIso()]);
+      await audit("BOARD_POST_REPORTED", "board_post", String(rest[2]), reporterId ? `talent:${reporterId}` : "system",
+        { postId: String(rest[2]), reportId },
+        { boardReport: { id: reportId, post_id: String(rest[2]) } });
+      return ok({ message: "Reported — the agency owner will review it. Nothing happens automatically." });
     }
     return err(404, "not found");
   }
