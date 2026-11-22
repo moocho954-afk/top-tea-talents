@@ -127,12 +127,24 @@ function api(path, opts){
 }
 function apiGet(path){ return api(path); }
 
-/* ---------- API field mapping: wizard/profile forms use snake_case keys; the API speaks camelCase. ---------- */
+/* ---------- API field mapping: wizard/profile forms use snake_case keys; the API speaks camelCase. ----------
+   toApiProfile(d, skipEmptyArrays): the wizard passes skipEmptyArrays=true.
+   Why: the wizard re-saves a step after re-entry, and a blank box there means
+   "not entered on this step", NOT "delete what is saved" — sending [] would
+   overwrite saved languages/skills/categories/availability with nothing (the
+   wizard-drop bug, reproduced live 2026-11-22: 80% -> 60%). Edit My Profile
+   calls it without the flag, so clearing a box there still deliberately
+   clears that field (its form renders from the saved record, so blank there
+   is a real choice, not an untouched step). */
 var PROFILE_KEY_MAP = {first_name:"firstName", last_name:"lastName", professional_name:"professionalName", travel_radius:"travelRadius", age_range:"ageRange", hair_color:"hairColor", eye_color:"eyeColor", min_compensation:"minCompensation", union_affiliation:"unionAffiliation", adult_or_minor:"adultOrMinor", contact_method:"contactMethod", share_photos:"sharePhotos"};
-function toApiProfile(d){
+function toApiProfile(d, skipEmptyArrays){
   var b = {};
   Object.keys(PROFILE_KEY_MAP).forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[PROFILE_KEY_MAP[k]]=d[k]; });
-  ["phone","city","state","zip","height","experience","availability","languages","skills","categories","adultOrMinor","minCompensation","unionAffiliation","clothing","clothingSizes","measurements","resume","demoReel","portfolioLinks","contactMethod","notifyEmail","notifySms","location","visibility","sharePhotos","paused"].forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[k]=d[k]; });
+  ["phone","city","state","zip","height","experience","availability","languages","skills","categories","adultOrMinor","minCompensation","unionAffiliation","clothing","clothingSizes","measurements","resume","demoReel","portfolioLinks","contactMethod","notifyEmail","notifySms","location","visibility","sharePhotos","paused"].forEach(function(k){
+    if(d[k]===undefined || d[k]==="") return;
+    if(skipEmptyArrays && Array.isArray(d[k]) && d[k].length===0) return;
+    b[k]=d[k];
+  });
   if(d.gender!==undefined || d.ethnicity!==undefined){
     b.demographics = {gender: d.gender||null, ethnicity: d.ethnicity||null};
   }
@@ -145,6 +157,48 @@ function normTalent(t){
   if(t.demographics){ if(t.gender===undefined) t.gender=t.demographics.gender; if(t.ethnicity===undefined) t.ethnicity=t.demographics.ethnicity; }
   if(t.guardian){ if(t.guardian_name===undefined) t.guardian_name=t.guardian.guardianName||""; if(t.guardian_contact===undefined) t.guardian_contact=t.guardian.guardianEmail||t.guardian.guardianPhone||""; }
   return t;
+}
+
+/* ---------- wizard repopulation (owner order 2026-11-22) ----------
+   The wizard used to read the device-local draft only, so re-entering after
+   the draft was gone (new device, cleared storage, or a previous Finish
+   removing it) showed blank fields even though the server had the answers —
+   and submitting a step then overwrote saved array values with [] (the
+   wizard-drop bug, reproduced live 2026-11-22: 80% -> 60%).
+   mergeDraftWithProfile fills the draft from the saved server profile (p is
+   a normTalent'ed profile, so both casings are present):
+   - scalars: the server is the durable record, so it wins when present.
+   - arrays (availability/categories/skills/languages): the draft wins only
+     when non-empty (chip taps not yet submitted); otherwise the server fills
+     the blank, so nothing already saved ever comes back empty. */
+function mergeDraftWithProfile(d, p){
+  if(!p) return d;
+  var demo = p.demographics || {};
+  var scalarMap = {first_name:"firstName", last_name:"lastName", professional_name:"professionalName", email:"email", phone:"phone", city:"city", state:"state", zip:"zip", travel_radius:"travelRadius", age_range:"ageRange", gender:"gender", ethnicity:"ethnicity", hair_color:"hairColor", eye_color:"eyeColor", height:"height", experience:"experience", min_compensation:"minCompensation", union_affiliation:"unionAffiliation", contact_method:"contactMethod", adult_or_minor:"adultOrMinor"};
+  Object.keys(scalarMap).forEach(function(snake){
+    var camel = scalarMap[snake];
+    var v = (p[camel]!==undefined && p[camel]!=="" && p[camel]!==null) ? p[camel] : p[snake];
+    if((v===undefined || v==="" || v===null) && demo[camel]!==undefined && demo[camel]!=="" && demo[camel]!==null) v = demo[camel];
+    if(v!==undefined && v!=="" && v!==null) d[snake]=v;
+  });
+  ["availability","categories","skills","languages"].forEach(function(k){
+    if(Array.isArray(d[k]) && d[k].length) return; // unsaved chip picks stay
+    if(Array.isArray(p[k])) d[k]=p[k].slice();
+  });
+  return d;
+}
+/* Debounced server sync for chip taps while the wizard is open: the draft
+   saves locally on every tap already; this also lands it on the server
+   profile so a closed tab loses nothing. Skipped while a step submit is in
+   flight, and never sends empty arrays (see toApiProfile). */
+var wizardSyncTimer = null, wizardSubmitting = false;
+function scheduleWizardSync(d){
+  if(!isLoggedIn()) return;
+  if(wizardSyncTimer) clearTimeout(wizardSyncTimer);
+  wizardSyncTimer = setTimeout(function(){
+    if(wizardSubmitting) return;
+    api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d, true)}).catch(function(){ /* draft still holds it; the step submit retries */ });
+  }, 800);
 }
 
 /* ---------- (3) auth / session ---------- */
@@ -586,6 +640,54 @@ function chipSet(id, values, selected, onPick){
    account immediately; email verification follows at #/verify. The
    remaining fields moved to post-signup profile completion, tracked by
    the % meter on the dashboard — nothing blocks joining. */
+/* Inline photo uploader inside wizard step 3 — reuses the portfolio upload
+   path (uploadPhoto -> POST /api/v1/talent/:id/photos, slot 1-8, JPG/PNG/WEBP,
+   decoded <= 500KB, max 8 photos). Only when signed in; otherwise the
+   #/portfolio link beside it is the path. */
+function wireJoinPhotos(){
+  var grid = $("#join-photo-grid"); if(!grid) return;
+  var msg = $("#join-photo-msg");
+  if(!isLoggedIn()){
+    grid.innerHTML = '<p class="muted">Sign in to upload photos here — or finish signing up and add them from your portfolio.</p>';
+    var addBtn0 = $("#join-photo-add"); if(addBtn0) addBtn0.style.display = "none";
+    var cnt0 = $("#join-photo-count"); if(cnt0) cnt0.textContent = "";
+    return;
+  }
+  var id = sessionTalentId();
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/photos").then(function(d){
+      var photos = d.photos||d||[];
+      var cnt = $("#join-photo-count"); if(cnt) cnt.textContent = photos.length + " of 8 photos";
+      grid.innerHTML = photos.length ? photos.map(function(p){
+        var imgSrc = p.url ? (apiBase() + p.url) : (p.dataUrl||"");
+        return '<div class="photo-slot"><img src="'+esc(imgSrc)+'" alt="'+esc(p.caption||p.label||"Photo")+'"><p class="small">'+esc(p.caption||p.label||"Photo")+'</p></div>';
+      }).join("") : '<p class="muted">No photos yet — add one below, or later from your portfolio.</p>';
+      var addBtn = $("#join-photo-add"); if(addBtn) addBtn.style.display = photos.length >= 8 ? "none" : "";
+    }).catch(function(err){ grid.innerHTML = errBox(err.message); });
+  };
+  var addBtn = $("#join-photo-add");
+  if(addBtn) addBtn.addEventListener("click", function(){
+    var inp = $("#join-photo-file"); if(!inp) return;
+    inp.onchange = function(){
+      var f = inp.files[0]; if(!f) return;
+      apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/photos").then(function(d){
+        var photos = d.photos||d||[];
+        var used = {};
+        photos.forEach(function(p){ used[p.slot]=true; });
+        var slot = 0;
+        for(var s=1; s<=8; s++){ if(!used[s]){ slot=s; break; } }
+        if(!slot){ msg.innerHTML = errBox("You already have 8 photos — delete one from your portfolio to add another."); return; }
+        uploadPhoto(id, slot, f, PHOTO_SLOTS[slot-1], function(err){
+          if(err) msg.innerHTML = errBox(err);
+          else { msg.innerHTML = okBox("Photo uploaded."); load(); }
+        });
+      }).catch(function(err){ msg.innerHTML = errBox(err.message); });
+    };
+    inp.click();
+  });
+  load();
+}
+
 function screenJoin(app){
   var d = joinDraft();
   var step = parseInt(qs("step")||"1",10) || 1;
@@ -601,8 +703,26 @@ function screenJoin(app){
       + '<p><a class="btn btn-ghost" href="#/dashboard">Go to my dashboard</a></p></div>';
     return;
   }
-  d.availability = d.availability||[]; d.categories=d.categories||[]; d.skills=d.skills||[];
+  d.availability = d.availability||[]; d.categories=d.categories||[]; d.skills=d.skills||[]; d.languages=d.languages||[];
   d.fast_track = d.fast_track||{A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
+  // Repopulate from the saved server profile before rendering steps 2-3:
+  // the server is the durable record — nothing already typed comes back
+  // blank, even if the device draft is gone. Draft-only if the fetch fails.
+  if(isLoggedIn() && (step===2 || step===3)){
+    app.innerHTML = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
+      + '<h1 style="color:var(--gold)">YOUR NEXT OPPORTUNITY STARTS HERE</h1>'
+      + '<p class="muted">Loading your saved answers…</p>';
+    apiGet("/api/v1/talent/"+encodeURIComponent(sessionTalentId())).then(function(res){
+      var t = normTalent((res&&(res.talent||res))||{});
+      d = mergeDraftWithProfile(d, t);
+      saveDraft(d);
+      renderJoin(app, d, step);
+    }).catch(function(){ renderJoin(app, d, step); });
+    return;
+  }
+  renderJoin(app, d, step);
+}
+function renderJoin(app, d, step){
   var html = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
     + '<h1 style="color:var(--gold)">YOUR NEXT OPPORTUNITY STARTS HERE</h1>'
     + '<p class="progress-label">Screen '+step+' of 3 — '+esc(JOIN_STEPS[step-1])+'</p>'
@@ -623,27 +743,34 @@ function screenJoin(app){
       + '<label>Preferred contact method<select name="contact_method"><option value="">No preference</option><option value="email">Email</option><option value="phone">Phone call</option><option value="text">Text</option></select></label>'
       + '<label class="checkbox-row"><input name="terms" type="checkbox" required> <span>I agree to the terms and the likeness-release process. I understand nothing is sent to an employer without my approval.</span></label>';
   } else if(step===2){
-    html += '<p class="muted">About you — all optional except where marked. Anything you skip can be added later from your profile; your completion % updates as you go.</p>'
-      + '<label>Height<input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
-      + '<div class="form-row"><div><label>ZIP<input name="zip" value="'+esc(d.zip||"")+'"></label></div>'
+    html += '<p class="muted">About you — height, ZIP and age range are needed to reach 100% and sign the release. Availability, languages and skills are optional — pick them only if they apply to you; skipping them never blocks you and never lowers your completion %.</p>'
+      + '<label>Height <span class="muted small">(needed for 100%)</span><input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
+      + '<div class="form-row"><div><label>ZIP <span class="muted small">(needed for 100%)</span><input name="zip" value="'+esc(d.zip||"")+'"></label></div>'
       + '<div><label>Travel radius (miles)<input name="travel_radius" type="number" min="0" value="'+esc(d.travel_radius||"")+'"></label></div></div>'
-      + '<label>Availability</label><div class="chip-set" id="avail-set"></div>'
-      + '<label>Age range<select name="age_range"><option value="">Prefer not to say</option><option>18–24</option><option>25–34</option><option>35–44</option><option>45–54</option><option>55+</option></select></label>'
+      + '<label>Availability <span class="muted small">(optional — pick only what applies, never blocks signing)</span></label><div class="chip-set" id="avail-set"></div>'
+      + '<label>Age range <span class="muted small">(needed for 100%)</span><select name="age_range"><option value="">Prefer not to say</option><option>18–24</option><option>25–34</option><option>35–44</option><option>45–54</option><option>55+</option></select></label>'
       + '<label>Adult or minor<select name="adult_or_minor"><option value="">Prefer not to say</option><option value="adult">Adult (18+)</option><option value="minor">Minor (under 18 — guardian required)</option></select></label>'
       + '<p class="muted">Optional demographics — never used as a match score. You control whether any of it is shared.</p>'
       + '<label>Gender<select name="gender"><option value="">Prefer not to say</option><option>Female</option><option>Male</option><option>Non-binary</option><option>Other</option></select></label>'
       + '<label>Ethnicity<select name="ethnicity"><option value="">Prefer not to say</option><option>Black / African American</option><option>Hispanic / Latino</option><option>White</option><option>Asian</option><option>Other</option><option>Two or more</option></select></label>'
       + '<label>Hair color<input name="hair_color" value="'+esc(d.hair_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
       + '<label>Eye color<input name="eye_color" value="'+esc(d.eye_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
-      + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
-      + '<label>Skills (comma separated)<input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>';
+      + '<label>Languages (comma separated) <span class="muted small">(optional)</span><input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
+      + '<label>Skills (comma separated) <span class="muted small">(optional)</span><input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>';
   } else {
-    html += '<p class="muted">Professional info &amp; permissions. Photos go in your portfolio (up to 8) — you can add them now or later.</p>'
-      + '<label>Categories</label><div class="chip-set" id="cat-set"></div>'
-      + '<label>Experience<textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
+    html += '<p class="muted">Professional info &amp; permissions. Experience is needed to reach 100%; categories are optional — pick only what applies. Photos go in your portfolio (up to 8) — add them right below, now or later.</p>'
+      + '<label>Categories <span class="muted small">(optional — pick only what applies, never blocks signing)</span></label><div class="chip-set" id="cat-set"></div>'
+      + '<label>Experience <span class="muted small">(needed for 100%)</span><textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
       + '<label>Minimum daily pay you will accept ($)<input name="min_compensation" type="number" min="0" value="'+esc(d.min_compensation||"")+'"></label>'
       + '<label>Union affiliation<input name="union_affiliation" value="'+esc(d.union_affiliation||"")+'" placeholder="e.g. SAG-AFTRA (optional)"></label>'
-      + '<p><a class="btn btn-ghost btn-sm" href="#/portfolio">Add portfolio photos (up to 8)</a></p>'
+      + '<div id="join-photos"><h3>Portfolio photos <span class="muted small">(optional — add now or later, never blocks signing)</span></h3>'
+      + '<p class="muted small">JPG, PNG, or WEBP only. Each photo is downscaled in your browser to max 1200px (JPEG, quality 0.82) before upload.</p>'
+      + '<p><strong id="join-photo-count">0 of 8 photos</strong></p>'
+      + '<div class="photo-grid" id="join-photo-grid">'+loadingBox("Loading photos…")+'</div>'
+      + '<p><input type="file" id="join-photo-file" accept="image/jpeg,image/png,image/webp" class="hidden">'
+      + '<button type="button" class="btn btn-ghost btn-sm" id="join-photo-add">Upload a photo</button> '
+      + '<a class="btn btn-ghost btn-sm" href="#/portfolio">Manage all photos</a></p>'
+      + '<div id="join-photo-msg"></div></div>'
       + '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning it ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time. You can change this any time in Fast-Track settings.</p>'
       + '<div id="ft-controls"></div>';
   }
@@ -654,10 +781,11 @@ function screenJoin(app){
     + '<p class="muted small">Your answers save automatically on this device as you go. If you are logged in, changes also save to your profile.</p>';
   app.innerHTML = html;
 
-  if(step===2) chipSet("avail-set", ["Available immediately","Weekdays","Weekends","Evenings","Flexible","Specific dates","Temporarily unavailable"], d.availability, function(v){ d.availability=v; saveDraft(d); });
+  if(step===2) chipSet("avail-set", ["Available immediately","Weekdays","Weekends","Evenings","Flexible","Specific dates","Temporarily unavailable"], d.availability, function(v){ d.availability=v; saveDraft(d); scheduleWizardSync(d); });
   if(step===3){
-    chipSet("cat-set", ["Film and television","Background extras","Featured extras","Commercials","Advertising","Music videos","Modeling","Print campaigns","Promotional events","Brand activations","Reality television","Live events","Corporate productions","Specialty talent","Other paid opportunities"], d.categories, function(v){ d.categories=v; saveDraft(d); });
+    chipSet("cat-set", ["Film and television","Background extras","Featured extras","Commercials","Advertising","Music videos","Modeling","Print campaigns","Promotional events","Brand activations","Reality television","Live events","Corporate productions","Specialty talent","Other paid opportunities"], d.categories, function(v){ d.categories=v; saveDraft(d); scheduleWizardSync(d); });
     renderFastTrackControls($("#ft-controls"), d.fast_track, function(k,v){ d.fast_track[k]=v; saveDraft(d); });
+    wireJoinPhotos();
   }
 
   var back = $("#join-back");
@@ -702,9 +830,10 @@ function screenJoin(app){
     }
     if(step<3){
       if(isLoggedIn()){
-        api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d)})
+        wizardSubmitting = true; // pause the debounced chip sync while saving
+        api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d, true)})
           .then(function(){ location.hash = "#/join?step="+(step+1); route(); })
-          .catch(function(err){ msg.innerHTML = errBox(err.message + " — your answers are still saved on this device."); });
+          .catch(function(err){ wizardSubmitting = false; msg.innerHTML = errBox(err.message + " — your answers are still saved on this device."); });
       } else { location.hash = "#/join?step="+(step+1); route(); }
       return;
     }
@@ -713,12 +842,13 @@ function screenJoin(app){
       if(!isLoggedIn()){ location.hash = "#/consent"; route(); return; }
       api("/api/v1/talent/"+encodeURIComponent(sessionTalentId())+"/fast-track", {method:"POST", body:{controls:d.fast_track}})
         .then(function(){ try{ localStorage.removeItem("ttt_join_draft"); }catch(err){} location.hash = "#/consent"; route(); })
-        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+        .catch(function(err){ wizardSubmitting = false; msg.innerHTML = errBox(err.message); });
     };
     if(isLoggedIn()){
-      api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d)})
+      wizardSubmitting = true; // pause the debounced chip sync while saving
+      api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d, true)})
         .then(finish)
-        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+        .catch(function(err){ wizardSubmitting = false; msg.innerHTML = errBox(err.message); });
     } else finish();
   });
 }
@@ -836,13 +966,22 @@ function renderFastTrackControls(el, state, onChange){
 }
 
 /* ---------- (8) dashboard / portfolio / profile / fast-track / consent ---------- */
+/* Fallback completion % — mirrors the server COMPLETION_ITEMS exactly (6 core
+   items only; languages/skills/categories/availability are optional extras
+   and photos never count). The dashboard prefers the server value; this must
+   never disagree with it. */
 function completionPct(t){
   if(!t) return 0;
-  var fields = ["first_name","last_name","email","phone","city","state","height","experience"];
-  var have = fields.filter(function(f){ return t[f]; }).length;
-  var pct = Math.round((have/fields.length)*70);
-  if((t.photos||[]).length>0) pct += Math.min(30, (t.photos||[]).length*5);
-  return Math.min(100, pct);
+  var core = [
+    !!(t.email && t.phone),
+    !!((t.firstName||t.first_name) && (t.lastName||t.last_name)),
+    !!(t.city && t.state && t.zip),
+    !!t.height,
+    !!(t.ageRange||t.age_range),
+    !!t.experience
+  ];
+  var done = core.filter(function(x){ return x; }).length;
+  return Math.round((done/core.length)*100);
 }
 function screenDashboard(app){
   if(!requireLogin(app)) return;
@@ -966,7 +1105,10 @@ function screenProfile(app){
       + '<div class="form-row"><div><label>City<input name="city" value="'+esc(t.city||"")+'"></label></div><div><label>State<input name="state" value="'+esc(t.state||"")+'"></label></div></div>'
       + '<label>ZIP<input name="zip" value="'+esc(t.zip||"")+'"></label>'
       + '<label>Travel radius (miles)<input name="travel_radius" type="number" value="'+esc(t.travel_radius||"")+'"></label>'
-      + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((t.languages||[]).join(", "))+'"></label>'
+      + '<label>Languages (comma separated) <span class="muted small">(optional)</span><input name="languages_text" value="'+esc((t.languages||[]).join(", "))+'"></label>'
+      + '<label>Skills (comma separated) <span class="muted small">(optional)</span><input name="skills_text" value="'+esc((t.skills||[]).join(", "))+'"></label>'
+      + '<label>Categories <span class="muted small">(optional — pick only what applies)</span></label><div class="chip-set" id="prof-cat-set"></div>'
+      + '<label>Availability <span class="muted small">(optional — pick only what applies)</span></label><div class="chip-set" id="prof-avail-set"></div>'
       + '<label>Experience<textarea name="experience" rows="4">'+esc(t.experience||"")+'</textarea></label>'
       + '<label>Portfolio visibility<select name="visibility"><option value="private"'+((t.visibility||"private")==="private"?" selected":"")+'>Private — nobody sees my portfolio</option><option value="agency"'+(t.visibility==="agency"?" selected":"")+'>Agency staff only</option><option value="public"'+(t.visibility==="public"?" selected":"")+'>Public — anyone with my personal link</option></select></label>'
       + '<label class="checkbox-row"><input type="checkbox" name="share_photos"'+(t.sharePhotos?" checked":"")+'> <span>Share my portfolio photos on my public portfolio page (only when visibility is Public).</span></label>'
@@ -980,6 +1122,12 @@ function screenProfile(app){
       + '<p><button class="btn btn-ghost" type="submit">Save guardian</button></p></form><div id="guardian-msg"></div>'
       + '<hr style="border-color:var(--line)"><h3>My audit trail</h3><p class="muted small">Every change to your record, from the ledger.</p><div id="audit-box"><p class="muted">Loading…</p></div>'
       + '<hr style="border-color:var(--line)"><h3>Delete my account</h3><p class="muted small">Deleting removes your talent record. This cannot be undone.</p><p><button class="btn btn-danger" id="del-acct" type="button">Delete my account</button></p>';
+    // Categories + availability live here too (optional) — they were
+    // wizard-only before, so a talent had no way to add or change them after
+    // signing up except by re-entering the wizard.
+    var profCategories = (t.categories||[]).slice(), profAvailability = (t.availability||[]).slice();
+    chipSet("prof-cat-set", ["Film and television","Background extras","Featured extras","Commercials","Advertising","Music videos","Modeling","Print campaigns","Promotional events","Brand activations","Reality television","Live events","Corporate productions","Specialty talent","Other paid opportunities"], profCategories, function(v){ profCategories=v; });
+    chipSet("prof-avail-set", ["Available immediately","Weekdays","Weekends","Evenings","Flexible","Specific dates","Temporarily unavailable"], profAvailability, function(v){ profAvailability=v; });
     $("#prof-form").addEventListener("submit", function(e){
       e.preventDefault();
       var body = {};
@@ -987,6 +1135,8 @@ function screenProfile(app){
       var sp = e.target.querySelector('[name="share_photos"]');
       body.sharePhotos = sp ? sp.checked : false;
       if(body.languages_text!==undefined){ body.languages = String(body.languages_text||"").split(",").map(function(s){return s.trim();}).filter(Boolean); delete body.languages_text; }
+      if(body.skills_text!==undefined){ body.skills = String(body.skills_text||"").split(",").map(function(s){return s.trim();}).filter(Boolean); delete body.skills_text; }
+      body.categories = profCategories; body.availability = profAvailability;
       api("/api/v1/talent/"+encodeURIComponent(id), {method:"PATCH", body:toApiProfile(body)})
         .then(function(){ $("#prof-msg").innerHTML = okBox("Profile saved."); })
         .catch(function(err){ $("#prof-msg").innerHTML = errBox(err.message); });
