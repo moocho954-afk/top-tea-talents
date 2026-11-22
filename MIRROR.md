@@ -140,6 +140,13 @@ SELFTEST: 87 passed, 0 failed
 - **Photo bytes are never in the mirror.** The ledger event is restored;
   the photo itself is not — the talent re-uploads. Counted as a gap in
   every restore report, never silently skipped.
+- **Board posts and board photo bytes are never in the mirror either (v16).**
+  The mirror carries the board ledger events (`BOARD_POST_CREATED`,
+  `BOARD_MENTION_DELIVERED`, `BOARD_POST_REPORTED`, `BOARD_POST_DELETED`,
+  `BOARD_POST_REMOVED_BY_OWNER`) with ids + counts only — never post
+  bodies or photo bytes. After a wipe the ledger rows restore, but the
+  board posts themselves do not: they must be re-posted, same as
+  portfolio photos. Stated in the UI and README, never promised otherwise.
 - **Payment status** lives only in the ledger event (`booking.payment`
   data) — restored with the ledger rows, but there is no payments column
   (pre-existing design, unchanged).

@@ -81,6 +81,26 @@ Dockerfile           oven/bun:1.3-slim, no install step
   consent, reviews, matches, applications, bookings, payments, ingestions).
   `GET /api/v1/ledger/verify` recomputes the chain. Ledger view + contact
   book in the UI.
+- **Community Board (v16, Phase 0 — `#/community`).** One public board:
+  everybody sees everybody's posts; there are no private DMs. Text + one
+  photo per post (JPG/PNG/WEBP, 500KB decoded cap, bytes in SQLite like
+  portfolio photos). @ mentions autocomplete live (narrowing per letter,
+  tap to insert), are stored as talent ids, highlighted to the named
+  person, and delivered as an in-app notification. The direct-talk bubble
+  is only a filtered view of the same public posts — it says so in its
+  header — and closes on "End chat" or 30 seconds after the last typing;
+  the messages stay on the board. Talent deletes own posts; the owner
+  removes any post behind the owner gate; reports are recorded for owner
+  review with no automated action. Every board action is ledger-recorded
+  (`BOARD_POST_CREATED`, `BOARD_MENTION_DELIVERED`, `BOARD_POST_REPORTED`,
+  `BOARD_POST_DELETED`, `BOARD_POST_REMOVED_BY_OWNER`). Audio and carousel
+  posts are refused honestly ("coming soon") and create nothing — not
+  implemented in this phase. Composer keeps native autocorrect/predictive
+  text enabled. **Honest limit:** board posts and photo bytes live in the
+  same ephemeral SQLite as everything else; the mirror carries the board
+  ledger events (ids + counts only, never post bodies or photo bytes),
+  not the posts themselves — a full restart wipes board posts, same as
+  portfolio photos (see MIRROR.md).
 - **Recurring-agency monitor** — agencies ranked by booking volume, TOP REPEAT
   AGENCY badges at/above the threshold (default 3 confirmed bookings) or in
   the top 10% by booking volume (both configurable in settings), spike
@@ -103,12 +123,15 @@ Dockerfile           oven/bun:1.3-slim, no install step
 
 ## Version
 
-- **Artifact parity: v14.** The footer carries a visible stamp
-  (`TOP TEA TALENTS • v14 • updated <date>`, from
+- **Artifact parity: v16.** The footer carries a visible stamp
+  (`TOP TEA TALENTS • v16 • updated <date>`, from
   `window.__TTT_BUILD__` in `frontend/index.html`), and
   `/api/v1/health` reports the backend version (`1.1.0`). If the stamp
   and the artifact disagree, the package is stale — that is the drift
-  check.
+  check. v16 ports the artifact's Community Board (Phase 0) plus the
+  returning-account wizard resume fix (WELCOME BACK panel on join step 1
+  for a signed-in talent; "Sign in instead" link on the
+  already-registered error). Backend version stays 1.1.0.
 
 ## Social linking + Instagram auto-pull — what is real here (v12–v14)
 
@@ -155,7 +178,7 @@ PORT=3101 DATABASE_PATH=/tmp/ttt.db ADMIN_TOKEN=dev-token bun run src/server.ts
 # in another shell, serve the frontend with the API pointed at it:
 #   echo 'window.__TTT_API__ = "http://localhost:3101";' > ../frontend/api-config.js
 #   python3 -m http.server 8123 --directory ../frontend
-bash server/selftest.sh   # 108 checks, boots its own temp DB
+bash server/selftest.sh   # 136 checks, boots its own temp DB
 bun x tsc --noEmit -p server/tsconfig.json
 ```
 
