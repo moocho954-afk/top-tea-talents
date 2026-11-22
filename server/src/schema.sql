@@ -174,3 +174,87 @@ CREATE INDEX IF NOT EXISTS idx_apps_talent ON applications(talent_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_talent ON bookings(talent_id);
 CREATE INDEX IF NOT EXISTS idx_photos_talent ON photos(talent_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_norm ON contacts(normalized);
+
+-- v11 parity additions (2026-11-21): email verification + password reset,
+-- owner gate, automation, social links, inbound replies.
+-- Verification/reset codes are stored HASH-ONLY (sha256), never plaintext,
+-- and never in the ledger mirror. Codes expire after 15 minutes; 5 failed
+-- attempts lock the code (a resend issues a fresh one).
+CREATE TABLE IF NOT EXISTS verification_codes (
+  id TEXT PRIMARY KEY,
+  talent_id TEXT,
+  email TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  purpose TEXT NOT NULL DEFAULT 'email_verify',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  used INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcodes_email ON verification_codes(email, purpose);
+
+-- Owner gate (v10): the owner passcode hash lives in settings under
+-- owner_passcode_hash (NEVER in the ledger or mirror). Owner sessions
+-- last 12 hours; agency money is only served to a valid owner session
+-- (or the admin token, which is the owner's credential).
+CREATE TABLE IF NOT EXISTS owner_sessions (
+  token TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- Automation toggle (v8): one row per talent. enabled=false by default.
+-- Agency-send email route (agency mailbox sends, talent CC'd, Reply-To
+-- the talent) + per-(talent, job) reference codes are computed
+-- deterministically (see refCode in server.ts) — nothing is ever sent
+-- live in TEST MODE; armed automation only queues for review.
+CREATE TABLE IF NOT EXISTS automation_settings (
+  talent_id TEXT PRIMARY KEY,
+  data_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+-- Social links (v11): a talent links THEIR OWN Instagram/Facebook.
+-- begin = talent-attested claim (status PENDING), confirm = talent
+-- confirms the link (status LINKED). bio_checked = the talent confirmed
+-- their social bio carries the TOP TEA TALENTS link. There is no OAuth
+-- integration yet — linking is talent-attested, preview only.
+CREATE TABLE IF NOT EXISTS social_links (
+  id TEXT PRIMARY KEY,
+  talent_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  handle TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  bio_checked INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_social_talent ON social_links(talent_id);
+
+-- Extended portfolio preview (v11): a few photos from the talent's
+-- linked social accounts, shown alongside the 8-photo portfolio.
+-- URL-only references (no bytes stored); talent chooses what shows.
+CREATE TABLE IF NOT EXISTS social_photos (
+  id TEXT PRIMARY KEY,
+  talent_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  photo_url TEXT NOT NULL,
+  caption TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_socialphotos_talent ON social_photos(talent_id);
+
+-- Inbound replies (v8/v11): replies from agencies/casting to an
+-- application, recorded by staff (admin) and visible to the talent.
+CREATE TABLE IF NOT EXISTS application_replies (
+  id TEXT PRIMARY KEY,
+  application_id TEXT NOT NULL,
+  talent_id TEXT NOT NULL,
+  from_name TEXT,
+  channel TEXT,
+  body TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replies_app ON application_replies(application_id);
+CREATE INDEX IF NOT EXISTS idx_replies_talent ON application_replies(talent_id);

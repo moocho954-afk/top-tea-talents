@@ -3,15 +3,23 @@
 // file; nothing is ever sent live; no payments are processed; email is queued
 // only ("email pending: integration not connected") and never claimed as sent.
 // Never collect SSN or bank credentials. Free-only: no paid service anywhere.
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createDb, type Db, type Row } from "./libsql.js";
+import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
 
 const db: Db = createDb();
+
+// Wipe-proof ledger mirror (see src/mirror.ts): every ledger event is also
+// appended to a JSONL mirror file next to the DB, carrying the full state
+// snapshot, so a wiped DB can be rebuilt from the mirror on boot. The file
+// is the durable artifact a collector pushes to the repo (see
+// prototype/ledger-mirror-recorder.yml — not activated yet).
+const MIRROR_PATH = defaultMirrorPath();
 
 // ---------- small helpers ----------
 const nowIso = () => new Date().toISOString();
@@ -102,7 +110,10 @@ function commissionFor(grossCents: number, rate: number): { feeCents: number; ne
 }
 
 // ---------- ledger (append-only, hash-chained) ----------
-async function ledgerAppend(eventType: string, entityType: string, entityId: string, actor: string, data: any): Promise<number> {
+// state (optional): the full record snapshot AFTER this change, carried
+// into the mirror so boot-restore can rebuild the DB from the mirror
+// alone. Never a secret: no password hash, no session token, no photo bytes.
+async function ledgerAppend(eventType: string, entityType: string, entityId: string, actor: string, data: any, state: any = null): Promise<number> {
   const rows = await db.all("SELECT MAX(seq) AS m, hash FROM ledger_events GROUP BY seq ORDER BY seq DESC LIMIT 1").catch(() => []);
   let prevHash = "GENESIS";
   let seq = 1;
@@ -119,16 +130,21 @@ async function ledgerAppend(eventType: string, entityType: string, entityId: str
     "INSERT INTO ledger_events (seq, ts, event_type, entity_type, entity_id, actor, data_json, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [seq, ts, eventType, entityType, entityId, actor, JSON.stringify(data ?? {}), prevHash, hash],
   );
+  // Mirror the event (with its state) to the durable JSONL log. Awaited:
+  // the mirror is fsync'd before this call returns. A mirror failure is
+  // logged loudly by appendMirror but never fails the API call — the DB
+  // row above is the live record; POST /ledger/mirror/rebuild re-syncs.
+  await appendMirror(MIRROR_PATH, { seq, ts, event_type: eventType, entity_type: entityType, entity_id: entityId, actor, data: data ?? {}, prev_hash: prevHash, hash }, state);
   return seq;
 }
 
-async function audit(action: string, entityType: string, entityId: string, actor: string, data: any): Promise<void> {
+async function audit(action: string, entityType: string, entityId: string, actor: string, data: any, state: any = null): Promise<void> {
   const ts = nowIso();
   await db.run(
     "INSERT INTO audit_log (id, ts, actor, action, entity_type, entity_id, data_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
     [genId("aud"), ts, actor, action, entityType, entityId, JSON.stringify(data ?? {})],
   ).catch(() => {});
-  await ledgerAppend(action, entityType, entityId, actor, data ?? {});
+  await ledgerAppend(action, entityType, entityId, actor, data ?? {}, state);
 }
 
 // ---------- contacts ----------
@@ -299,6 +315,12 @@ async function loadSeed(): Promise<{ inserted: number; skipped: number; intelIns
 
 const SCHEMA = await Bun.file(import.meta.dir + "/schema.sql").text();
 await db.exec(SCHEMA);
+// Wipe-proof boot-restore: if the local DB is empty (wiped) and a ledger
+// mirror exists, replay the mirror into the fresh DB BEFORE the seed check
+// runs, so staff-added state comes back first and the seed only fills what
+// the mirror doesn't carry. A tampered mirror is REFUSED (boots from seed
+// only) — see src/mirror.ts.
+await bootRestoreIfNeeded(db, MIRROR_PATH, ledgerAppend);
 {
   const rows = await db.all("SELECT COUNT(*) AS n FROM opportunities");
   if (Number(rows[0]?.n ?? 0) === 0) {
@@ -336,6 +358,9 @@ async function talentView(id: string): Promise<any | null> {
     completion: comp.percent,
     completionChecklist: comp.checklist,
     status,
+    emailVerified: p.emailVerified === true,
+    automation: await loadAutomation(id),
+    portfolioLink: { path: `#/talent/${id}`, visibility: p.visibility || "private" },
     photoCount: await photoCount(id),
     fastTrack: ft.length ? { version: ft[0].version, authorizedAt: ft[0].authorized_at } : null,
     guardian: gd.length ? JSON.parse(String(gd[0].data_json)) : null,
@@ -350,6 +375,173 @@ async function requireTalentOrAdmin(req: Request, talentId: string): Promise<{ o
   if (me && me === talentId) return { ok: true, talentId, admin: false };
   if (!me) return { ok: false, res: err(401, "authentication required") };
   return { ok: false, res: err(403, "not authorized for this talent") };
+}
+
+// ---------- v11: verification codes (hash-only, 15-min expiry, 5-attempt lock) ----------
+// Codes are stored as sha256 hashes ONLY — the plaintext code is never
+// written to the DB, the ledger, or the mirror. TEST MODE honesty: email
+// is not connected, so the code is returned once in the API response
+// under a clearly-named testMode* field, never in any stored record.
+const CODE_TTL_MS = 15 * 60 * 1000;
+const CODE_MAX_ATTEMPTS = 5;
+async function issueCode(email: string, talentId: string | null, purpose: string): Promise<{ code: string; expiresAt: string }> {
+  const code = String(randomInt(0, 1000000)).padStart(6, "0");
+  const expiresAt = new Date(Date.now() + CODE_TTL_MS).toISOString();
+  await db.run("UPDATE verification_codes SET used = 1 WHERE email = ? AND purpose = ? AND used = 0", [email, purpose]);
+  await db.run("INSERT INTO verification_codes (id, talent_id, email, code_hash, purpose, attempts, used, expires_at, created_at) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)",
+    [genId("vc"), talentId, email, sha256(code), purpose, expiresAt, nowIso()]);
+  return { code, expiresAt };
+}
+async function checkCode(email: string, purpose: string, code: string): Promise<{ ok: boolean; error?: string; row?: Row }> {
+  const rows = await db.all("SELECT * FROM verification_codes WHERE email = ? AND purpose = ? AND used = 0 ORDER BY created_at DESC LIMIT 1", [email, purpose]);
+  if (!rows.length) return { ok: false, error: "no active code — request a new one" };
+  const row = rows[0];
+  if (new Date(String(row.expires_at)).getTime() < Date.now()) return { ok: false, error: "code expired — request a new one" };
+  if (Number(row.attempts) >= CODE_MAX_ATTEMPTS) return { ok: false, error: "code locked after too many attempts — request a new one" };
+  if (sha256(code) !== String(row.code_hash)) {
+    await db.run("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", [row.id]);
+    const left = CODE_MAX_ATTEMPTS - (Number(row.attempts) + 1);
+    return { ok: false, error: left > 0 ? `wrong code — ${left} attempt${left === 1 ? "" : "s"} left` : "code locked after too many attempts — request a new one" };
+  }
+  await db.run("UPDATE verification_codes SET used = 1 WHERE id = ?", [row.id]);
+  return { ok: true, row };
+}
+
+// ---------- v11: owner gate (v10) ----------
+// Owner passcode hash lives in settings under owner_passcode_hash — NEVER
+// in the ledger or the mirror (a wipe means the passcode must be re-set,
+// same as passwords). A successful unlock issues a 12-hour owner session
+// token. Agency money is served ONLY to a valid owner session or the
+// admin token (the owner's credential); everyone else gets 401/403.
+const OWNER_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const ownerUnlockAttempts = new Map<string, number[]>();
+function ownerUnlockRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const arr = (ownerUnlockAttempts.get(ip) || []).filter((t) => now - t < 15 * 60_000);
+  if (arr.length >= 5) return true;
+  arr.push(now);
+  ownerUnlockAttempts.set(ip, arr);
+  return false;
+}
+async function ownerPasscodeSet(): Promise<boolean> {
+  const rows = await db.all("SELECT value FROM settings WHERE key = 'owner_passcode_hash'");
+  return rows.length > 0 && !!String(rows[0].value);
+}
+async function ownerFromToken(req: Request): Promise<boolean> {
+  const h = req.headers.get("authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/);
+  if (!m) return false;
+  const rows = await db.all("SELECT expires_at FROM owner_sessions WHERE token = ?", [m[1]]);
+  if (!rows.length) return false;
+  if (new Date(String(rows[0].expires_at)).getTime() < Date.now()) {
+    await db.run("DELETE FROM owner_sessions WHERE token = ?", [m[1]]);
+    return false;
+  }
+  return true;
+}
+async function requireOwner(req: Request): Promise<Response | null> {
+  if (isAdmin(req)) return null;
+  if (await ownerFromToken(req)) return null;
+  return err(401, "owner access required — unlock the owner view with the owner passcode");
+}
+
+// ---------- v11: per-(talent, job) reference codes ----------
+// Deterministic: the same (talent, job) pair always yields the same code,
+// so the code can travel in agency-send emails without a lookup table.
+function refCode(talentId: string, opportunityId: string): string {
+  return "TTT-" + sha256(talentId + "|" + opportunityId).slice(0, 8).toUpperCase();
+}
+
+// ---------- v11: automation settings (v8 BIG toggle) ----------
+async function loadAutomation(talentId: string): Promise<any> {
+  const rows = await db.all("SELECT data_json FROM automation_settings WHERE talent_id = ?", [talentId]);
+  const base = { enabled: false, agencySendEmail: true, ccTalent: true, replyToTalent: true, categories: [], geography: null, minDaily: null };
+  if (!rows.length) return base;
+  try { return { ...base, ...JSON.parse(String(rows[0].data_json)) }; } catch { return base; }
+}
+
+// ---------- v11: talent earnings (own net ONLY) + proof-of-work credits ----------
+// Talent-facing: per-job NET + running total only. Commission/fee and any
+// agency total are NEVER in this payload — agency money is owner-only
+// (see agencyEarnings + the owner gate).
+async function talentEarnings(talentId: string): Promise<any> {
+  const rows = await db.all("SELECT * FROM bookings WHERE talent_id = ? ORDER BY created_at DESC", [talentId]);
+  const jobs: any[] = [];
+  let totalNetCents = 0, completedNetCents = 0, completedCount = 0;
+  for (const r of rows) {
+    const o = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [r.opportunity_id]);
+    const opp = o.length ? JSON.parse(String(o[0].data_json)) : null;
+    const net = Number(r.net_cents ?? 0);
+    totalNetCents += net;
+    if (String(r.status) === "COMPLETED") { completedNetCents += net; completedCount++; }
+    jobs.push({ bookingId: r.id, opportunityId: r.opportunity_id, title: opp?.title ?? String(r.opportunity_id), agency: opp?.casting_org || opp?.employer || null, status: r.status, netCents: net, net: net / 100, date: r.created_at });
+  }
+  return { jobs, totalNetCents, totalNet: totalNetCents / 100, completedNetCents, completedNet: completedNetCents / 100, jobCount: rows.length, completedCount };
+}
+// Proof of work: every job the talent accepted AND completed successfully,
+// shown as a credits list in their profile. No money here at all.
+async function talentCredits(talentId: string): Promise<any> {
+  const rows = await db.all("SELECT * FROM bookings WHERE talent_id = ? AND status = 'COMPLETED' ORDER BY created_at DESC", [talentId]);
+  const credits: any[] = [];
+  for (const r of rows) {
+    const o = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [r.opportunity_id]);
+    const opp = o.length ? JSON.parse(String(o[0].data_json)) : null;
+    credits.push({ bookingId: r.id, opportunityId: r.opportunity_id, title: opp?.title ?? String(r.opportunity_id), production: opp?.production ?? null, agency: opp?.casting_org || opp?.employer || null, completedAt: r.updated_at });
+  }
+  const accepted = await db.all("SELECT COUNT(*) AS n FROM bookings WHERE talent_id = ? AND status = 'BOOKED'", [talentId]);
+  return { credits, completedCount: credits.length, acceptedInProgress: Number(accepted[0]?.n ?? 0) };
+}
+// Owner-only: agency earnings (commission totals + per-agency breakdown).
+async function agencyEarnings(): Promise<any> {
+  const rows = await db.all("SELECT * FROM bookings ORDER BY created_at DESC");
+  let totalGross = 0, totalFee = 0, totalNet = 0;
+  const byAgency = new Map<string, any>();
+  const bookings: any[] = [];
+  for (const r of rows) {
+    const o = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [r.opportunity_id]);
+    const opp = o.length ? JSON.parse(String(o[0].data_json)) : null;
+    const agency = opp?.casting_org || opp?.employer || "Unknown";
+    totalGross += Number(r.gross_cents ?? 0); totalFee += Number(r.commission_cents ?? 0); totalNet += Number(r.net_cents ?? 0);
+    const a = byAgency.get(agency) ?? { agency, bookings: 0, grossCents: 0, commissionCents: 0, netCents: 0 };
+    a.bookings++; a.grossCents += Number(r.gross_cents ?? 0); a.commissionCents += Number(r.commission_cents ?? 0); a.netCents += Number(r.net_cents ?? 0);
+    byAgency.set(agency, a);
+    bookings.push({ bookingId: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, title: opp?.title ?? String(r.opportunity_id), agency, status: r.status, grossCents: Number(r.gross_cents ?? 0), commissionCents: Number(r.commission_cents ?? 0), netCents: Number(r.net_cents ?? 0), rate: Number(r.rate ?? 0), date: r.created_at });
+  }
+  return { totalGrossCents: totalGross, totalCommissionCents: totalFee, totalNetCents: totalNet, bookingCount: rows.length, byAgency: [...byAgency.values()], bookings };
+}
+
+// ---------- v11: public per-talent portfolio ----------
+// Casting-safe fields ONLY. Never: email, phone, demographics, zip/exact
+// address, password/session data, fees/earnings, guardian, fast-track,
+// consent. Visibility rules (MODULE-TALENT-REGISTRATION.md §4): private
+// by default — a private portfolio resolves to nothing (404); "agency"
+// needs the admin token; "public" is open. Photos are shared only when
+// the talent also set sharePhotos.
+async function publicTalentView(id: string): Promise<any | null> {
+  const t = await loadTalent(id);
+  if (!t) return null;
+  const p = t.profile;
+  const visibility = p.visibility || "private";
+  const sharePhotos = p.sharePhotos === true;
+  const credits = (await talentCredits(id)).credits;
+  const photos = sharePhotos ? await photoList(id) : [];
+  const socials = await db.all("SELECT platform, handle, bio_checked FROM social_links WHERE talent_id = ? AND status = 'LINKED'", [id]);
+  const socialPhotos = sharePhotos ? await db.all("SELECT id, platform, photo_url, caption FROM social_photos WHERE talent_id = ?", [id]) : [];
+  return {
+    id,
+    professionalName: p.professionalName || null,
+    firstName: p.firstName, lastName: p.lastName,
+    city: p.city, state: p.state,
+    categories: p.categories || [], skills: p.skills || [], languages: p.languages || [],
+    experience: p.experience || null, availability: p.availability || [],
+    height: p.height || null, travelRadius: p.travelRadius || null,
+    visibility, sharePhotos,
+    photoCount: await photoCount(id),
+    photos: photos.map((ph: any) => ({ id: ph.id, slot: ph.slot, label: ph.label, caption: ph.caption, url: `/api/v1/public/photos/${ph.id}` })),
+    credits,
+    socialLinks: socials.map((s: any) => ({ platform: s.platform, handle: s.handle, bioChecked: Number(s.bio_checked) === 1 })),
+    socialPhotos: socialPhotos.map((s: any) => ({ id: s.id, platform: s.platform, photoUrl: s.photo_url, caption: s.caption })),
+  };
 }
 
 const LIKENESS_TEXT = `TOP TEA TALENTS — LIKENESS RELEASE (contract version TTT-LIKENESS-v1.0)
@@ -414,13 +606,13 @@ async function handle(req: Request): Promise<Response> {
     const profile: any = {
       email, phone: String(b.phone), firstName: String(b.firstName), lastName: String(b.lastName),
       professionalName: b.professionalName ? String(b.professionalName) : null,
-      contactMethod: b.contactMethod ?? null, notifyEmail: b.notifyEmail ?? true, notifySms: b.notifySms ?? false,
-      city: null, state: null, zip: null, location: null, travelRadius: null,
+      contactMethod: b.contactMethod ? String(b.contactMethod) : null, notifyEmail: b.notifyEmail ?? true, notifySms: b.notifySms ?? false,
+      city: b.city ? String(b.city) : null, state: b.state ? String(b.state) : null, zip: null, location: null, travelRadius: null,
       availability: [], height: null, ageRange: null, adultOrMinor: null, languages: [], skills: [],
       experience: null, categories: [], unionAffiliation: null, minCompensation: null,
       clothing: {}, resume: null, demoReel: null, portfolioLinks: [],
       demographics: { race: null, ethnicity: null, gender: null, pronouns: null },
-      visibility: "private", status: "PROFILE INCOMPLETE", completion: 0,
+      visibility: "private", sharePhotos: false, emailVerified: false, status: "PROFILE INCOMPLETE", completion: 0,
     };
     const ts = nowIso();
     await db.run("INSERT INTO talents (id, email, password_hash, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -428,8 +620,13 @@ async function handle(req: Request): Promise<Response> {
     const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
     await db.run("INSERT INTO sessions (token, talent_id, created_at) VALUES (?, ?, ?)", [token, id, ts]);
     await upsertContact("talent", `${profile.firstName} ${profile.lastName}`, { email, phone: profile.phone });
-    await audit("talent.register", "talent", id, id, { email, firstName: profile.firstName, lastName: profile.lastName });
-    return json({ ok: true, talentId: id, token }, 201);
+    await audit("talent.register", "talent", id, id, { email, firstName: profile.firstName, lastName: profile.lastName, verificationRequired: true }, { talent: { id, email, profile, created_at: ts, updated_at: ts } });
+    // v7: email verification. 6-digit code, hash-only, 15-min expiry.
+    // TEST MODE: email is not connected, so the code is returned once
+    // here under a clearly-named testMode* field — never stored anywhere.
+    const { code: vcode, expiresAt } = await issueCode(email, id, "email_verify");
+    await audit("talent.email.verification-issued", "talent", id, id, { email, purpose: "email_verify", note: "TEST MODE: email not connected — code shown once in the register response, never emailed." });
+    return json({ ok: true, talentId: id, token, verificationRequired: true, verificationExpiresAt: expiresAt, testModeVerificationCode: vcode, testModeNote: "TEST MODE: email is not connected, so the verification code is shown here instead of emailed. Never do this in live mode." }, 201);
   }
   if (method === "POST" && rest.join("/") === "auth/login") {
     const ip = req.headers.get("x-forwarded-for") || "local";
@@ -446,6 +643,149 @@ async function handle(req: Request): Promise<Response> {
     return ok({ token, talentId: String(rows[0].id) });
   }
 
+  // ----- v7: email verification (6-digit code, resend, status) -----
+  if (method === "POST" && rest.join("/") === "auth/verify-email") {
+    const b = await body(req);
+    if (!b || !b.email || !b.code) return err(400, "email and code are required");
+    const email = String(b.email).toLowerCase().trim();
+    const chk = await checkCode(email, "email_verify", String(b.code).trim());
+    if (!chk.ok) return err(400, chk.error!);
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    if (!rows.length) return err(404, "talent not found");
+    const t = await loadTalent(String(rows[0].id));
+    if (!t) return err(404, "talent not found");
+    const p = { ...t.profile, emailVerified: true };
+    await saveProfile(String(rows[0].id), p);
+    await audit("talent.email.verified", "talent", String(rows[0].id), String(rows[0].id), { email, verified: true }, { profile: p });
+    return ok({ verified: true, talentId: String(rows[0].id) });
+  }
+  if (method === "POST" && rest.join("/") === "auth/resend-verification") {
+    const b = await body(req);
+    if (!b || !b.email) return err(400, "email is required");
+    const email = String(b.email).toLowerCase().trim();
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    if (!rows.length) return err(404, "talent not found");
+    const { code: vcode, expiresAt } = await issueCode(email, String(rows[0].id), "email_verify");
+    await audit("talent.email.verification-issued", "talent", String(rows[0].id), String(rows[0].id), { email, purpose: "email_verify", note: "Resent. TEST MODE: email not connected — code shown once in the response, never emailed." });
+    return ok({ resent: true, verificationExpiresAt: expiresAt, testModeVerificationCode: vcode, testModeNote: "TEST MODE: email is not connected, so the verification code is shown here instead of emailed. Never do this in live mode." });
+  }
+  if (method === "GET" && rest.join("/") === "auth/verification-status") {
+    const email = String(q.get("email") || "").toLowerCase().trim();
+    if (!email) return err(400, "email query param is required");
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    if (!rows.length) return err(404, "talent not found");
+    const t = await loadTalent(String(rows[0].id));
+    const codes = await db.all("SELECT expires_at FROM verification_codes WHERE email = ? AND purpose = 'email_verify' AND used = 0 ORDER BY created_at DESC LIMIT 1", [email]);
+    const active = codes.length ? String(codes[0].expires_at) : null;
+    const hasActiveCode = !!active && new Date(active).getTime() > Date.now();
+    return ok({ email, verified: t?.profile.emailVerified === true, hasActiveCode, codeExpiresAt: hasActiveCode ? active : null });
+  }
+  if (method === "POST" && rest.join("/") === "auth/mark-email-verification-dispatched") {
+    const adm = requireAdmin(req); if (adm) return adm;
+    const b = await body(req);
+    if (!b || !b.email) return err(400, "email is required");
+    const email = String(b.email).toLowerCase().trim();
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    if (!rows.length) return err(404, "talent not found");
+    await audit("talent.email.verification-dispatched", "talent", String(rows[0].id), "admin", { email, note: "Staff marked the verification email as dispatched." });
+    return ok({ dispatched: true, email });
+  }
+
+  // ----- v7: password reset (6-digit code, hash-only, 15-min expiry) -----
+  if (method === "POST" && rest.join("/") === "auth/request-password-reset") {
+    const b = await body(req);
+    if (!b || !b.email) return err(400, "email is required");
+    const email = String(b.email).toLowerCase().trim();
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    // Always 200 — never reveal whether the email is registered.
+    if (!rows.length) return ok({ requested: true, testModeNote: "TEST MODE: email is not connected. If the address is registered, the reset code is shown in the response instead of emailed." });
+    const { code: rcode, expiresAt } = await issueCode(email, String(rows[0].id), "password_reset");
+    await audit("talent.password.reset-requested", "talent", String(rows[0].id), String(rows[0].id), { email, note: "TEST MODE: email not connected — code shown once in the response, never emailed." });
+    return ok({ requested: true, resetExpiresAt: expiresAt, testModeResetCode: rcode, testModeNote: "TEST MODE: email is not connected, so the reset code is shown here instead of emailed. Never do this in live mode." });
+  }
+  if (method === "POST" && rest.join("/") === "auth/reset-password") {
+    const b = await body(req);
+    if (!b || !b.email || !b.code || !b.newPassword) return err(400, "email, code and newPassword are required");
+    if (String(b.newPassword).length < 8) return err(400, "newPassword must be at least 8 characters");
+    const email = String(b.email).toLowerCase().trim();
+    const chk = await checkCode(email, "password_reset", String(b.code).trim());
+    if (!chk.ok) return err(400, chk.error!);
+    const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
+    if (!rows.length) return err(404, "talent not found");
+    const hash = await Bun.password.hash(String(b.newPassword));
+    await db.run("UPDATE talents SET password_hash = ?, updated_at = ? WHERE id = ?", [hash, nowIso(), String(rows[0].id)]);
+    await db.run("DELETE FROM sessions WHERE talent_id = ?", [String(rows[0].id)]);
+    await audit("talent.password.reset", "talent", String(rows[0].id), String(rows[0].id), { email, note: "Password reset via emailed code; all sessions invalidated." });
+    return ok({ reset: true, talentId: String(rows[0].id) });
+  }
+
+  // ----- v10: owner gate -----
+  if (rest[0] === "owner") {
+    if (method === "GET" && rest.length === 2 && rest[1] === "gate") {
+      return ok({ configured: await ownerPasscodeSet(), unlocked: await ownerFromToken(req) || isAdmin(req) });
+    }
+    if (method === "POST" && rest.length === 2 && rest[1] === "set-passcode") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const b = await body(req);
+      if (!b || !b.passcode || String(b.passcode).length < 6) return err(400, "passcode must be at least 6 characters");
+      const hash = await Bun.password.hash(String(b.passcode));
+      await setSetting("owner_passcode_hash", hash);
+      // Never put the hash in the ledger or the mirror — only the fact
+      // that a passcode was set. A wipe means the passcode must be re-set.
+      await audit("owner.passcode.set", "owner", "owner", "admin", { configured: true, note: "Owner passcode set. Hash is stored in settings only — never in the ledger or mirror." });
+      return ok({ configured: true });
+    }
+    if (method === "POST" && rest.length === 2 && rest[1] === "unlock") {
+      const ip = req.headers.get("x-forwarded-for") || "local";
+      if (ownerUnlockRateLimited(ip)) return err(429, "too many unlock attempts, try again in 15 minutes");
+      const b = await body(req);
+      if (!b || !b.passcode) return err(400, "passcode is required");
+      if (!(await ownerPasscodeSet())) return err(400, "no owner passcode is set yet");
+      const rows = await db.all("SELECT value FROM settings WHERE key = 'owner_passcode_hash'");
+      const valid = await Bun.password.verify(String(b.passcode), String(rows[0].value));
+      if (!valid) return err(401, "wrong owner passcode");
+      const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
+      const expiresAt = new Date(Date.now() + OWNER_SESSION_TTL_MS).toISOString();
+      await db.run("INSERT INTO owner_sessions (token, created_at, expires_at) VALUES (?, ?, ?)", [token, nowIso(), expiresAt]);
+      await audit("owner.unlock", "owner", "owner", "owner", { unlocked: true, expiresAt });
+      return ok({ unlocked: true, ownerToken: token, expiresAt });
+    }
+    if (method === "POST" && rest.length === 2 && rest[1] === "lock") {
+      const h = req.headers.get("authorization") || "";
+      const m = h.match(/^Bearer\s+(.+)$/);
+      if (m) await db.run("DELETE FROM owner_sessions WHERE token = ?", [m[1]]);
+      await audit("owner.lock", "owner", "owner", "owner", { locked: true });
+      return ok({ locked: true });
+    }
+    return err(404, "not found");
+  }
+
+  // ----- v9: agency earnings (OWNER ONLY) -----
+  if (method === "GET" && rest.join("/") === "agency-earnings") {
+    const gate = await requireOwner(req);
+    if (gate) return gate;
+    return ok(await agencyEarnings());
+  }
+
+  // ----- v11: public per-talent portfolio (no auth; visibility-gated) -----
+  if (rest[0] === "public" && rest[1] === "talent" && rest.length === 3) {
+    const v = await publicTalentView(rest[2]);
+    if (!v) return err(404, "talent not found");
+    if (v.visibility === "private") return err(404, "this portfolio is private");
+    if (v.visibility === "agency" && !isAdmin(req)) return err(403, "this portfolio is visible to agency staff only");
+    return ok({ portfolio: v });
+  }
+  if (rest[0] === "public" && rest[1] === "photos" && rest.length === 3 && method === "GET") {
+    // Serves a portfolio photo ONLY when that talent's portfolio is
+    // public and sharePhotos is on — otherwise the photo stays private.
+    const rows = await db.all("SELECT * FROM photos WHERE id = ?", [rest[2]]);
+    if (!rows.length) return err(404, "photo not found");
+    const t = await loadTalent(String(rows[0].talent_id));
+    if (!t || (t.profile.visibility || "private") !== "public" || t.profile.sharePhotos !== true) return err(404, "photo not found");
+    const buf = Buffer.from(String(rows[0].data_base64), "base64");
+    return new Response(buf, { headers: { "Content-Type": String(rows[0].mime), "Access-Control-Allow-Origin": "*" } });
+  }
+
   // ----- sources -----
   if (rest[0] === "sources") {
     if (method === "GET" && rest.length === 1) return ok({ sources: await allSources() });
@@ -456,7 +796,7 @@ async function handle(req: Request): Promise<Response> {
       const id = b.id ? String(b.id) : genId("src");
       const rec = { id, name: b.name, url: b.url, category: b.category ?? null, tier: b.tier ?? 3, status: b.status ?? "NOT CONNECTED", connectionMethod: b.connectionMethod ?? null, provides: b.provides ?? null, tosStatus: b.tosStatus ?? null, updateFrequency: b.updateFrequency ?? null, verificationBasis: b.verificationBasis ?? null };
       await db.run("INSERT INTO sources (id, data_json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json", [id, JSON.stringify(rec)]);
-      await audit("source.create", "source", id, "admin", { name: rec.name });
+      await audit("source.create", "source", id, "admin", { name: rec.name }, { source: rec });
       return json({ ok: true, source: rec }, 201);
     }
     return err(404, "not found");
@@ -480,7 +820,8 @@ async function handle(req: Request): Promise<Response> {
         if (!Number.isFinite(tp) || tp < 0 || tp > 100) return err(400, "repeatAgencyTopPercent must be 0–100 (0 disables the top-% rule)");
         await setSetting("repeat_agency_top_percent", String(Math.floor(tp)));
       }
-      await audit("settings.update", "settings", "settings", "admin", { submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent(), note: "TEST MODE stays on: even unpaused, TEST MODE blocks every submission." });
+      const settingsSnap = { submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() };
+      await audit("settings.update", "settings", "settings", "admin", { ...settingsSnap, note: "TEST MODE stays on: even unpaused, TEST MODE blocks every submission." }, { settings: { submissions_paused: String(settingsSnap.submissionsPaused), repeat_agency_threshold: String(settingsSnap.repeatAgencyThreshold), repeat_agency_top_percent: String(settingsSnap.repeatAgencyTopPercent) } });
       return ok({ testMode: true, submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() });
     }
   }
@@ -504,7 +845,7 @@ async function handle(req: Request): Promise<Response> {
       await setSetting("commission_floor_rate", String(next.floorRate));
       await setSetting("commission_ceiling_daily", String(next.ceilingDaily));
       await setSetting("commission_ceiling_rate", String(next.ceilingRate));
-      await audit("commission.settings.update", "settings", "commission-settings", "admin", next);
+      await audit("commission.settings.update", "settings", "commission-settings", "admin", next, { settings: { commission_floor_daily: String(next.floorDaily), commission_floor_rate: String(next.floorRate), commission_ceiling_daily: String(next.ceilingDaily), commission_ceiling_rate: String(next.ceilingRate) } });
       return ok(next);
     }
   }
@@ -545,7 +886,7 @@ async function handle(req: Request): Promise<Response> {
       const id = genId("cub");
       const rec = { id, ...b, status: b.status ?? "OPEN" };
       await db.run("INSERT INTO cubicles (id, data_json, status, created_at) VALUES (?, ?, ?, ?)", [id, JSON.stringify(rec), rec.status, nowIso()]);
-      await audit("cubicle.create", "cubicle", id, "admin", { name: rec.name ?? null });
+      await audit("cubicle.create", "cubicle", id, "admin", { name: rec.name ?? null }, { cubicle: rec });
       return json({ ok: true, cubicle: rec }, 201);
     }
     if (method === "PATCH" && rest.length === 3 && rest[2] === "status") {
@@ -556,7 +897,7 @@ async function handle(req: Request): Promise<Response> {
       if (!rows.length) return err(404, "cubicle not found");
       const rec = { ...JSON.parse(String(rows[0].data_json)), status: String(b.status) };
       await db.run("UPDATE cubicles SET data_json = ?, status = ? WHERE id = ?", [JSON.stringify(rec), rec.status, rest[1]]);
-      await audit("cubicle.status", "cubicle", rest[1], "admin", { status: rec.status });
+      await audit("cubicle.status", "cubicle", rest[1], "admin", { status: rec.status }, { cubicle: rec });
       return ok({ cubicle: rec });
     }
     return err(404, "not found");
@@ -596,12 +937,30 @@ async function handle(req: Request): Promise<Response> {
         if (String(r.prev_hash) !== prev || expect !== String(r.hash)) { valid = false; firstBad = Number(r.seq); break; }
         prev = String(r.hash);
       }
-      return ok({ events: rows.length, head_seq: rows.length ? Number(rows[rows.length - 1].seq) : 0, head_hash: rows.length ? String(rows[rows.length - 1].hash) : "GENESIS", valid, first_bad_seq: firstBad });
+      return ok({ events: rows.length, head_seq: rows.length ? Number(rows[rows.length - 1].seq) : 0, head_hash: rows.length ? String(rows[rows.length - 1].hash) : "GENESIS", valid, first_bad_seq: firstBad, mirror: verifyMirrorFile(MIRROR_PATH) });
     }
     if (method === "GET" && rest.length === 2 && rest[1] === "export") {
       const rows = await db.all("SELECT * FROM ledger_events ORDER BY seq ASC");
       const lines = rows.map((r) => JSON.stringify(ledgerRow(r))).join("\n");
       return new Response(lines + (lines ? "\n" : ""), { headers: { "Content-Type": "application/x-ndjson", "Content-Disposition": 'attachment; filename="top-tea-talents-ledger.jsonl"', "Access-Control-Allow-Origin": "*" } });
+    }
+    // ----- ledger mirror (wipe-proof copy) -----
+    // GET /ledger/mirror returns the raw JSONL mirror — the durable
+    // artifact a collector pushes to the repo (see MIRROR.md). Admin-only:
+    // mirror lines carry full state (profiles, emails, signatures).
+    if (method === "GET" && rest.length === 2 && rest[1] === "mirror") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const text = readMirrorText(MIRROR_PATH);
+      if (text === null) return err(404, "no ledger mirror on this server yet");
+      return new Response(text, { headers: { "Content-Type": "application/x-ndjson", "Content-Disposition": 'attachment; filename="top-tea-talents-ledger-mirror.jsonl"', "Access-Control-Allow-Origin": "*" } });
+    }
+    if (method === "GET" && rest.length === 3 && rest[1] === "mirror" && rest[2] === "verify") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      return ok({ mirror: verifyMirrorFile(MIRROR_PATH) });
+    }
+    if (method === "POST" && rest.length === 3 && rest[1] === "mirror" && rest[2] === "rebuild") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      return ok(await rebuildMirrorFromDb(db, MIRROR_PATH));
     }
     return err(404, "not found");
   }
@@ -684,7 +1043,7 @@ async function handle(req: Request): Promise<Response> {
         if (isPrimary) await db.run("UPDATE photos SET is_primary = 0 WHERE talent_id = ?", [talentId]);
         await db.run("INSERT INTO photos (id, talent_id, slot, label, caption, is_primary, sort_order, mime, data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [id, talentId, slot, SLOT_LABELS[slot], b.caption ? String(b.caption) : null, isPrimary, slot, m[1], m[3], nowIso()]);
-        await audit("talent.photo.add", "talent", talentId, talentId, { photoId: id, slot, label: SLOT_LABELS[slot] });
+        await audit("talent.photo.add", "talent", talentId, talentId, { photoId: id, slot, label: SLOT_LABELS[slot] }, { photo: { id, slot, label: SLOT_LABELS[slot], is_primary: isPrimary === 1, mime: m[1] } });
         return json({ ok: true, photo: (await photoList(talentId)).find((p: any) => p.id === id) }, 201);
       }
       return err(404, "not found");
@@ -713,7 +1072,7 @@ async function handle(req: Request): Promise<Response> {
         const ts = nowIso();
         await db.run("INSERT INTO fast_track (talent_id, data_json, version, authorized_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(talent_id) DO UPDATE SET data_json = excluded.data_json, version = excluded.version, authorized_at = excluded.authorized_at, updated_at = excluded.updated_at",
           [talentId, JSON.stringify(ft), version, ts, ts]);
-        await audit("talent.fast-track.save", "talent", talentId, talentId, { version, autoSubmit: ft.autoSubmit });
+        await audit("talent.fast-track.save", "talent", talentId, talentId, { version, autoSubmit: ft.autoSubmit }, { fastTrack: { talent_id: talentId, data: ft, version, authorized_at: ts, updated_at: ts } });
         return ok({ fastTrack: ft, version, authorizedAt: ts });
       }
       return err(404, "not found");
@@ -724,9 +1083,10 @@ async function handle(req: Request): Promise<Response> {
       if (!b) return err(400, "invalid JSON");
       for (const f of ["guardianName", "guardianEmail", "guardianPhone", "relationship"]) if (!b[f]) return err(400, `missing field: ${f}`);
       const rec = { guardianName: b.guardianName, guardianEmail: b.guardianEmail, guardianPhone: b.guardianPhone, relationship: b.relationship, consentGiven: b.consentGiven === true };
+      const gts = nowIso();
       await db.run("INSERT INTO guardians (talent_id, data_json, created_at) VALUES (?, ?, ?) ON CONFLICT(talent_id) DO UPDATE SET data_json = excluded.data_json",
-        [talentId, JSON.stringify(rec), nowIso()]);
-      await audit("talent.guardian.save", "talent", talentId, talentId, { guardianName: rec.guardianName, consentGiven: rec.consentGiven });
+        [talentId, JSON.stringify(rec), gts]);
+      await audit("talent.guardian.save", "talent", talentId, talentId, { guardianName: rec.guardianName, consentGiven: rec.consentGiven }, { guardian: { talent_id: talentId, data: rec, created_at: gts } });
       return ok({ guardian: rec });
     }
     if (rest.length === 3 && rest[2] === "likeness-release") {
@@ -751,6 +1111,8 @@ async function handle(req: Request): Promise<Response> {
       const b = await body(req);
       if (!b) return err(400, "invalid JSON");
       if (b.agreed !== true) return err(400, "agreed must be true");
+      // v7: the likeness release can only be signed once the email is verified.
+      if (t.profile.emailVerified !== true) return err(400, "verify your email first — enter the 6-digit code from your sign-up confirmation (TEST MODE: the code is shown on the sign-up confirmation screen)");
       const sig = String(b.signature || "").trim();
       if (!sig) return err(400, "signature is required");
       const legal = `${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim().toLowerCase();
@@ -762,7 +1124,10 @@ async function handle(req: Request): Promise<Response> {
       await db.run("INSERT INTO consents (talent_id, signed, signed_at, signature, status, version, updated_at) VALUES (?, 1, ?, ?, 'SIGNED', 'TTT-LIKENESS-v1.0', ?) ON CONFLICT(talent_id) DO UPDATE SET signed = 1, signed_at = excluded.signed_at, signature = excluded.signature, status = 'SIGNED', version = 'TTT-LIKENESS-v1.0', updated_at = excluded.updated_at",
         [talentId, ts, sig, ts]);
       const status = await refreshStatus(talentId);
-      await audit("consent.sign", "talent", talentId, talentId, { version: "TTT-LIKENESS-v1.0", signedAt: ts, signature: sig, status });
+      const consentRow = await db.all("SELECT * FROM consents WHERE talent_id = ?", [talentId]);
+      const afterSign = await loadTalent(talentId);
+      const crow = consentRow.length ? consentRow[0] : null;
+      await audit("consent.sign", "talent", talentId, talentId, { version: "TTT-LIKENESS-v1.0", signedAt: ts, signature: sig, status }, crow ? { consent: { talent_id: talentId, signed: Number(crow.signed) === 1, signed_at: crow.signed_at, signature: crow.signature, status: crow.status, version: crow.version, updated_at: crow.updated_at }, profile: afterSign?.profile ?? null } : null);
       return ok({ signed: true, signedAt: ts, signature: sig, status, version: "TTT-LIKENESS-v1.0" });
     }
     if (rest.length === 4 && rest[2] === "likeness-release" && rest[3] === "revoke" && method === "POST") {
@@ -771,7 +1136,10 @@ async function handle(req: Request): Promise<Response> {
       await db.run("INSERT INTO consents (talent_id, signed, signed_at, signature, status, version, updated_at) VALUES (?, 0, NULL, NULL, 'REVOKED', 'TTT-LIKENESS-v1.0', ?) ON CONFLICT(talent_id) DO UPDATE SET signed = 0, status = 'REVOKED', updated_at = excluded.updated_at",
         [talentId, ts]);
       await refreshStatus(talentId);
-      await audit("consent.revoke", "talent", talentId, talentId, { status: "REVOKED", note: "Removed from rotation; future applications blocked." });
+      const revokeRow = await db.all("SELECT * FROM consents WHERE talent_id = ?", [talentId]);
+      const afterRevoke = await loadTalent(talentId);
+      const rrow = revokeRow.length ? revokeRow[0] : null;
+      await audit("consent.revoke", "talent", talentId, talentId, { status: "REVOKED", note: "Removed from rotation; future applications blocked." }, rrow ? { consent: { talent_id: talentId, signed: Number(rrow.signed) === 1, signed_at: rrow.signed_at, signature: rrow.signature, status: rrow.status, version: rrow.version, updated_at: rrow.updated_at }, profile: afterRevoke?.profile ?? null } : null);
       return ok({ signed: false, status: "REVOKED" });
     }
     if (rest.length === 3 && rest[2] === "review" && method === "POST") {
@@ -781,12 +1149,14 @@ async function handle(req: Request): Promise<Response> {
       if (b.decision !== "PASS" && b.decision !== "FAIL") return err(400, 'decision must be "PASS" or "FAIL"');
       if (b.decision === "FAIL" && !b.reason) return err(400, "FAIL requires a reason");
       const id = genId("rvw");
-      await db.run("INSERT INTO reviews (id, talent_id, decision, reason, created_at) VALUES (?, ?, ?, ?, ?)", [id, talentId, b.decision, b.reason ?? null, nowIso()]);
+      const rts = nowIso();
+      await db.run("INSERT INTO reviews (id, talent_id, decision, reason, created_at) VALUES (?, ?, ?, ?, ?)", [id, talentId, b.decision, b.reason ?? null, rts]);
       const status = await refreshStatus(talentId);
       if (b.decision === "FAIL") {
         await notify(talentId, "Agency review: more information needed", `Your profile was not approved. Reason: ${b.reason}`);
       }
-      await audit("review.decision", "talent", talentId, "admin", { decision: b.decision, reason: b.reason ?? null, status });
+      const afterReview = await loadTalent(talentId);
+      await audit("review.decision", "talent", talentId, "admin", { decision: b.decision, reason: b.reason ?? null, status }, { review: { id, talent_id: talentId, decision: b.decision, reason: b.reason ?? null, created_at: rts }, profile: afterReview?.profile ?? null });
       return ok({ decision: b.decision, status });
     }
     if (rest.length === 3 && rest[2] === "match" && method === "POST") {
@@ -824,7 +1194,7 @@ async function handle(req: Request): Promise<Response> {
         const id = genId("app");
         const ts = nowIso();
         await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, talentId, oppId, ts, ts]);
-        await audit("application.create", "application", id, talentId, { talentId, opportunityId: oppId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." });
+        await audit("application.create", "application", id, talentId, { talentId, opportunityId: oppId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." }, { application: { id, talent_id: talentId, opportunity_id: oppId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
         created.push({ id, talentId, opportunityId: oppId, status: "AWAITING APPROVAL" });
       }
       return ok({ applications: created, skipped, note: "TEST MODE: nothing was sent." });
@@ -833,6 +1203,181 @@ async function handle(req: Request): Promise<Response> {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       const rows = await db.all("SELECT * FROM notifications WHERE talent_id = ? ORDER BY created_at DESC", [talentId]);
       return ok({ notifications: rows.map((r) => ({ id: r.id, talentId: r.talent_id, title: r.title, body: r.body, read: Number(r.read) === 1, createdAt: r.created_at })) });
+    }
+    // ----- v8: Jobs For You feed -----
+    if (rest.length === 3 && rest[2] === "jobs-for-you" && method === "GET") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const t = await loadTalent(talentId);
+      if (!t) return err(404, "talent not found");
+      const matches = matchTalent(t.profile, await allOpps());
+      const automation = await loadAutomation(talentId);
+      const opps = await allOpps();
+      const byId = new Map(opps.map((o: any) => [String(o.id), o]));
+      const jobs = matches
+        .filter((m: any) => m.classification !== "NOT QUALIFIED")
+        .slice(0, 25)
+        .map((m: any) => {
+          const o = byId.get(String(m.opportunityId)) || {};
+          const autoEligible = automation.enabled === true && m.classification !== "NEEDS TALENT APPROVAL";
+          return {
+            opportunityId: m.opportunityId, title: o.title || m.opportunityId, production: o.production || null,
+            agency: o.casting_org || o.employer || null, location: o.location || null,
+            compensation: o.compensation || null, compensationType: o.compensation_type || null,
+            deadline: o.deadline || null, verificationStatus: o.verification_status || null,
+            classification: m.classification, reasons: m.reasons, score: m.score,
+            referenceCode: refCode(talentId, String(m.opportunityId)),
+            automationEligible: autoEligible,
+            automationNote: automation.enabled !== true
+              ? "Automation is OFF — nothing is submitted automatically."
+              : autoEligible
+                ? "Automation is ON and this job fits your rules — it would be queued for agency-send (TEST MODE: nothing is ever sent live)."
+                : "Automation is ON but this job needs your approval first.",
+          };
+        });
+      return ok({ jobs, total: jobs.length, automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
+    }
+    // ----- v8: BIG automation toggle -----
+    if (rest.length === 3 && rest[2] === "automation") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      if (method === "GET") return ok({ automation: await loadAutomation(talentId), testMode: true, note: "TEST MODE: even with automation ON, nothing is ever sent live. Would-be sends queue for review." });
+      if (method === "POST") {
+        const b = await body(req);
+        if (!b) return err(400, "invalid JSON");
+        const cur = await loadAutomation(talentId);
+        const next = {
+          enabled: b.enabled === true,
+          agencySendEmail: b.agencySendEmail !== undefined ? b.agencySendEmail === true : cur.agencySendEmail,
+          ccTalent: b.ccTalent !== undefined ? b.ccTalent === true : cur.ccTalent,
+          replyToTalent: b.replyToTalent !== undefined ? b.replyToTalent === true : cur.replyToTalent,
+          categories: Array.isArray(b.categories) ? b.categories : cur.categories,
+          geography: b.geography !== undefined ? b.geography : cur.geography,
+          minDaily: b.minDaily !== undefined ? b.minDaily : cur.minDaily,
+        };
+        const ts = nowIso();
+        await db.run("INSERT INTO automation_settings (talent_id, data_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(talent_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at",
+          [talentId, JSON.stringify(next), ts]);
+        await audit("talent.automation.save", "talent", talentId, talentId, { enabled: next.enabled, note: "TEST MODE: automation armed, nothing sent live." }, { automation: { talent_id: talentId, data: next, updated_at: ts } });
+        return ok({ automation: next, testMode: true, note: "TEST MODE: even with automation ON, nothing is ever sent live." });
+      }
+      return err(404, "not found");
+    }
+    // ----- v9: proof-of-work credits + talent earnings (own net ONLY) -----
+    if (rest.length === 3 && rest[2] === "credits" && method === "GET") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      return ok(await talentCredits(talentId));
+    }
+    if (rest.length === 3 && rest[2] === "earnings" && method === "GET") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      // Own net per job + running total only — never commission, never
+      // any agency total. See talentEarnings().
+      return ok(await talentEarnings(talentId));
+    }
+    // ----- v11: per-talent public portfolio link -----
+    if (rest.length === 3 && rest[2] === "portfolio-link" && method === "GET") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const t = await loadTalent(talentId);
+      if (!t) return err(404, "talent not found");
+      const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+      return ok({
+        talentId, path: `#/talent/${talentId}`,
+        publicUrl: base ? `${base}/#/talent/${talentId}` : null,
+        visibility: t.profile.visibility || "private", sharePhotos: t.profile.sharePhotos === true,
+        note: "Share this link — it opens THIS person's profile and portfolio, never the front page. Private by default; shared only with the talent's permission.",
+      });
+    }
+    // ----- v11: social links (Instagram / Facebook, talent-attested) -----
+    if (rest.length === 3 && rest[2] === "social-links") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      if (method === "GET") {
+        const rows = await db.all("SELECT * FROM social_links WHERE talent_id = ? ORDER BY created_at", [talentId]);
+        const photos = await db.all("SELECT * FROM social_photos WHERE talent_id = ? ORDER BY created_at", [talentId]);
+        return ok({
+          socialLinks: rows.map((r: any) => ({ id: r.id, platform: r.platform, handle: r.handle, status: r.status, bioChecked: Number(r.bio_checked) === 1, createdAt: r.created_at })),
+          socialPhotos: photos.map((r: any) => ({ id: r.id, platform: r.platform, photoUrl: r.photo_url, caption: r.caption, createdAt: r.created_at })),
+          note: "Linking is talent-attested: you connect YOUR OWN Instagram/Facebook. There is no OAuth integration yet — the preview only ever shows what you connected and approved.",
+        });
+      }
+      if (method === "POST") {
+        const b = await body(req);
+        if (!b) return err(400, "invalid JSON");
+        const platform = String(b.platform || "").toLowerCase();
+        if (platform !== "instagram" && platform !== "facebook") return err(400, 'platform must be "instagram" or "facebook"');
+        const handle = String(b.handle || "").trim();
+        if (!handle) return err(400, "handle is required");
+        const id = genId("soc");
+        const ts = nowIso();
+        await db.run("INSERT INTO social_links (id, talent_id, platform, handle, status, bio_checked, created_at, updated_at) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)",
+          [id, talentId, platform, handle, ts, ts]);
+        const row = { id, talent_id: talentId, platform, handle, status: "PENDING", bio_checked: 0, created_at: ts, updated_at: ts };
+        await audit("talent.social-link.begin", "talent", talentId, talentId, { platform, handle, status: "PENDING", note: "Talent-attested link claim; no OAuth verification yet." }, { socialLink: row });
+        return json({ ok: true, socialLink: { id, platform, handle, status: "PENDING", bioChecked: false }, next: "Confirm the link on the Social page to make it live in your extended portfolio." }, 201);
+      }
+      return err(404, "not found");
+    }
+    if (rest.length === 4 && rest[2] === "social-links" && method === "POST") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const linkId = rest[3];
+      const rows = await db.all("SELECT * FROM social_links WHERE id = ? AND talent_id = ?", [linkId, talentId]);
+      if (!rows.length) return err(404, "social link not found");
+      const b = await body(req);
+      if (!b) return err(400, "invalid JSON");
+      const action = String(b.action || "");
+      const ts = nowIso();
+      if (action === "confirm") {
+        await db.run("UPDATE social_links SET status = 'LINKED', updated_at = ? WHERE id = ?", [ts, linkId]);
+        const row = { ...rows[0], status: "LINKED", updated_at: ts };
+        await audit("talent.social-link.confirm", "talent", talentId, talentId, { linkId, platform: rows[0].platform, status: "LINKED" }, { socialLink: row });
+        return ok({ socialLink: { id: linkId, platform: rows[0].platform, handle: rows[0].handle, status: "LINKED", bioChecked: Number(rows[0].bio_checked) === 1 } });
+      }
+      if (action === "bio-checked") {
+        const checked = b.checked === true;
+        await db.run("UPDATE social_links SET bio_checked = ?, updated_at = ? WHERE id = ?", [checked ? 1 : 0, ts, linkId]);
+        const row = { ...rows[0], bio_checked: checked ? 1 : 0, updated_at: ts };
+        await audit("talent.social-link.bio-checked", "talent", talentId, talentId, { linkId, platform: rows[0].platform, bioChecked: checked }, { socialLink: row });
+        return ok({ socialLink: { id: linkId, platform: rows[0].platform, handle: rows[0].handle, status: rows[0].status, bioChecked: checked } });
+      }
+      return err(400, 'action must be "confirm" or "bio-checked"');
+    }
+    if (rest.length === 4 && rest[2] === "social-links" && rest[3] && method === "DELETE") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const linkId = rest[3];
+      const rows = await db.all("SELECT * FROM social_links WHERE id = ? AND talent_id = ?", [linkId, talentId]);
+      if (!rows.length) return err(404, "social link not found");
+      await db.run("DELETE FROM social_links WHERE id = ?", [linkId]);
+      await audit("talent.social-link.unlink", "talent", talentId, talentId, { linkId, platform: rows[0].platform }, { deleted: true, socialLinkId: linkId });
+      return ok({ deleted: true, socialLinkId: linkId });
+    }
+    if (rest.length === 3 && rest[2] === "social-photos") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      if (method === "GET") {
+        const photos = await db.all("SELECT * FROM social_photos WHERE talent_id = ? ORDER BY created_at", [talentId]);
+        return ok({ socialPhotos: photos.map((r: any) => ({ id: r.id, platform: r.platform, photoUrl: r.photo_url, caption: r.caption, createdAt: r.created_at })) });
+      }
+      if (method === "POST") {
+        const b = await body(req);
+        if (!b) return err(400, "invalid JSON");
+        const platform = String(b.platform || "").toLowerCase();
+        if (platform !== "instagram" && platform !== "facebook") return err(400, 'platform must be "instagram" or "facebook"');
+        const photoUrl = String(b.photoUrl || "").trim();
+        if (!/^https?:\/\/.+/.test(photoUrl)) return err(400, "photoUrl must be an http(s) URL to one of your own social photos");
+        const id = genId("sph");
+        const ts = nowIso();
+        await db.run("INSERT INTO social_photos (id, talent_id, platform, photo_url, caption, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          [id, talentId, platform, photoUrl, b.caption ? String(b.caption) : null, ts]);
+        const row = { id, talent_id: talentId, platform, photo_url: photoUrl, caption: b.caption ? String(b.caption) : null, created_at: ts };
+        await audit("talent.social-photo.add", "talent", talentId, talentId, { photoId: id, platform }, { socialPhoto: row });
+        return json({ ok: true, socialPhoto: { id, platform, photoUrl, caption: row.caption } }, 201);
+      }
+      return err(404, "not found");
+    }
+    if (rest.length === 4 && rest[2] === "social-photos" && method === "DELETE") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const photoId = rest[3];
+      const rows = await db.all("SELECT * FROM social_photos WHERE id = ? AND talent_id = ?", [photoId, talentId]);
+      if (!rows.length) return err(404, "social photo not found");
+      await db.run("DELETE FROM social_photos WHERE id = ?", [photoId]);
+      await audit("talent.social-photo.remove", "talent", talentId, talentId, { photoId }, { deleted: true, socialPhotoId: photoId });
+      return ok({ deleted: true, socialPhotoId: photoId });
     }
     // GET /talent/:id, PATCH, DELETE
     if (rest.length === 2 && method === "GET") {
@@ -848,14 +1393,15 @@ async function handle(req: Request): Promise<Response> {
       const b = await body(req);
       if (!b) return err(400, "invalid JSON");
       if (b.email !== undefined) return err(400, "email cannot be changed here");
-      const allowed = ["phone", "firstName", "lastName", "professionalName", "contactMethod", "notifyEmail", "notifySms", "city", "state", "zip", "location", "travelRadius", "availability", "height", "ageRange", "adultOrMinor", "languages", "skills", "experience", "categories", "unionAffiliation", "minCompensation", "clothing", "clothingSizes", "measurements", "resume", "demoReel", "portfolioLinks", "demographics", "visibility", "hairColor", "eyeColor", "paused"];
+      const allowed = ["phone", "firstName", "lastName", "professionalName", "contactMethod", "notifyEmail", "notifySms", "city", "state", "zip", "location", "travelRadius", "availability", "height", "ageRange", "adultOrMinor", "languages", "skills", "experience", "categories", "unionAffiliation", "minCompensation", "clothing", "clothingSizes", "measurements", "resume", "demoReel", "portfolioLinks", "demographics", "visibility", "sharePhotos", "hairColor", "eyeColor", "paused"];
       const p = { ...t.profile };
       for (const k of allowed) if (b[k] !== undefined) p[k] = b[k];
       if (p.availability !== undefined && !Array.isArray(p.availability)) return err(400, "availability must be an array");
       if (p.categories !== undefined && !Array.isArray(p.categories)) return err(400, "categories must be an array");
       await saveProfile(talentId, p);
       const status = await refreshStatus(talentId);
-      await audit("talent.update", "talent", talentId, chk.admin ? "admin" : talentId, { fields: Object.keys(b), status });
+      const afterPatch = await loadTalent(talentId);
+      await audit("talent.update", "talent", talentId, chk.admin ? "admin" : talentId, { fields: Object.keys(b), status }, { profile: afterPatch?.profile ?? null });
       const v = await talentView(talentId);
       return ok({ talent: v });
     }
@@ -868,7 +1414,7 @@ async function handle(req: Request): Promise<Response> {
       await db.run("DELETE FROM notifications WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM sessions WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM talents WHERE id = ?", [talentId]);
-      await audit("talent.delete", "talent", talentId, chk.admin ? "admin" : talentId, { note: "Profile, photos, fast-track, guardian, and notifications deleted." });
+      await audit("talent.delete", "talent", talentId, chk.admin ? "admin" : talentId, { note: "Profile, photos, fast-track, guardian, and notifications deleted." }, { deleted: true });
       return ok({ deleted: true, talentId });
     }
     return err(404, "not found");
@@ -891,12 +1437,12 @@ async function handle(req: Request): Promise<Response> {
       if (b.isPrimary === true) await db.run("UPDATE photos SET is_primary = 0 WHERE talent_id = ?", [ph.talent_id]);
       await db.run("UPDATE photos SET caption = ?, is_primary = ?, sort_order = ? WHERE id = ?",
         [b.caption !== undefined ? String(b.caption) : ph.caption, b.isPrimary !== undefined ? (b.isPrimary ? 1 : 0) : ph.is_primary, b.sortOrder !== undefined ? Number(b.sortOrder) : ph.sort_order, photoId]);
-      await audit("talent.photo.update", "talent", String(ph.talent_id), String(ph.talent_id), { photoId });
+      await audit("talent.photo.update", "talent", String(ph.talent_id), String(ph.talent_id), { photoId }, { photo: { id: photoId } });
       return ok({ photo: (await photoList(String(ph.talent_id))).find((p: any) => p.id === photoId) });
     }
     if (method === "DELETE") {
       await db.run("DELETE FROM photos WHERE id = ?", [photoId]);
-      await audit("talent.photo.delete", "talent", String(ph.talent_id), String(ph.talent_id), { photoId });
+      await audit("talent.photo.delete", "talent", String(ph.talent_id), String(ph.talent_id), { photoId }, { deleted: true, photoId });
       return ok({ deleted: true, photoId });
     }
     return err(404, "not found");
@@ -970,7 +1516,7 @@ async function handle(req: Request): Promise<Response> {
       const id = b.id ? String(b.id) : genId("opp");
       const rec = { ...b, id, verification_status: b.verification_status ?? "UNVERIFIED", discovered_at: b.discovered_at ?? nowIso() };
       await db.run("INSERT INTO opportunities (id, data_json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json", [id, JSON.stringify(rec)]);
-      await audit("opportunity.create", "opportunity", id, "admin", { title: rec.title, source: rec.source ?? null });
+      await audit("opportunity.create", "opportunity", id, "admin", { title: rec.title, source: rec.source ?? null }, { opportunity: rec });
       return json({ ok: true, opportunity: oppWithExpiry(rec) }, 201);
     }
     if (method === "PATCH" && rest.length === 3 && rest[2] === "verification") {
@@ -982,13 +1528,13 @@ async function handle(req: Request): Promise<Response> {
       // Lifecycle status is DERIVED from verification — single source of truth.
       const rec = { ...JSON.parse(String(rows[0].data_json)), verification_status: String(b.verification), verified_at: nowIso(), verification_notes: b.verification_notes ?? b.notes ?? null };
       await db.run("UPDATE opportunities SET data_json = ? WHERE id = ?", [JSON.stringify(rec), rest[1]]);
-      await audit("opportunity.verification", "opportunity", rest[1], "admin", { verification_status: rec.verification_status });
+      await audit("opportunity.verification", "opportunity", rest[1], "admin", { verification_status: rec.verification_status }, { opportunity: rec });
       return ok({ opportunity: oppWithExpiry(rec) });
     }
     if (method === "DELETE" && rest.length === 2) {
       const adm = requireAdmin(req); if (adm) return adm;
       await db.run("DELETE FROM opportunities WHERE id = ?", [rest[1]]);
-      await audit("opportunity.delete", "opportunity", rest[1], "admin", {});
+      await audit("opportunity.delete", "opportunity", rest[1], "admin", {}, { deleted: true });
       return ok({ deleted: true, opportunityId: rest[1] });
     }
     return err(404, "not found");
@@ -1021,7 +1567,7 @@ async function handle(req: Request): Promise<Response> {
       const id = genId("app");
       const ts = nowIso();
       await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, b.talentId, b.opportunityId, ts, ts]);
-      await audit("application.create", "application", id, String(b.talentId), { talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." });
+      await audit("application.create", "application", id, String(b.talentId), { talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." }, { application: { id, talent_id: b.talentId, opportunity_id: b.opportunityId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
       return json({ ok: true, application: { id, talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL" }, note: "TEST MODE: nothing was sent." }, 201);
     }
     if (method === "GET" && rest.length === 1) {
@@ -1042,14 +1588,48 @@ async function handle(req: Request): Promise<Response> {
         return err(400, "SUBMITTED — CONFIRMED is BLOCKED in TEST MODE: no submission is ever sent live. The application stays AWAITING APPROVAL until TEST MODE is lifted by the owner.");
       }
       await db.run("UPDATE applications SET status = ?, updated_at = ? WHERE id = ?", [status, nowIso(), rest[1]]);
-      await audit("application.status", "application", rest[1], String(rows[0].talent_id), { status });
+      await audit("application.status", "application", rest[1], String(rows[0].talent_id), { status }, { status });
       return ok({ application: { id: rest[1], talentId: rows[0].talent_id, opportunityId: rows[0].opportunity_id, status } });
     }
     if (method === "DELETE" && rest.length === 2) {
       const adm = requireAdmin(req); if (adm) return adm;
       await db.run("DELETE FROM applications WHERE id = ?", [rest[1]]);
-      await audit("application.delete", "application", rest[1], "admin", {});
+      await audit("application.delete", "application", rest[1], "admin", {}, { deleted: true });
       return ok({ deleted: true, applicationId: rest[1] });
+    }
+    return err(404, "not found");
+  }
+
+  // ----- v8/v11: inbound replies from agencies/casting -----
+  if (rest[0] === "application-replies") {
+    if (method === "POST" && rest.length === 1) {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const b = await body(req);
+      if (!b || !b.applicationId || !b.body) return err(400, "applicationId and body are required");
+      const appRows = await db.all("SELECT * FROM applications WHERE id = ?", [b.applicationId]);
+      if (!appRows.length) return err(404, "application not found");
+      const id = genId("rpl");
+      const ts = nowIso();
+      const receivedAt = b.receivedAt ? String(b.receivedAt) : ts;
+      await db.run("INSERT INTO application_replies (id, application_id, talent_id, from_name, channel, body, received_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [id, b.applicationId, appRows[0].talent_id, b.fromName ? String(b.fromName) : null, b.channel ? String(b.channel) : null, String(b.body), receivedAt, ts]);
+      const row = { id, application_id: b.applicationId, talent_id: appRows[0].talent_id, from_name: b.fromName ? String(b.fromName) : null, channel: b.channel ? String(b.channel) : null, body: String(b.body), received_at: receivedAt, created_at: ts };
+      await audit("application.reply.record", "application", b.applicationId, "admin", { replyId: id, fromName: row.from_name, channel: row.channel }, { applicationReply: row });
+      return json({ ok: true, reply: { id, applicationId: b.applicationId, talentId: appRows[0].talent_id, fromName: row.from_name, channel: row.channel, body: row.body, receivedAt } }, 201);
+    }
+    if (method === "GET" && rest.length === 1) {
+      // Talent sees only their own replies; admin sees all.
+      const appId = q.get("applicationId");
+      const talentId = q.get("talentId");
+      let rows = await db.all("SELECT * FROM application_replies ORDER BY received_at DESC, created_at DESC");
+      if (appId) rows = rows.filter((r: any) => String(r.application_id) === appId);
+      if (talentId) rows = rows.filter((r: any) => String(r.talent_id) === talentId);
+      if (!isAdmin(req)) {
+        const me = await talentFromToken(req);
+        if (!me) return err(401, "authentication required");
+        rows = rows.filter((r: any) => String(r.talent_id) === me);
+      }
+      return ok({ replies: rows.map((r: any) => ({ id: r.id, applicationId: r.application_id, talentId: r.talent_id, fromName: r.from_name, channel: r.channel, body: r.body, receivedAt: r.received_at, createdAt: r.created_at })), total: rows.length });
     }
     return err(404, "not found");
   }
@@ -1081,11 +1661,15 @@ async function handle(req: Request): Promise<Response> {
       const name = t ? `${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() : String(app.talent_id);
       const title = opp?.title ?? String(app.opportunity_id);
       const summary = `Booking confirmed: ${title} for ${name}. Gross $${(grossCents / 100).toFixed(2)} — commission ${rate}% $${(feeCents / 100).toFixed(2)} — net $${(netCents / 100).toFixed(2)}. Evidence on file. TEST MODE: no payment processed.`;
-      await notify(String(app.talent_id), `Booking confirmed: ${title}`, summary);
+      const ntfId = await notify(String(app.talent_id), `Booking confirmed: ${title}`, summary);
       const emailId = genId("eml");
       await db.run("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at) VALUES (?, ?, ?, ?, 'QUEUED', ?)",
         [emailId, app.talent_id, `Booking confirmed: ${title}`, summary, ts]);
-      await audit("booking.create", "booking", id, "admin", { applicationId: b.applicationId, talentId: app.talent_id, opportunityId: app.opportunity_id, status, grossCents, rate, commissionCents: feeCents, netCents, agency: opp ? (opp.casting_org || opp.employer || null) : null, email: "email pending: integration not connected" });
+      await audit("booking.create", "booking", id, "admin", { applicationId: b.applicationId, talentId: app.talent_id, opportunityId: app.opportunity_id, status, grossCents, rate, commissionCents: feeCents, netCents, agency: opp ? (opp.casting_org || opp.employer || null) : null, email: "email pending: integration not connected" }, {
+        booking: { id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: String(b.evidence), gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts },
+        notification: ntfId ? { id: ntfId, talent_id: app.talent_id, title: `Booking confirmed: ${title}`, body: summary, read: false, created_at: ts } : null,
+        email: { id: emailId, talent_id: app.talent_id, subject: `Booking confirmed: ${title}`, body: summary, status: "QUEUED", created_at: ts },
+      });
       return json({ ok: true, booking: bookingView({ id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: b.evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts }), note: "Email queued only — email pending: integration not connected. No payment processed (TEST MODE)." }, 201);
     }
     if (method === "GET" && rest.length === 1) {
@@ -1111,8 +1695,21 @@ async function handle(req: Request): Promise<Response> {
         await notify(String(rows[0].talent_id), `Booking ${status === "BOOKED" ? "confirmed" : "confirmed"}: ${opp?.title ?? rows[0].opportunity_id}`,
           `Your booking is now ${status}. Gross $${(Number(rows[0].gross_cents || 0) / 100).toFixed(2)} — commission $${(Number(rows[0].commission_cents || 0) / 100).toFixed(2)} — net $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. TEST MODE: no payment processed.`);
       }
-      await audit("booking.status", "booking", rest[1], "admin", { status });
+      await audit("booking.status", "booking", rest[1], "admin", { status }, { status, evidence });
       const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      return ok({ booking: bookingView(updated[0]) });
+    }
+    if (method === "POST" && rest.length === 3 && rest[2] === "complete") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const rows = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "booking not found");
+      if (!rows[0].evidence) return err(400, "evidence is required to mark a booking complete");
+      const ts = nowIso();
+      await db.run("UPDATE bookings SET status = 'COMPLETED', updated_at = ? WHERE id = ?", [ts, rest[1]]);
+      await notify(String(rows[0].talent_id), "Job completed — proof of work added", `Your booking is now marked COMPLETED and appears in your proof-of-work credits. Net pay for this job: $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. TEST MODE: no payment processed.`);
+      const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      const b = updated[0];
+      await audit("booking.complete", "booking", rest[1], "admin", { status: "COMPLETED" }, { booking: { id: b.id, application_id: b.application_id, talent_id: b.talent_id, opportunity_id: b.opportunity_id, status: "COMPLETED", evidence: b.evidence, gross_cents: b.gross_cents, rate: b.rate, commission_cents: b.commission_cents, net_cents: b.net_cents, created_at: b.created_at, updated_at: b.updated_at } });
       return ok({ booking: bookingView(updated[0]) });
     }
     if (method === "PATCH" && rest.length === 3 && rest[2] === "payment") {
@@ -1135,7 +1732,7 @@ async function handle(req: Request): Promise<Response> {
     if (!rows.length) return err(404, "notification not found");
     const chk = await requireTalentOrAdmin(req, String(rows[0].talent_id)); if (!chk.ok) return chk.res!;
     await db.run("UPDATE notifications SET read = 1 WHERE id = ?", [rest[1]]);
-    await audit("notification.read", "notification", rest[1], String(rows[0].talent_id), {});
+    await audit("notification.read", "notification", rest[1], String(rows[0].talent_id), {}, { read: 1 });
     return ok({ notification: { id: rest[1], read: true } });
   }
   if (rest[0] === "notifications" && rest.length === 2 && method === "DELETE") {
@@ -1143,7 +1740,7 @@ async function handle(req: Request): Promise<Response> {
     if (!rows.length) return err(404, "notification not found");
     const chk = await requireTalentOrAdmin(req, String(rows[0].talent_id)); if (!chk.ok) return chk.res!;
     await db.run("DELETE FROM notifications WHERE id = ?", [rest[1]]);
-    await audit("notification.delete", "notification", rest[1], String(rows[0].talent_id), {});
+    await audit("notification.delete", "notification", rest[1], String(rows[0].talent_id), {}, { deleted: true });
     return ok({ deleted: true, notificationId: rest[1] });
   }
 
@@ -1163,8 +1760,9 @@ async function photoList(talentId: string): Promise<any[]> {
 
 async function notify(talentId: string, title: string, body: string): Promise<string> {
   const id = genId("ntf");
-  await db.run("INSERT INTO notifications (id, talent_id, title, body, read, created_at) VALUES (?, ?, ?, ?, 0, ?)", [id, talentId, title, body, nowIso()]);
-  await audit("notification.create", "notification", id, "system", { talentId, title });
+  const ts = nowIso();
+  await db.run("INSERT INTO notifications (id, talent_id, title, body, read, created_at) VALUES (?, ?, ?, ?, 0, ?)", [id, talentId, title, body, ts]);
+  await audit("notification.create", "notification", id, "system", { talentId, title }, { notification: { id, talent_id: talentId, title, body, read: false, created_at: ts } });
   return id;
 }
 
