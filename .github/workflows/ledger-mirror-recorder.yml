@@ -1,0 +1,113 @@
+# TOP TEA TALENTS — ledger mirror recorder (PROTOTYPE — NOT ACTIVATED).
+#
+# WHY: the server keeps a wipe-proof ledger mirror (a JSONL file with the
+# full state snapshots) next to its SQLite DB — but on Render's free tier
+# that file lives on the SAME ephemeral filesystem as the DB, so a restart
+# wipes both. This workflow is the durable copy: every 5 minutes, on
+# GitHub's own free runners (public repo = no minute cap), it fetches the
+# mirror from the live API and commits it to the `ledger` branch. The
+# server's boot-restore then fetches that branch (MIRROR_URL) and replays
+# it into a fresh DB after a wipe. Same pattern as ReacheR's recorder.
+#
+# WHERE IT COMMITS: the `ledger` branch — NEVER main. Render watches main
+# (auto-deploy is off, but belt and braces); the ledger branch is data,
+# not a deploy. The workflow must run AFTER the `ledger` branch exists
+# (activation step 1 below) and AFTER the server code with the mirror
+# endpoints is deployed (it fetches /api/v1/ledger/mirror, admin-gated).
+#
+# ACTIVATION (owner taps, ~10 minutes):
+#   1. Create the `ledger` branch: on GitHub, open the repo -> the branch
+#      dropdown -> type `ledger` -> Create branch. Then put one file on it:
+#      copy the current mirror (GET /api/v1/ledger/mirror with the admin
+#      token) to `ledger/top-tea-talents-mirror.jsonl` on that branch.
+#   2. Add the admin token as a repo SECRET (not a variable): repo ->
+#      Settings -> Secrets and variables -> Actions -> Secrets -> New
+#      repository secret. Name: TTT_ADMIN_TOKEN. Value: the ADMIN_TOKEN
+#      from Render -> service -> Environment (click the eye icon).
+#      (TTT_API_URL already exists as a repo variable from the deploy.)
+#   3. Copy this file to `.github/workflows/ledger-mirror-recorder.yml`
+#      and push it to main.
+#   4. In Render -> service -> Environment, set MIRROR_URL to:
+#      https://raw.githubusercontent.com/moocho954-afk/top-tea-talents/ledger/ledger/top-tea-talents-mirror.jsonl
+#      and Save (Render restarts the service once).
+#   5. Prove it: delete nothing; watch the Actions tab run green, then
+#      open the raw URL in a browser and confirm it shows mirror lines.
+#      The real proof is the wipe test in MIRROR.md (delete the DB, restart,
+#      sign-ups come back).
+#
+# RACES: the server also appends to its local mirror between fetches. The
+# workflow only ever ADDS the fetched content (it never edits history):
+# it compares md5 with the committed copy and commits only when different.
+# Two workflow runs never overlap (concurrency group). A failed run exits
+# non-zero and the NEXT 5-minute run retries — nothing is lost, because
+# the mirror is re-derived from the live API on the next run.
+#
+# COST: $0. No PAT anywhere (GITHUB_TOKEN is auto-provided for the push to
+# the same repo). The admin token is a repo secret, never in the workflow.
+#
+# HONEST LIMIT: GitHub raw reads lag the commit by minutes (CDN). A server
+# that restarts seconds after a sign-up may restore a mirror a few minutes
+# old and miss the very latest events. That is the known gap — the fix
+# would be a second durable store the server writes to directly (Turso),
+# which is step 2 of DEPLOY.md.
+name: Top Tea Talents ledger mirror recorder
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # every 5 minutes, UTC
+  workflow_dispatch: # manual run from the Actions tab
+
+permissions:
+  contents: write # commit + push the mirror back to the ledger branch
+
+concurrency:
+  group: ttt-ledger-mirror-recorder
+  cancel-in-progress: false # never kill a run mid-commit; serialize
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the ledger branch
+        uses: actions/checkout@v4
+        with:
+          ref: ledger
+          fetch-depth: 0
+
+      - name: Fetch the mirror from the live API
+        env:
+          API_URL: ${{ vars.TTT_API_URL }}
+          ADMIN_TOKEN: ${{ secrets.TTT_ADMIN_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${API_URL:-}" ]; then echo "TTT_API_URL repo variable is not set"; exit 1; fi
+          if [ -z "${ADMIN_TOKEN:-}" ]; then echo "TTT_ADMIN_TOKEN repo secret is not set"; exit 1; fi
+          mkdir -p ledger
+          curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "$API_URL/api/v1/ledger/mirror" -o ledger/top-tea-talents-mirror.jsonl.new
+          # The mirror must be a valid chain before it is committed: every
+          # line carries seq + mirror_hash. A corrupt fetch commits nothing.
+          python3 - <<'PY'
+          import json, sys
+          lines = open("ledger/top-tea-talents-mirror.jsonl.new").read().splitlines()
+          assert lines, "fetched mirror is empty"
+          parsed = [json.loads(l) for l in lines]
+          assert [p["seq"] for p in parsed] == list(range(1, len(parsed) + 1)), "mirror seqs not 1..N"
+          assert all(p.get("mirror_hash") for p in parsed), "mirror line missing mirror_hash"
+          print(f"fetched mirror ok: {len(lines)} lines")
+          PY
+          mv ledger/top-tea-talents-mirror.jsonl.new ledger/top-tea-talents-mirror.jsonl
+
+      - name: Commit when changed
+        run: |
+          set -eu
+          if git diff --quiet -- ledger/top-tea-talents-mirror.jsonl; then
+            echo "mirror unchanged — nothing to commit"
+            exit 0
+          fi
+          git config user.name "ttt-mirror-recorder"
+          git config user.email "ttt-mirror-recorder@users.noreply.github.com"
+          git add ledger/top-tea-talents-mirror.jsonl
+          git commit -m "ledger mirror: $(wc -l < ledger/top-tea-talents-mirror.jsonl) events"
+          git push origin ledger
+          echo "mirror pushed to ledger branch"
