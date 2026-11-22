@@ -37,7 +37,10 @@ class TursoDb implements Db {
   durable = true;
   constructor(private url: string, private token: string) {}
   private async pipeline(requests: any[]): Promise<any[]> {
-    const res = await fetch(this.url.replace(/\/$/, "") + "/v2/pipeline", {
+    // Turso database URLs use the libsql:// scheme, but fetch() only accepts
+    // http:/https: — convert to https:// for the HTTP pipeline endpoint.
+    const httpUrl = this.url.replace(/^libsql:\/\//, "https://").replace(/\/$/, "");
+    const res = await fetch(httpUrl + "/v2/pipeline", {
       method: "POST",
       headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ requests: [...requests, { type: "close" }] }),
