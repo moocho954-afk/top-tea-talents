@@ -93,6 +93,7 @@ label{display:block;font-weight:600;margin:.9rem 0 .3rem}
 .badge-unverified{color:#ffb3a3;border-color:var(--red);background:rgba(192,57,43,.14)}
 .badge-expired{color:#ffb3a3;border-color:var(--red)}
 .badge-blue{color:#a8c8ff;border-color:var(--electric)}
+.badge-gold{color:#1a1405;border-color:var(--gold);background:var(--gold)}
 .badge-purple{color:#d3b8ff;border-color:var(--purple)}
 .badge-green{color:#7be3a8;border-color:var(--green)}
 .pay{color:var(--gold);font-weight:700}
@@ -197,3 +198,24 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
 .big-toggle.on .toggle-knob{left:74px;background:#14100a}
 .code-input{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:1.5rem;letter-spacing:.5em;text-align:center}
 #version-stamp{font-size:.8rem;letter-spacing:.08em;color:var(--gold);opacity:.85}
+
+/* ---------- v16: Community Board ---------- */
+.board-layout{display:flex;gap:1rem;align-items:flex-start}
+.board-layout #board-posts{flex:1;min-width:0}
+.board-layout #board-bubble{flex:0 0 360px;min-width:0}
+.board-post-mentioned{border:1px solid var(--gold);box-shadow:0 0 0 1px var(--gold),var(--shadow)}
+.mention{font-weight:700;color:#e8c766;background:rgba(212,175,55,.15);border-radius:4px;padding:0 .25rem}
+.mention-me{background:var(--gold);color:#111}
+.board-suggest{position:absolute;left:0;right:0;top:100%;margin-top:.25rem;z-index:30;border-radius:12px;overflow:hidden;background:#141414;border:1px solid rgba(212,175,55,.55);box-shadow:0 14px 30px rgba(0,0,0,.6)}
+.board-suggest-item{display:block;width:100%;text-align:left;padding:.75rem 1rem;background:none;border:0;border-bottom:1px solid #2a2410;cursor:pointer;font-size:1rem;color:var(--white)}
+.board-suggest-item:hover{background:#1e1b17}
+.board-suggest-empty{padding:.75rem 1rem;font-size:.9rem;color:var(--gray)}
+.board-bubble{background:#141414;border:1px solid var(--gold);border-radius:16px;padding:1rem;box-shadow:0 18px 40px rgba(0,0,0,.65)}
+.board-bubble-msg{border-radius:12px;padding:.5rem .75rem;margin-bottom:.5rem;background:#1e1e1e}
+.board-bubble-mine{background:rgba(212,175,55,.16);margin-left:2rem}
+.board-bubble-msg:not(.board-bubble-mine){margin-right:2rem}
+@media (max-width:900px){
+  .board-layout{flex-direction:column}
+  .board-layout #board-bubble{flex:1 1 auto;width:100%}
+  .board-bubble{position:static}
+}

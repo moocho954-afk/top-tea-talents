@@ -230,6 +230,7 @@ var ROUTES = [
   {re:/^#\/applications$/, fn:screenApplications},
   {re:/^#\/bookings$/, fn:screenBookings},
   {re:/^#\/notifications$/, fn:screenNotifications},
+  {re:/^#\/community$/, fn:screenCommunity},
   {re:/^#\/settings$/, fn:screenSettings},
   {re:/^#\/compliance$/, fn:screenCompliance},
   {re:/^#\/agency\/([^\/]+)$/, fn:screenAgencyHistory},
@@ -240,6 +241,9 @@ var ROUTES = [
 function route(){
   var app = $("#app");
   if(!app) return;
+  // Community Board timers (15s refresh + 30s bubble auto-close) belong
+  // to that screen only — clear them on every navigation.
+  if(window.__tttBoardTimers){ window.__tttBoardTimers.forEach(function(t){ clearInterval(t); }); window.__tttBoardTimers = []; }
   apiBanner(); bindAuthSlot(); closeSidebar();
   document.querySelectorAll(".nav-group-body a").forEach(function(a){
     var h = a.getAttribute("href")||"";
@@ -687,7 +691,11 @@ function screenJoin(app){
         .catch(function(err){
           var m = err.message||"";
           if(/already registered/i.test(m)){
-            msg.innerHTML = errBox(m + ' <a href="#/login">Sign in instead</a> — your account already exists, and signing in takes you back to where you left off.');
+            // NOTE (v16 port): the GitHub hunk passed the anchor through
+            // errBox(), which escapes HTML — as-shipped the "Sign in
+            // instead" link renders as literal "&lt;a&gt;" text, not a
+            // link. Same words, same error box, but the anchor is live.
+            msg.innerHTML = '<div class="error-box" role="alert">'+esc(m)+' <a href="#/login">Sign in instead</a> — your account already exists, and signing in takes you back to where you left off.</div>';
           } else { msg.innerHTML = errBox(m); }
         });
       return;
@@ -1574,6 +1582,257 @@ function screenNotifications(app){
     }).catch(function(err){ $("#notif-list").innerHTML = errBox(err.message); });
   };
   load();
+}
+
+/* ---------- (6b) Community Board (v16, Phase 0) ----------
+   One public board: everybody talks in it, everybody sees everybody's
+   messages — there are no private DMs. @ mentions autocomplete live
+   (narrowing per letter, tap to insert) and are highlighted to the
+   named talent (+ an in-app notification). The direct-talk bubble is
+   ONLY a filtered view of the same public posts — its header says so
+   in plain words — and it closes on "End chat" or 30 seconds after the
+   last typing; the messages themselves stay on the board. The composer
+   is a plain textarea with NO autocorrect/autocomplete suppression, so
+   the phone keyboard's predictive spelling works exactly as ordered.
+   Audio/carousel buttons call the honest-refusal endpoint and create
+   nothing. Ported from artifact top-tea-talents v16. */
+function screenCommunity(app){
+  var me = sessionTalentId();
+  var signedIn = isLoggedIn();
+  var posts = [];
+  var picks = [];
+  var photo = null; // {dataBase64, mimeType, preview}
+  var mentionQuery = null;
+  var suggestions = [];
+  var partner = null; // {talentId, name, handle}
+  var bubbleText = "";
+  var lastActivity = 0;
+  var reported = {};
+  var refreshTick = 0;
+
+  function boardBodyHTML(post){
+    var text = esc(post.body||"");
+    var handles = (post.mentions||[]).map(function(m){ return m.handle; }).filter(Boolean);
+    if(!handles.length) return text;
+    var re = new RegExp("(@(?:" + handles.map(function(h){ return h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join("|") + "))", "gi");
+    return text.split(re).map(function(part){
+      var m = (post.mentions||[]).filter(function(x){ return part.toLowerCase() === "@"+String(x.handle||"").toLowerCase(); })[0];
+      if(!m) return part;
+      var cls = m.talentId === me ? "mention mention-me" : "mention";
+      return '<span class="'+cls+'">'+esc(part)+'</span>';
+    }).join("");
+  }
+  function postCardHTML(post){
+    var mine = post.talentId === me;
+    var h = '<article class="card board-post'+(post.mentionsViewer?' board-post-mentioned':'')+'" data-post-id="'+esc(post.id)+'">'
+      + '<p><strong style="color:var(--gold)">'+esc(post.authorName)+'</strong> <span class="muted small">@'+esc(post.authorHandle)+'</span> '
+      + '<span class="muted small">'+esc(fmtDT(post.createdAt))+'</span> '
+      + (post.mentionsViewer?'<span class="badge badge-gold">MENTIONED YOU</span>':"")
+      + (mine?'<span class="badge badge-blue">YOUR POST</span>':"")+'</p>'
+      + '<p style="white-space:pre-wrap;overflow-wrap:break-word">'+boardBodyHTML(post)+'</p>';
+    if(post.photoUrl) h += '<p><img src="'+esc(apiBase()+post.photoUrl)+'" alt="Photo posted by '+esc(post.authorName)+'" style="border-radius:12px;max-height:320px;width:auto;max-width:100%;border:1px solid rgba(212,175,55,.35)" loading="lazy"></p>';
+    h += '<p>';
+    if(signedIn && !mine) h += '<button class="mini-btn" data-talk="'+esc(post.talentId)+'" data-talk-name="'+esc(post.authorName)+'" data-talk-handle="'+esc(post.authorHandle)+'">Talk to '+esc((post.authorName||"them").split(" ")[0])+'</button> ';
+    if(signedIn && post.mentionsViewer && !mine) h += '<button class="mini-btn" data-talk="'+esc(post.talentId)+'" data-talk-name="'+esc(post.authorName)+'" data-talk-handle="'+esc(post.authorHandle)+'">Reply</button> ';
+    if(signedIn && mine) h += '<button class="mini-btn" data-del="'+esc(post.id)+'">Delete my post</button> ';
+    if(ownerTokenValid()) h += '<button class="mini-btn" data-remove="'+esc(post.id)+'">Remove (owner)</button> ';
+    if(signedIn) h += '<button class="mini-btn" data-report="'+esc(post.id)+'">'+(reported[post.id]?"Reported":"Report")+'</button>';
+    h += '</p></article>';
+    return h;
+  }
+  function threadPosts(){
+    if(!partner) return [];
+    return posts.filter(function(p){
+      return (p.talentId === me && (p.mentions||[]).some(function(m){ return m.talentId === partner.talentId; }))
+        || (p.talentId === partner.talentId && (p.mentions||[]).some(function(m){ return m.talentId === me; }));
+    }).slice().reverse();
+  }
+  function renderBubble(){
+    var el = $("#board-bubble"); if(!el) return;
+    if(!partner || !signedIn){ el.innerHTML = ""; return; }
+    var thread = threadPosts();
+    var h = '<div class="board-bubble"><div style="display:flex;justify-content:space-between;gap:.5rem;align-items:flex-start">'
+      + '<h2 style="margin:0;color:var(--gold)">Talking with '+esc(partner.name)+'</h2>'
+      + '<button class="btn btn-sm" id="bubble-end" type="button">End chat</button></div>'
+      + '<p class="muted small">Everyone on the board can see this conversation — the bubble just makes it easier to follow. It closes on its own 30 seconds after the last typing; the messages stay on the board.</p>'
+      + '<div id="bubble-thread" style="max-height:320px;overflow-y:auto;margin-bottom:.75rem">'
+      + (thread.length ? thread.map(function(p){
+          var mine = p.talentId === me;
+          return '<div class="board-bubble-msg'+(mine?' board-bubble-mine':'')+'"><p class="small" style="margin:0"><strong style="color:var(--gold)">'+esc(mine?"You":p.authorName)+'</strong> · '+esc(fmtDT(p.createdAt))+'</p>'
+            + '<p style="white-space:pre-wrap;overflow-wrap:break-word;margin:.2rem 0 0">'+boardBodyHTML(p)+'</p>'
+            + (p.photoUrl?'<p style="margin:.3rem 0 0"><img src="'+esc(apiBase()+p.photoUrl)+'" alt="Photo posted by '+esc(p.authorName)+'" style="border-radius:8px;max-height:160px;width:auto;max-width:100%" loading="lazy"></p>':"")+'</div>';
+        }).join("") : '<p class="muted small">No messages between you two yet — say hello below. It posts straight to the public board, addressed to @'+esc(partner.handle)+'.</p>')
+      + '</div>'
+      + '<label for="bubble-text" class="small muted">Message @'+esc(partner.handle)+' — public, everyone can see it</label>'
+      + '<textarea id="bubble-text" rows="2" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" placeholder="Message @'+esc(partner.handle)+'…" aria-label="Message '+esc(partner.name)+' on the public board">'+esc(bubbleText)+'</textarea>'
+      + '<p style="margin-top:.5rem"><button class="btn" id="bubble-send" type="button">Send to @'+esc(partner.handle)+'</button></p></div>';
+    el.innerHTML = h;
+    $("#bubble-end").addEventListener("click", function(){ partner = null; bubbleText = ""; renderBubble(); });
+    var ta = $("#bubble-text");
+    ta.addEventListener("input", function(){ bubbleText = ta.value; lastActivity = Date.now(); });
+    $("#bubble-send").addEventListener("click", function(){
+      if(!bubbleText.trim() || !partner) return;
+      var body = bubbleText.trim();
+      bubbleText = ""; lastActivity = Date.now();
+      api("/api/v1/board/posts", {method:"POST", body:{talentId:me, body:body, mentionedTalentIds:[partner.talentId]}})
+        .then(function(r){ setNotice(r.message||"Posted to the Community Board."); loadPosts(); renderBubble(); })
+        .catch(function(e){ setNotice(e.message); });
+    });
+  }
+  function setNotice(msg){
+    var el = $("#board-notice"); if(el) el.innerHTML = msg ? '<p class="small" role="status" style="color:var(--gold);font-weight:700">'+esc(msg)+'</p>' : "";
+  }
+  function renderPosts(){
+    var el = $("#board-posts"); if(!el) return;
+    if(!posts.length){ el.innerHTML = emptyBox("No posts yet. Be the first to say hello, share a job photo, or ask the community for what you need."); return; }
+    el.innerHTML = posts.map(postCardHTML).join("");
+    el.querySelectorAll("[data-talk]").forEach(function(b){
+      b.addEventListener("click", function(){
+        partner = {talentId:b.getAttribute("data-talk"), name:b.getAttribute("data-talk-name"), handle:b.getAttribute("data-talk-handle")};
+        bubbleText = ""; lastActivity = Date.now(); renderBubble();
+      });
+    });
+    el.querySelectorAll("[data-del]").forEach(function(b){
+      b.addEventListener("click", function(){
+        api("/api/v1/board/posts/"+encodeURIComponent(b.getAttribute("data-del"))+"/delete", {method:"POST", body:{talentId:me}})
+          .then(function(r){ setNotice(r.message); loadPosts(); })
+          .catch(function(e){ setNotice(e.message); });
+      });
+    });
+    el.querySelectorAll("[data-remove]").forEach(function(b){
+      b.addEventListener("click", function(){
+        api("/api/v1/board/posts/"+encodeURIComponent(b.getAttribute("data-remove"))+"/remove", {method:"POST", body:{ownerToken:ownerToken()}, token:ownerToken()||undefined})
+          .then(function(r){ setNotice(r.message); loadPosts(); })
+          .catch(function(e){ setNotice(e.message); });
+      });
+    });
+    el.querySelectorAll("[data-report]").forEach(function(b){
+      b.addEventListener("click", function(){
+        var id = b.getAttribute("data-report");
+        api("/api/v1/board/posts/"+encodeURIComponent(id)+"/report", {method:"POST", body:{reporterTalentId:me, reason:""}})
+          .then(function(r){ reported[id] = true; setNotice(r.message); renderPosts(); })
+          .catch(function(e){ setNotice(e.message); });
+      });
+    });
+  }
+  function loadPosts(){
+    if(!apiBase()){ var el=$("#board-posts"); if(el) el.innerHTML = emptyBox("The board loads from the live backend once it is connected."); return; }
+    apiGet("/api/v1/board/posts?viewerTalentId="+encodeURIComponent(me||"")).then(function(d){
+      posts = d.posts||[]; renderPosts(); renderBubble();
+    }).catch(function(e){ var el2=$("#board-posts"); if(el2) el2.innerHTML = errBox(e.message); });
+  }
+  function openBubble(p){ partner = p; bubbleText = ""; lastActivity = Date.now(); renderBubble(); }
+  function onComposerChange(value, cursor){
+    var upto = cursor == null ? value : value.slice(0, cursor);
+    var m = /(?:^|\s)@([A-Za-z0-9]*)$/.exec(upto);
+    mentionQuery = m ? (m[1]||"") : null;
+    renderSuggestions();
+    if(mentionQuery !== null && signedIn){
+      apiGet("/api/v1/board/mentions/search?q="+encodeURIComponent(mentionQuery)).then(function(d){
+        suggestions = (d.profiles||[]).filter(function(p){ return p.talentId !== me; });
+        renderSuggestions();
+      }).catch(function(){ suggestions = []; renderSuggestions(); });
+    }
+  }
+  function renderSuggestions(){
+    var box = $("#board-suggestions"); if(!box) return;
+    if(mentionQuery === null){ box.innerHTML = ""; return; }
+    if(!suggestions.length){
+      box.innerHTML = '<div class="board-suggest-empty">No profile matches “@'+esc(mentionQuery)+'” yet — keep typing.</div>';
+      return;
+    }
+    box.innerHTML = suggestions.map(function(p, i){
+      return '<button type="button" class="board-suggest-item" data-sugg="'+i+'"><span aria-hidden="true">⭐</span> <strong style="color:var(--gold)">@'+esc(p.handle)+'</strong> <span class="muted">'+esc(p.name)+'</span></button>';
+    }).join("");
+    box.querySelectorAll("[data-sugg]").forEach(function(b){
+      b.addEventListener("click", function(){ chooseMention(suggestions[Number(b.getAttribute("data-sugg"))]); });
+    });
+  }
+  function chooseMention(p){
+    if(!p) return;
+    var ta = $("#board-text"); if(!ta) return;
+    var cursor = ta.selectionStart == null ? ta.value.length : ta.selectionStart;
+    var upto = ta.value.slice(0, cursor), rest = ta.value.slice(cursor);
+    var replaced = upto.replace(/(?:^|\s)@[A-Za-z0-9]*$/, function(whole){ return (whole.charAt(0) === "@" ? "" : whole.charAt(0)) + "@" + p.handle + " "; });
+    ta.value = replaced + rest;
+    if(!picks.some(function(x){ return x.talentId === p.talentId; })) picks.push(p);
+    mentionQuery = null; renderSuggestions();
+    ta.focus();
+  }
+  function submitPost(){
+    var ta = $("#board-text"); if(!ta) return;
+    var body = ta.value.trim();
+    if(!body && !photo){ setNotice("Write something or add a photo before posting."); return; }
+    var live = picks.filter(function(p){ return body.toLowerCase().indexOf("@"+p.handle.toLowerCase()) >= 0; });
+    var payload = {talentId:me, body:body, mentionedTalentIds:live.map(function(p){ return p.talentId; })};
+    if(photo) payload.photo = {dataBase64:photo.dataBase64, mimeType:photo.mimeType};
+    api("/api/v1/board/posts", {method:"POST", body:payload}).then(function(r){
+      setNotice(r.message); ta.value = ""; photo = null; picks = []; mentionQuery = null;
+      var pv = $("#board-photo-preview"); if(pv) pv.innerHTML = "";
+      renderSuggestions(); loadPosts();
+      if(live.length) openBubble(live[0]);
+    }).catch(function(e){ setNotice(e.message); });
+  }
+  function onPhotoFile(file){
+    if(!file) return;
+    if(["image/jpeg","image/png","image/webp"].indexOf(file.type) < 0){ setNotice("Board photos must be JPG, PNG, or WEBP."); return; }
+    if(file.size > 500*1024){ setNotice("That photo is too large for the board — 500 KB maximum. Pick a smaller photo."); return; }
+    var rd = new FileReader();
+    rd.onload = function(){
+      var dataUrl = String(rd.result||"");
+      var m = dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,(.+)$/);
+      if(!m){ setNotice("That photo appears empty or corrupted. Choose a different photo."); return; }
+      photo = {dataBase64:m[2], mimeType:m[1], preview:dataUrl};
+      var pv = $("#board-photo-preview");
+      if(pv) pv.innerHTML = '<div style="display:flex;gap:.75rem;align-items:flex-start;margin-top:.75rem"><img src="'+esc(dataUrl)+'" alt="Photo attached to your post" style="border-radius:12px;max-height:160px;width:auto;border:1px solid rgba(212,175,55,.4)"><button class="btn btn-ghost btn-sm" id="board-photo-remove" type="button">Remove photo</button></div>';
+      var rm = $("#board-photo-remove");
+      if(rm) rm.addEventListener("click", function(){ photo = null; var pv2=$("#board-photo-preview"); if(pv2) pv2.innerHTML = ""; });
+      setNotice("");
+    };
+    rd.onerror = function(){ setNotice("Could not read that photo file."); };
+    rd.readAsDataURL(file);
+  }
+  function mediaAttempt(kind){
+    api("/api/v1/board/media-posts", {method:"POST", body:{talentId:me, kind:kind, body:""}}).then(function(r){ setNotice(r.message); }).catch(function(e){ setNotice(e.message); });
+  }
+
+  app.innerHTML = '<h1 style="color:var(--gold)">Community Board</h1>'
+    + '<div class="card"><p><strong>This board is public.</strong> Everyone on the board can see every post and every conversation — there are no private messages here. Talk to someone directly by @-mentioning them: it reaches them highlighted, like a direct message, but it stays on the open board for everyone to see.</p>'
+    + '<p class="muted">Share your experiences, post photos from jobs, and find people in the talent pool for what you need — a videographer, a photographer, a partner for your next project. Create together, make friends, make partners.</p>'
+    + '<p class="muted small">Moderation: there is no automatic content filter. You can delete your own posts, report any post, and the agency owner reviews reports and can remove posts. TEST MODE: posting is not a submission — nothing is sent anywhere.</p></div>'
+    + (signedIn ? "" : '<div class="card"><h2>Join the conversation</h2><p>You can read the whole board right now — it\'s public. To post, @-mention, and talk with other talent, sign up or open your profile first.</p><p><a class="btn" href="#/join">SIGN UP — JOIN FREE</a> <a class="btn btn-ghost" href="#/dashboard">My Dashboard</a></p></div>')
+    + (signedIn ? '<div class="card"><h2>Post to the board</h2><div style="position:relative">'
+      + '<label for="board-text">Share something with the community… type @ to mention someone</label>'
+      + '<textarea id="board-text" rows="3" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" placeholder="Share something with the community… type @ to mention someone" aria-label="Write a post for the community board"></textarea>'
+      + '<div id="board-suggestions" class="board-suggest" role="listbox" aria-label="Mention suggestions"></div></div>'
+      + '<div id="board-photo-preview"></div>'
+      + '<p style="margin-top:.75rem"><button class="btn" id="board-post-btn" type="button">Post</button> '
+      + '<label class="btn btn-ghost btn-sm" style="cursor:pointer">Add photo<input type="file" id="board-photo-input" accept="image/jpeg,image/png,image/webp" style="display:none" aria-label="Add a photo to your post"></label> '
+      + '<button class="btn btn-ghost btn-sm" id="board-audio-btn" type="button">Add music</button> '
+      + '<button class="btn btn-ghost btn-sm" id="board-carousel-btn" type="button">Carousel</button></p>'
+      + '<p class="muted small">Photos: JPG, PNG, or WEBP, up to 500 KB. Type @ plus a letter and matching profiles appear — tap one to mention them.</p>'
+      + '<div id="board-notice"></div></div>' : '<div id="board-notice"></div>')
+    + '<div class="board-layout"><div id="board-posts" style="flex:1;min-width:0">'+loadingBox("Loading the board…")+'</div><aside id="board-bubble" style="flex:0 0 360px;min-width:0" aria-label="Direct talk"></aside></div>';
+
+  if(signedIn){
+    var ta = $("#board-text");
+    ta.addEventListener("input", function(){ onComposerChange(ta.value, ta.selectionStart); });
+    ta.addEventListener("click", function(){ onComposerChange(ta.value, ta.selectionStart); });
+    $("#board-post-btn").addEventListener("click", submitPost);
+    $("#board-photo-input").addEventListener("change", function(e){ onPhotoFile(e.target.files && e.target.files[0]); e.target.value = ""; });
+    $("#board-audio-btn").addEventListener("click", function(){ mediaAttempt("audio"); });
+    $("#board-carousel-btn").addEventListener("click", function(){ mediaAttempt("carousel"); });
+  }
+  loadPosts();
+  // Refresh the board every 15s while this screen is open; the
+  // 1-second tick also auto-closes the bubble 30s after last typing.
+  // Timers are cleared by route() on every navigation (see below).
+  window.__tttBoardTimers = window.__tttBoardTimers || [];
+  window.__tttBoardTimers.push(setInterval(function(){
+    refreshTick++;
+    if(partner && lastActivity && Date.now() - lastActivity > 30000){ partner = null; bubbleText = ""; renderBubble(); }
+    if(refreshTick % 15 === 0) loadPosts();
+  }, 1000));
 }
 
 function screenSettings(app){
