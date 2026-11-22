@@ -48,15 +48,20 @@ function extractVar(src, name) {
 
 // Evaluate the real functions via a factory (direct eval in strict mode
 // would scope them to the eval call). PROFILE_KEY_MAP is a dependency.
+const agencyEmailDecl = appSrc.match(/var AGENCY_EMAIL = "[^"]+";/);
+assert(agencyEmailDecl, "AGENCY_EMAIL constant not found in app.js");
 const factorySrc =
   extractVar(appSrc, "PROFILE_KEY_MAP") + "\n" +
+  agencyEmailDecl[0] + "\n" +
   extractFn(appSrc, "function toApiProfile") + "\n" +
   extractFn(appSrc, "function completionPct") + "\n" +
   extractFn(appSrc, "function mergeDraftWithProfile") + "\n" +
   extractFn(appSrc, "function photoEncodeSteps") + "\n" +
   extractFn(appSrc, "function dataUrlByteSize") + "\n" +
-  "return { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize };";
-const { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize } = new Function(factorySrc)();
+  extractFn(appSrc, "function reviewWindowsNotice") + "\n" +
+  extractFn(appSrc, "function isAwaitingReview") + "\n" +
+  "return { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize, reviewWindowsNotice, isAwaitingReview };";
+const { toApiProfile, completionPct, mergeDraftWithProfile, photoEncodeSteps, dataUrlByteSize, reviewWindowsNotice, isAwaitingReview } = new Function(factorySrc)();
 
 // --- toApiProfile: wizard mode must never send empty arrays (Fix 3) ---
 check("toApiProfile wizard mode skips empty arrays (no wipe)", () => {
@@ -202,6 +207,44 @@ check("wizard labels mark the optional groups Optional", () => {
 });
 check("wizard step submits use toApiProfile(d, true)", () => {
   assert((appSrc.match(/toApiProfile\(d, true\)/g) || []).length >= 2, "wizard PATCH calls do not pass skipEmptyArrays");
+});
+
+// --- agency review windows notice (owner policy 2026-11-22: review runs
+// 9:00 AM, 12:00 PM, 4:00 PM Eastern; not in by 4:00 PM waits until the
+// next day unless the talent emails the agency directly) ---
+check("reviewWindowsNotice: all three windows + next-day rule + direct-email bypass", () => {
+  const html = reviewWindowsNotice();
+  assert(html.includes("9:00 AM") && html.includes("12:00 PM") && html.includes("4:00 PM"), "windows missing: " + html);
+  assert(html.includes("Eastern"), "timezone missing");
+  assert(html.includes("waits until the next day"), "next-day rule missing");
+  assert(html.includes("mailto:moocho954@gmail.com"), "agency mailto link missing");
+  assert(html.includes("notice-box"), "notice-box class missing (mobile styling)");
+});
+check("reviewWindowsNotice: agency email comes from the single AGENCY_EMAIL constant", () => {
+  assert(agencyEmailDecl[0].includes('"moocho954@gmail.com"'), "AGENCY_EMAIL is not moocho954@gmail.com");
+  assert(appSrc.includes("topteatalents@gmail.com"), "swap note for the future agency Gmail missing");
+  const uses = (appSrc.match(/AGENCY_EMAIL/g) || []).length;
+  assert(uses >= 3, "AGENCY_EMAIL should be declared once and used in the notice, found " + uses);
+});
+check("isAwaitingReview: true for AWAITING AGENCY REVIEW via status or readiness_status", () => {
+  assert(isAwaitingReview({ status: "AWAITING AGENCY REVIEW" }) === true);
+  assert(isAwaitingReview({ readiness_status: "AWAITING AGENCY REVIEW" }) === true);
+  assert(isAwaitingReview({ status: "awaiting agency review" }) === true);
+});
+check("isAwaitingReview: false for other statuses and missing talent", () => {
+  assert(isAwaitingReview({ status: "PROFILE INCOMPLETE" }) === false);
+  assert(isAwaitingReview({ status: "READY FOR MATCHING" }) === false);
+  assert(isAwaitingReview({}) === false);
+  assert(isAwaitingReview(null) === false);
+  assert(isAwaitingReview(undefined) === false);
+});
+check("dashboard shows the review-windows notice only while awaiting review", () => {
+  const dash = appSrc.slice(appSrc.indexOf("function screenDashboard"), appSrc.indexOf("function screenPortfolio"));
+  assert(dash.includes("isAwaitingReview(t) ? reviewWindowsNotice()"), "dashboard does not gate the notice on awaiting review");
+});
+check("likeness-release sign confirmation carries the review-windows notice", () => {
+  const consent = appSrc.slice(appSrc.indexOf("function screenConsent"), appSrc.indexOf("function screenMatches"));
+  assert(consent.includes('okBox("Release signed. Status: AWAITING AGENCY REVIEW.") + reviewWindowsNotice()'), "sign confirmation lacks the notice");
 });
 
 console.log("\nFRONTEND-UNIT: " + PASS + " passed, " + FAIL + " failed");

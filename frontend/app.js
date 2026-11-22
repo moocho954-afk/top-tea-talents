@@ -98,6 +98,18 @@ function emptyBox(msg){ return '<div class="empty">'+esc(msg)+'</div>'; }
 function errBox(msg){ return '<div class="error-box" role="alert">'+esc(msg)+'</div>'; }
 function okBox(msg){ return '<div class="success-box" role="status">'+esc(msg)+'</div>'; }
 function loadingBox(msg){ return '<div class="card"><p class="muted">'+esc(msg||"Loading…")+'</p></div>'; }
+/* Agency review windows (owner policy 2026-11-22): the agency reviews
+   profiles three times a day — 9:00 AM, 12:00 PM, and 4:00 PM Eastern.
+   A profile not in by the 4:00 PM review waits until the next day, unless
+   the talent emails the agency directly. */
+var AGENCY_EMAIL = "moocho954@gmail.com"; // agency contact for now — swap to topteatalents@gmail.com once the agency Gmail exists.
+function reviewWindowsNotice(){
+  return '<p class="notice-box">Agency review runs three times a day — <strong>9:00 AM, 12:00 PM, and 4:00 PM Eastern</strong>. If your profile is not in by the 4:00 PM review, it waits until the next day. Need it sooner? Email the agency directly at <a href="mailto:'+AGENCY_EMAIL+'">'+AGENCY_EMAIL+'</a>.</p>';
+}
+function isAwaitingReview(t){
+  var s = ((t && (t.readiness_status || t.status)) || "").toString().toUpperCase();
+  return s.indexOf("AWAITING") >= 0;
+}
 function apiBanner(){
   var b = $("#api-banner");
   if(!b) return;
@@ -1037,6 +1049,7 @@ function screenDashboard(app){
     var el = $("#dash"); if(!el) return;
     el.innerHTML = '<div class="card"><h2>Welcome, '+esc(t.professional_name||t.first_name||"talent")+'</h2>'
       + '<p>Profile completion: <strong>'+pct+'%</strong> · Photos: <strong>'+photos.length+' of 8</strong> · Readiness: <strong>'+esc(t.readiness_status||t.status||(pct>=80?"Ready":"In progress"))+'</strong></p>'
+      + (isAwaitingReview(t) ? reviewWindowsNotice() : "")
       + (pct<100 && missing.length ? '<p class="muted small">To reach 100%: '+esc(missing.join(", "))+'.</p>' : "")
       + (t.gender ? "" : '<p class="muted small">Set your gender in <a href="#/profile">Edit My Profile</a> — roles that require a different gender can only filter once it is set.</p>')
       + '<div class="stats-row"><div class="stat"><b>'+apps.length+'</b><span>applications</span></div>'
@@ -1236,7 +1249,7 @@ function screenConsent(app){
       e.preventDefault();
       var sig = $("#consent-sig").value.trim();
       api("/api/v1/talent/"+encodeURIComponent(id)+"/likeness-release/sign", {method:"POST", body:{signature:sig, agreed:true}})
-        .then(function(){ $("#consent-msg").innerHTML = okBox("Release signed. Status: AWAITING AGENCY REVIEW."); })
+        .then(function(){ $("#consent-msg").innerHTML = okBox("Release signed. Status: AWAITING AGENCY REVIEW.") + reviewWindowsNotice(); })
         .catch(function(err){ $("#consent-msg").innerHTML = errBox(err.message); });
     });
     $("#consent-revoke").addEventListener("click", function(){
