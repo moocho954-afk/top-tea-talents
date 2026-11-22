@@ -586,6 +586,17 @@ function screenJoin(app){
   var d = joinDraft();
   var step = parseInt(qs("step")||"1",10) || 1;
   if(step<1||step>3) step=1;
+  // Returning account: a signed-in talent already has an account, so step 1
+  // (fresh registration) is a dead end — show a resume panel instead.
+  if(step===1 && isLoggedIn() && sessionTalentId()){
+    app.innerHTML = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
+      + '<h1 style="color:var(--gold)">WELCOME BACK</h1>'
+      + '<p class="muted">You already have an account and you are signed in — no need to sign up again. Continue where you left off:</p>'
+      + '<div class="card"><p><a class="btn" href="#/join?step=2">Continue my profile — About you</a></p>'
+      + '<p><a class="btn" href="#/join?step=3">Pick my categories</a></p>'
+      + '<p><a class="btn btn-ghost" href="#/dashboard">Go to my dashboard</a></p></div>';
+    return;
+  }
   d.availability = d.availability||[]; d.categories=d.categories||[]; d.skills=d.skills||[];
   d.fast_track = d.fast_track||{A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
   var html = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
@@ -673,7 +684,12 @@ function screenJoin(app){
           }catch(err){}
           location.hash = "#/verify"; route();
         })
-        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+        .catch(function(err){
+          var m = err.message||"";
+          if(/already registered/i.test(m)){
+            msg.innerHTML = errBox(m + ' <a href="#/login">Sign in instead</a> — your account already exists, and signing in takes you back to where you left off.');
+          } else { msg.innerHTML = errBox(m); }
+        });
       return;
     }
     if(step<3){
