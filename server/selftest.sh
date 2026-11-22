@@ -466,6 +466,96 @@ check "proof-of-work credits list the completed job" python3 -c "import json; d=
 # Mirror must never carry secrets from the new flows
 check "mirror carries no passcode hash, code hash, or password hash" bash -c "! grep -q 'owner_passcode_hash' $MIRROR && ! grep -q 'code_hash' $MIRROR && ! grep -q 'password_hash' $MIRROR && echo 'mirror clean of secrets'"
 
+# ----- v16: COMMUNITY BOARD (Phase 0) -----
+# Uses TALENT_ID (Testy Talent, @testytalent) + TALENT2_ID (Second Talent,
+# @secondtalent) from the v11 section. Runs BEFORE the mirror/wipe
+# sections: board posts live in the ephemeral SQLite, not the mirror.
+BOARD_BODY="BoardSelftestUnique hello from Testy"
+curl -sf "$BASE/board/mentions/search?q=s" -o /tmp/ttt-body.json
+check "board mention search: 's' matches Second Talent" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); hs=[p['handle'] for p in d['profiles']]; assert 'secondtalent' in hs, d; assert len(d['profiles'])<=8, d"
+curl -sf "$BASE/board/mentions/search?q=second" -o /tmp/ttt-body.json
+check "board mention search: 'second' narrows to one profile" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert [p['handle'] for p in d['profiles']]==['secondtalent'], d"
+curl -sf "$BASE/board/mentions/search?q=zzzznothing" -o /tmp/ttt-body.json
+check "board mention search: no match returns empty" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['profiles']==[], d"
+curl -sf "$BASE/board/mentions/search" -o /tmp/ttt-body.json
+check "board mention search: empty query lists talents" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['profiles'])>=2, d"
+
+check "board post without auth returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts -H 'Content-Type: application/json' -d '{\"talentId\":\"$TALENT_ID\",\"body\":\"nope\"}' | grep -q 401"
+check "board empty post returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$TALENT_ID\",\"body\":\"   \"}' | grep -q 400"
+curl -sf -X POST "$BASE/board/posts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"talentId\":\"$TALENT_ID\",\"body\":\"$BOARD_BODY @secondtalent — looking for a videographer in Miami!\",\"mentionedTalentIds\":[\"$TALENT2_ID\"]}" -o /tmp/ttt-body.json
+BOARD_POST_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['id'])")
+check "board text post with @mention creates (201, id + message)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['id'].startswith('brd_'), d"
+curl -sf "$BASE/board/posts?viewerTalentId=$TALENT2_ID" -o /tmp/ttt-body.json
+check "board list: post round-trips with author, mention + mentionsViewer" python3 - "$BOARD_POST_ID" <<'PY'
+import json, sys
+d = json.load(open('/tmp/ttt-body.json'))
+ps = [p for p in d["posts"] if p["id"] == sys.argv[1]]
+assert len(ps) == 1, d
+p = ps[0]
+assert p["authorName"] == "Testy Talent" and p["authorHandle"] == "testytalent", p
+assert p["mentions"] == [{"talentId": p["mentions"][0]["talentId"], "name": "Second Talent", "handle": "secondtalent"}], p
+assert p["mentionsViewer"] is True, p
+assert "BoardSelftestUnique" in p["body"], p
+print("listed post:", p["id"], "mentions:", p["mentions"])
+PY
+curl -sf "$BASE/talent/$TALENT2_ID/notifications" -H "Authorization: Bearer $TOKEN2" -o /tmp/ttt-body.json
+check "board mention delivers an in-app notification to the named talent" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert any('mentioned you on the Community Board' in n['title'] for n in d['notifications']), d"
+
+# photo post: 1x1 PNG (real bytes), then mime + size rejections
+PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+curl -sf -X POST "$BASE/board/posts" -H "Authorization: Bearer $TOKEN2" -H 'Content-Type: application/json' \
+  -d "{\"talentId\":\"$TALENT2_ID\",\"body\":\"Photo from my last job\",\"photo\":{\"dataBase64\":\"$PNG_B64\",\"mimeType\":\"image/png\"}}" -o /tmp/ttt-body.json
+BOARD_PHOTO_POST_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['id'])")
+check "board photo post creates with PNG bytes" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['id'].startswith('brd_'), d"
+curl -sf "$BASE/board/posts?viewerTalentId=$TALENT_ID" -o /tmp/ttt-body.json
+check "board photo post serves its bytes as image/png" bash -c "PHOTO_URL=\$(python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); print([p['photoUrl'] for p in d['posts'] if p['id']=='$BOARD_PHOTO_POST_ID'][0])\"); curl -sf -o /tmp/ttt-board-photo.bin -w '%{content_type}' \"http://127.0.0.1:$PORT\$PHOTO_URL\" | grep -q 'image/png' && python3 -c \"import base64; raw=open('/tmp/ttt-board-photo.bin','rb').read(); assert raw==base64.b64decode('$PNG_B64'), 'photo bytes differ'; print('photo bytes match:', len(raw))\""
+check "board photo with bad mime returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$TALENT_ID\",\"body\":\"gif?\",\"photo\":{\"dataBase64\":\"R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==\",\"mimeType\":\"image/gif\"}}' | grep -q 400"
+# 600KB of zeros as base64 (~800KB of JSON) exceeds the 128KB single-arg
+# limit, so the oversized-photo body is built in a file, not argv.
+python3 -c "import base64, json; json.dump({'talentId':'$TALENT_ID','body':'too big','photo':{'dataBase64':base64.b64encode(b'\\x00'*(600*1024)).decode(),'mimeType':'image/jpeg'}}, open('/tmp/ttt-big-photo.json','w'))"
+check "board photo over 500KB returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' --data @/tmp/ttt-big-photo.json | grep -q 400"
+
+# audio / carousel: honest refusal, creates nothing
+curl -sf -X POST "$BASE/board/media-posts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\"talentId\":\"$TALENT_ID\",\"kind\":\"audio\",\"body\":\"my song\"}" -o /tmp/ttt-body.json
+check "board audio post refused honestly (ok:false, coming soon)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is False and 'coming soon' in d['message'].lower(), d"
+curl -sf -X POST "$BASE/board/media-posts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\"talentId\":\"$TALENT_ID\",\"kind\":\"carousel\",\"body\":\"my set\"}" -o /tmp/ttt-body.json
+check "board carousel post refused honestly (ok:false, coming soon)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is False and 'coming soon' in d['message'].lower(), d"
+curl -sf "$BASE/board/posts" -o /tmp/ttt-body.json
+check "board refusals created no posts (still 2 posts)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['posts'])==2, d"
+
+# moderation: delete-other refused, delete-own works, report recorded
+check "board delete of another talent's post returns 403" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts/$BOARD_POST_ID/delete -H 'Authorization: Bearer $TOKEN2' -H 'Content-Type: application/json' -d '{\"talentId\":\"$TALENT2_ID\"}' | grep -q 403"
+curl -sf -X POST "$BASE/board/posts/$BOARD_POST_ID/report" -H "Authorization: Bearer $TOKEN2" -H 'Content-Type: application/json' -d "{\"reporterTalentId\":\"$TALENT2_ID\",\"reason\":\"selftest report — please review\"}" -o /tmp/ttt-body.json
+check "board report records for owner review (no automated action)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and 'owner will review' in d['message'], d"
+check "board owner remove without any token returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts/$BOARD_PHOTO_POST_ID/remove -H 'Content-Type: application/json' -d '{}' | grep -q 401"
+curl -sf -X POST "$BASE/owner/unlock" -H 'Content-Type: application/json' -d '{"passcode":"ownerpass1"}' -o /tmp/ttt-body.json
+OWNER_TOKEN2=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['ownerToken'])")
+curl -sf -X POST "$BASE/board/posts/$BOARD_PHOTO_POST_ID/remove" -H 'Content-Type: application/json' -d "{\"ownerToken\":\"$OWNER_TOKEN2\"}" -o /tmp/ttt-body.json
+check "board owner remove via body ownerToken removes the post" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and 'ledger' in d['message'], d"
+curl -sf "$BASE/board/posts" -o /tmp/ttt-body.json
+check "board removed post no longer lists" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert all(p['id']!='$BOARD_PHOTO_POST_ID' for p in d['posts']) and len(d['posts'])==1, d"
+curl -sf "$BASE/talent/$TALENT2_ID/notifications" -H "Authorization: Bearer $TOKEN2" -o /tmp/ttt-body.json
+check "board owner remove notifies the post author" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert any('was removed' in n['title'] for n in d['notifications']), d"
+curl -sf -X POST "$BASE/board/posts/$BOARD_POST_ID/delete" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\"talentId\":\"$TALENT_ID\"}" -o /tmp/ttt-body.json
+check "board delete of own post succeeds" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True, d"
+curl -sf "$BASE/board/posts" -o /tmp/ttt-body.json
+check "board deleted post no longer lists (0 posts)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['posts']==[], d"
+check "board report on a deleted post returns 404" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/board/posts/$BOARD_POST_ID/report -H 'Authorization: Bearer $TOKEN2' -H 'Content-Type: application/json' -d '{\"reporterTalentId\":\"$TALENT2_ID\",\"reason\":\"late\"}' | grep -q 404"
+
+# ledger: all five board event types present + chain valid
+curl -sf "$BASE/ledger?limit=500" -o /tmp/ttt-body.json
+check "board ledger entries present for all five board actions" python3 -c "
+import json
+d = json.load(open('/tmp/ttt-body.json'))
+types = [e['event_type'] for e in d['events']]
+for t in ['BOARD_POST_CREATED', 'BOARD_MENTION_DELIVERED', 'BOARD_POST_REPORTED', 'BOARD_POST_DELETED', 'BOARD_POST_REMOVED_BY_OWNER']:
+    assert t in types, (t, types)
+print('board events in ledger:', sorted(set(t for t in types if t.startswith('BOARD_'))))"
+curl -sf "$BASE/ledger/verify" -o /tmp/ttt-body.json
+check "board ledger chain still verifies after board actions" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['valid'] is True and d['first_bad_seq'] is None, d"
+check "mirror carries no board post body or photo bytes (events only)" bash -c "! grep -q 'BoardSelftestUnique' $MIRROR && ! grep -q 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg' $MIRROR && echo 'mirror has no board bodies/bytes'"
+
 # ----- WIPE-PROOF LEDGER MIRROR (a) append -> verify -----
 # The mirror file is written on every ledger append, one line per event,
 # each line carrying the full state snapshot + its own mirror hash chain.
