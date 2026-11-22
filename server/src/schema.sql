@@ -214,31 +214,68 @@ CREATE TABLE IF NOT EXISTS automation_settings (
   updated_at TEXT NOT NULL
 );
 
--- Social links (v11): a talent links THEIR OWN Instagram/Facebook.
--- begin = talent-attested claim (status PENDING), confirm = talent
--- confirms the link (status LINKED). bio_checked = the talent confirmed
--- their social bio carries the TOP TEA TALENTS link. There is no OAuth
--- integration yet — linking is talent-attested, preview only.
+-- Social links (v12–v14): a talent links THEIR OWN Instagram/Facebook.
+-- begin = talent states the account is theirs; the server issues a unique
+-- ownership code the talent places in their own bio. confirm = the talent
+-- signs (typed name must match the profile, same standard as the Likeness
+-- Release) and states the code is in their bio; signing does NOT authorize
+-- the account — it starts the live bio check. AUTHORIZED exists ONLY when
+-- verification_status = 'code_confirmed' (v13 hardening): no read path may
+-- report AUTHORIZED otherwise; inconsistent rows are demoted to pending.
+-- The live bio check is dispatched from the agency app (the standalone
+-- public site has no background-task dispatch): the agency reports the
+-- outcome through the admin bio-check route. The code itself is public by
+-- design (it goes in the talent's public bio), so it may appear in the
+-- mirror; it is never a password, token, or secret.
+-- pull_status (v14): browser auto-pull of Instagram photos. The pull is
+-- dispatched from the agency app; the standalone site records a request as
+-- 'unavailable' and says so honestly. Pulled snapshots arrive through the
+-- admin pull callback, only ever from the talent's own authorized account,
+-- and only photos the identity check calls a match are placed.
 CREATE TABLE IF NOT EXISTS social_links (
   id TEXT PRIMARY KEY,
   talent_id TEXT NOT NULL,
   platform TEXT NOT NULL,
   handle TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'PENDING',
+  profile_url TEXT,
+  status TEXT NOT NULL DEFAULT 'PENDING_VERIFICATION',
+  verification_status TEXT NOT NULL DEFAULT 'code_issued',
+  ownership_code TEXT,
+  signature_name TEXT,
+  signed_at TEXT,
+  check_detail TEXT,
+  checked_at TEXT,
+  pull_status TEXT NOT NULL DEFAULT '',
+  pull_detail TEXT,
+  pulled_at TEXT,
+  pull_rejected_count INTEGER NOT NULL DEFAULT 0,
   bio_checked INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_social_talent ON social_links(talent_id);
 
--- Extended portfolio preview (v11): a few photos from the talent's
--- linked social accounts, shown alongside the 8-photo portfolio.
--- URL-only references (no bytes stored); talent chooses what shows.
+-- Extended portfolio preview (v12–v14): a few photos from the talent's
+-- OWN linked social accounts, shown alongside the 8-photo portfolio.
+-- v12: the talent uploads the photo bytes AND pastes the link to the
+-- original post on their own AUTHORIZED account, so every preview photo is
+-- traceable to the talent's own post. v14: browser-pulled snapshots carry
+-- source='browser_pull' + selection + identity verdict; only verdict 'match'
+-- photos are ever placed. Bytes live in data_base64 (same pattern as the
+-- 8-photo portfolio); legacy v11 URL-only rows keep photo_url.
 CREATE TABLE IF NOT EXISTS social_photos (
   id TEXT PRIMARY KEY,
   talent_id TEXT NOT NULL,
   platform TEXT NOT NULL,
-  photo_url TEXT NOT NULL,
+  photo_url TEXT,
+  mime TEXT,
+  data_base64 TEXT,
+  source_post_url TEXT,
+  source TEXT NOT NULL DEFAULT 'upload',
+  selection TEXT,
+  identity_verdict TEXT,
+  identity_note TEXT,
+  likes_label TEXT,
   caption TEXT,
   created_at TEXT NOT NULL
 );

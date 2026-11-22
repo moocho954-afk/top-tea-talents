@@ -315,6 +315,42 @@ async function loadSeed(): Promise<{ inserted: number; skipped: number; intelIns
 
 const SCHEMA = await Bun.file(import.meta.dir + "/schema.sql").text();
 await db.exec(SCHEMA);
+// v12–v14: bring pre-existing social tables up to the new columns.
+// Idempotent: duplicate-column errors are caught and ignored, so this is
+// safe on fresh DBs (CREATE TABLE already has the columns) and on live DBs
+// built by v11. Then v13 rule 3 (migration): any record left LINKED or
+// AUTHORIZED without a confirmed code is corrected to pending — never
+// left authorized. Legacy PENDING rows become PENDING_VERIFICATION.
+await migrateSocialV12();
+async function migrateSocialV12(): Promise<void> {
+  const adds: [string, string][] = [
+    ["social_links", "profile_url TEXT"],
+    ["social_links", "verification_status TEXT NOT NULL DEFAULT 'code_issued'"],
+    ["social_links", "ownership_code TEXT"],
+    ["social_links", "signature_name TEXT"],
+    ["social_links", "signed_at TEXT"],
+    ["social_links", "check_detail TEXT"],
+    ["social_links", "checked_at TEXT"],
+    ["social_links", "pull_status TEXT NOT NULL DEFAULT ''"],
+    ["social_links", "pull_detail TEXT"],
+    ["social_links", "pulled_at TEXT"],
+    ["social_links", "pull_rejected_count INTEGER NOT NULL DEFAULT 0"],
+    ["social_photos", "mime TEXT"],
+    ["social_photos", "data_base64 TEXT"],
+    ["social_photos", "source_post_url TEXT"],
+    ["social_photos", "source TEXT NOT NULL DEFAULT 'upload'"],
+    ["social_photos", "selection TEXT"],
+    ["social_photos", "identity_verdict TEXT"],
+    ["social_photos", "identity_note TEXT"],
+    ["social_photos", "likes_label TEXT"],
+  ];
+  for (const [table, col] of adds) {
+    await db.run(`ALTER TABLE ${table} ADD COLUMN ${col}`).catch(() => {});
+  }
+  const ts = nowIso();
+  await db.run("UPDATE social_links SET status = 'PENDING_VERIFICATION', verification_status = '', bio_checked = 0, updated_at = ? WHERE status IN ('LINKED', 'AUTHORIZED') AND COALESCE(verification_status, '') <> 'code_confirmed'", [ts]).catch(() => {});
+  await db.run("UPDATE social_links SET status = 'PENDING_VERIFICATION', verification_status = '', updated_at = ? WHERE status = 'PENDING'", [ts]).catch(() => {});
+}
 // Wipe-proof boot-restore: if the local DB is empty (wiped) and a ledger
 // mirror exists, replay the mirror into the fresh DB BEFORE the seed check
 // runs, so staff-added state comes back first and the seed only fills what
@@ -510,6 +546,64 @@ async function agencyEarnings(): Promise<any> {
   return { totalGrossCents: totalGross, totalCommissionCents: totalFee, totalNetCents: totalNet, bookingCount: rows.length, byAgency: [...byAgency.values()], bookings };
 }
 
+// ---------- v12–v14: social link / photo helpers (module scope —
+// publicTalentView and the talent routes both use them) ----------
+function genOwnershipCode(): string {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (let i = 0; i < 6; i++) s += chars[randomInt(chars.length)];
+  return "TTT-" + s;
+}
+function signatureMatchesProfile(sig: string, profile: any): boolean {
+  const legal = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim().toLowerCase();
+  const prof = String(profile.professionalName || "").trim().toLowerCase();
+  const s = String(sig || "").trim().toLowerCase();
+  return s !== "" && (s === legal || s === prof);
+}
+function socialLinkView(r: any): any {
+  const confirmed = r.verification_status === "code_confirmed";
+  const authorized = r.status === "AUTHORIZED" && confirmed;
+  return {
+    id: r.id, platform: r.platform, handle: r.handle, profileUrl: r.profile_url || null,
+    status: authorized ? "AUTHORIZED" : "PENDING_VERIFICATION",
+    verificationStatus: r.verification_status || "",
+    ownershipCode: r.ownership_code || null,
+    bioChecked: confirmed,
+    signatureName: r.signature_name || null, signedAt: r.signed_at || null,
+    checkDetail: r.check_detail || null, checkedAt: r.checked_at || null,
+    pullStatus: r.pull_status || "", pullDetail: r.pull_detail || null, pulledAt: r.pulled_at || null,
+    pullRejectedCount: Number(r.pull_rejected_count ?? 0),
+    createdAt: r.created_at,
+  };
+}
+function socialPhotoView(r: any): any {
+  const stored = !!r.data_base64;
+  return {
+    id: r.id, platform: r.platform,
+    photoUrl: stored ? `/api/v1/social-photos/${r.id}` : (r.photo_url || null),
+    publicPhotoUrl: stored ? `/api/v1/public/social-photos/${r.id}` : (r.photo_url || null),
+    sourcePostUrl: r.source_post_url || null,
+    source: r.source || "upload",
+    selection: r.selection || null,
+    identityVerdict: r.identity_verdict || null,
+    identityNote: r.identity_note || null,
+    likesLabel: r.likes_label || null,
+    caption: r.caption || null, createdAt: r.created_at,
+  };
+}
+async function demoteInconsistentSocialLinks(talentId: string): Promise<void> {
+  // v13 rule 2+3 (read path): never report AUTHORIZED when the code was
+  // not confirmed — demote such records to pending, persist the
+  // correction, and record the honest reason.
+  const bad = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND status = 'AUTHORIZED' AND COALESCE(verification_status, '') <> 'code_confirmed'", [talentId]);
+  for (const r of bad) {
+    const ts = nowIso();
+    await db.run("UPDATE social_links SET status = 'PENDING_VERIFICATION', bio_checked = 0, updated_at = ? WHERE id = ?", [ts, r.id]);
+    const fixed = { ...r, status: "PENDING_VERIFICATION", bio_checked: 0, updated_at: ts };
+    await audit("talent.social-link.demoted", "talent", talentId, "system", { linkId: r.id, platform: r.platform, reason: "AUTHORIZED without a confirmed bio code — demoted to pending (v13 hardening)" }, { socialLink: fixed });
+  }
+}
+
 // ---------- v11: public per-talent portfolio ----------
 // Casting-safe fields ONLY. Never: email, phone, demographics, zip/exact
 // address, password/session data, fees/earnings, guardian, fast-track,
@@ -525,8 +619,13 @@ async function publicTalentView(id: string): Promise<any | null> {
   const sharePhotos = p.sharePhotos === true;
   const credits = (await talentCredits(id)).credits;
   const photos = sharePhotos ? await photoList(id) : [];
-  const socials = await db.all("SELECT platform, handle, bio_checked FROM social_links WHERE talent_id = ? AND status = 'LINKED'", [id]);
-  const socialPhotos = sharePhotos ? await db.all("SELECT id, platform, photo_url, caption FROM social_photos WHERE talent_id = ?", [id]) : [];
+  // v13: the public page shows a social link ONLY when its bio code was
+  // confirmed (AUTHORIZED + code_confirmed), and preview photos ONLY from
+  // authorized platforms — a pending or unverified account never appears.
+  const socials = await db.all("SELECT platform, handle FROM social_links WHERE talent_id = ? AND status = 'AUTHORIZED' AND verification_status = 'code_confirmed'", [id]);
+  const authorizedPlatforms = new Set(socials.map((s: any) => s.platform));
+  const allSocialPhotos = sharePhotos ? await db.all("SELECT * FROM social_photos WHERE talent_id = ?", [id]) : [];
+  const socialPhotos = allSocialPhotos.filter((s: any) => authorizedPlatforms.has(s.platform));
   return {
     id,
     professionalName: p.professionalName || null,
@@ -539,8 +638,8 @@ async function publicTalentView(id: string): Promise<any | null> {
     photoCount: await photoCount(id),
     photos: photos.map((ph: any) => ({ id: ph.id, slot: ph.slot, label: ph.label, caption: ph.caption, url: `/api/v1/public/photos/${ph.id}` })),
     credits,
-    socialLinks: socials.map((s: any) => ({ platform: s.platform, handle: s.handle, bioChecked: Number(s.bio_checked) === 1 })),
-    socialPhotos: socialPhotos.map((s: any) => ({ id: s.id, platform: s.platform, photoUrl: s.photo_url, caption: s.caption })),
+    socialLinks: socials.map((s: any) => ({ platform: s.platform, handle: s.handle, bioChecked: true })),
+    socialPhotos: socialPhotos.map((s: any) => socialPhotoView(s)),
   };
 }
 
@@ -784,6 +883,81 @@ async function handle(req: Request): Promise<Response> {
     if (!t || (t.profile.visibility || "private") !== "public" || t.profile.sharePhotos !== true) return err(404, "photo not found");
     const buf = Buffer.from(String(rows[0].data_base64), "base64");
     return new Response(buf, { headers: { "Content-Type": String(rows[0].mime), "Access-Control-Allow-Origin": "*" } });
+  }
+
+  // ----- v14: social photo-pull callback (admin) -----
+  // Standalone adaptation of the artifact's marksocialphotopull: the pull
+  // itself is dispatched from the agency app, so its report arrives here
+  // from the agency (admin token) instead of a one-time dispatch token.
+  // Outcomes 'private' / 'login_wall' / 'unreadable' / 'no_reference'
+  // place NOTHING and record the honest reason. On 'pulled', only photos
+  // the identity check calls a match are placed (max 4); the rest are
+  // counted as rejected, never shown.
+  if (method === "POST" && rest.join("/") === "social-photo-pull-callback") {
+    const adm = requireAdmin(req); if (adm) return adm;
+    const b = await body(req);
+    if (!b) return err(400, "invalid JSON");
+    const talentIdCb = String(b.talentId || b.talent_id || "");
+    const platform = String(b.platform || "").toLowerCase();
+    if (!talentIdCb) return err(400, "talentId is required");
+    if (platform !== "instagram" && platform !== "facebook") return err(400, 'platform must be "instagram" or "facebook"');
+    const outcome = String(b.outcome || "");
+    if (outcome !== "pulled" && outcome !== "private" && outcome !== "login_wall" && outcome !== "unreadable" && outcome !== "no_reference") return err(400, 'outcome must be "pulled", "private", "login_wall", "unreadable", or "no_reference"');
+    const links = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND platform = ?", [talentIdCb, platform]);
+    if (!links.length) return err(404, "social link not found");
+    const link = links[0];
+    if (link.status !== "AUTHORIZED" || link.verification_status !== "code_confirmed") return err(400, "the account must be AUTHORIZED before pulled photos can be placed");
+    const detail = b.detail ? String(b.detail).slice(0, 800) : null;
+    const ts = nowIso();
+    if (outcome !== "pulled") {
+      await db.run("UPDATE social_links SET pull_status = ?, pull_detail = ?, pulled_at = ?, updated_at = ? WHERE id = ?", [outcome, detail, ts, ts, link.id]);
+      await audit("talent.social-photo-pull.report", "talent", talentIdCb, "admin", { linkId: link.id, platform, outcome, note: "Auto-pull placed nothing; the honest reason is recorded." }, { socialLink: { ...link, pull_status: outcome, pull_detail: detail, pulled_at: ts } });
+      return ok({ placed: 0, rejected: 0, pullStatus: outcome });
+    }
+    const photos = Array.isArray(b.photos) ? b.photos.slice(0, 4) : [];
+    let placed = 0, rejected = 0;
+    for (const ph of photos) {
+      const verdict = String(ph.identity_verdict || ph.identityVerdict || "");
+      const src = String(ph.source_post_url || ph.sourcePostUrl || "").trim();
+      const rawB64 = String(ph.data_base64 || ph.dataBase64 || "");
+      const mime = String(ph.mime_type || ph.mimeType || "").toLowerCase();
+      if (verdict !== "match" || !/^https?:\/\/.+/.test(src) || src.length < 10 || !/^[A-Za-z0-9+/=]+$/.test(rawB64) || (mime !== "image/jpeg" && mime !== "image/png" && mime !== "image/webp")) { rejected++; continue; }
+      const pbuf = Buffer.from(rawB64, "base64");
+      if (pbuf.length > 500 * 1024) { rejected++; continue; }
+      const selection = ph.selection === "most_popular" ? "most_popular" : "first_three";
+      const pid = genId("sph");
+      await db.run("INSERT INTO social_photos (id, talent_id, platform, photo_url, mime, data_base64, source_post_url, source, selection, identity_verdict, identity_note, likes_label, caption, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, 'browser_pull', ?, ?, ?, ?, ?, ?)",
+        [pid, talentIdCb, platform, mime, rawB64, src, selection, verdict, ph.identity_note || ph.identityNote ? String(ph.identity_note || ph.identityNote).slice(0, 400) : null, ph.likes_label || ph.likesLabel ? String(ph.likes_label || ph.likesLabel).slice(0, 60) : null, ph.caption ? String(ph.caption).slice(0, 400) : null, ts]);
+      placed++;
+    }
+    rejected += Math.max(0, (Array.isArray(b.photos) ? b.photos.length : 0) - photos.length);
+    rejected += Number(b.rejectedCount ?? b.rejected_count ?? 0) || 0;
+    await db.run("UPDATE social_links SET pull_status = 'pulled', pull_detail = ?, pulled_at = ?, pull_rejected_count = ?, updated_at = ? WHERE id = ?", [detail, ts, rejected, ts, link.id]);
+    await audit("talent.social-photo-pull.report", "talent", talentIdCb, "admin", { linkId: link.id, platform, outcome: "pulled", placed, rejected, note: "Only identity-matched photos were placed; the rest were rejected, never shown." }, { socialLink: { ...link, pull_status: "pulled", pull_detail: detail, pulled_at: ts, pull_rejected_count: rejected } });
+    return ok({ placed, rejected, pullStatus: "pulled" });
+  }
+
+  // ----- v12–v14: social preview photos by id (bytes) -----
+  if (rest[0] === "social-photos" && rest.length === 2 && method === "GET") {
+    const rows = await db.all("SELECT * FROM social_photos WHERE id = ?", [rest[1]]);
+    if (!rows.length || !rows[0].data_base64) return err(404, "photo not found");
+    const ph = rows[0];
+    const chk = await requireTalentOrAdmin(req, String(ph.talent_id)); if (!chk.ok) return chk.res!;
+    const sbuf = Buffer.from(String(ph.data_base64), "base64");
+    return new Response(sbuf, { headers: { "Content-Type": String(ph.mime || "image/jpeg"), "Access-Control-Allow-Origin": "*" } });
+  }
+  if (rest[0] === "public" && rest[1] === "social-photos" && rest.length === 3 && method === "GET") {
+    // Serves a social preview photo ONLY when that talent's portfolio is
+    // public, sharePhotos is on, AND the photo's platform is AUTHORIZED.
+    const rows = await db.all("SELECT * FROM social_photos WHERE id = ?", [rest[2]]);
+    if (!rows.length || !rows[0].data_base64) return err(404, "photo not found");
+    const ph = rows[0];
+    const t = await loadTalent(String(ph.talent_id));
+    if (!t || (t.profile.visibility || "private") !== "public" || t.profile.sharePhotos !== true) return err(404, "photo not found");
+    const links = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND platform = ? AND status = 'AUTHORIZED' AND verification_status = 'code_confirmed'", [String(ph.talent_id), ph.platform]);
+    if (!links.length) return err(404, "photo not found");
+    const sbuf = Buffer.from(String(ph.data_base64), "base64");
+    return new Response(sbuf, { headers: { "Content-Type": String(ph.mime || "image/jpeg"), "Access-Control-Allow-Origin": "*" } });
   }
 
   // ----- sources -----
@@ -1285,32 +1459,62 @@ async function handle(req: Request): Promise<Response> {
         note: "Share this link — it opens THIS person's profile and portfolio, never the front page. Private by default; shared only with the talent's permission.",
       });
     }
-    // ----- v11: social links (Instagram / Facebook, talent-attested) -----
+    // ---------- v12–v14: social links + extended portfolio ----------
+    // v12: per-talent Instagram/Facebook linking with an ownership code
+    // the talent places in their own bio + a typed signature (same name
+    // standard as the Likeness Release). v13: AUTHORIZED exists ONLY when
+    // the live bio check confirmed the code (verification_status =
+    // 'code_confirmed') — confirming/signing never authorizes by itself.
+    // v14: browser auto-pull of Instagram photos with face-match; the
+    // pull is dispatched from the agency app, so the standalone site
+    // records a pull request as 'unavailable' and says so honestly.
+    // Helpers are function declarations (hoisted): socialLinkView,
+    // socialPhotoView, demoteInconsistentSocialLinks, genOwnershipCode,
+    // signatureMatchesProfile are defined below the routes.
     if (rest.length === 3 && rest[2] === "social-links") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       if (method === "GET") {
+        await demoteInconsistentSocialLinks(talentId);
         const rows = await db.all("SELECT * FROM social_links WHERE talent_id = ? ORDER BY created_at", [talentId]);
         const photos = await db.all("SELECT * FROM social_photos WHERE talent_id = ? ORDER BY created_at", [talentId]);
         return ok({
-          socialLinks: rows.map((r: any) => ({ id: r.id, platform: r.platform, handle: r.handle, status: r.status, bioChecked: Number(r.bio_checked) === 1, createdAt: r.created_at })),
-          socialPhotos: photos.map((r: any) => ({ id: r.id, platform: r.platform, photoUrl: r.photo_url, caption: r.caption, createdAt: r.created_at })),
-          note: "Linking is talent-attested: you connect YOUR OWN Instagram/Facebook. There is no OAuth integration yet — the preview only ever shows what you connected and approved.",
+          socialLinks: rows.map(socialLinkView),
+          socialPhotos: photos.map(socialPhotoView),
+          photoPullNote: "Instagram auto-pull runs from the agency app — this public site cannot dispatch a browser visit, so a pull request here is recorded as unavailable and nothing is faked. Your own uploads below work now.",
+          note: "Link YOUR OWN Instagram/Facebook. Put the ownership code in your bio, sign to confirm it is there, and the agency runs the live bio check — only a confirmed code authorizes the account.",
         });
       }
       if (method === "POST") {
+        // begin (v12): issue (or re-issue) the ownership code.
         const b = await body(req);
         if (!b) return err(400, "invalid JSON");
         const platform = String(b.platform || "").toLowerCase();
         if (platform !== "instagram" && platform !== "facebook") return err(400, 'platform must be "instagram" or "facebook"');
         const handle = String(b.handle || "").trim();
         if (!handle) return err(400, "handle is required");
-        const id = genId("soc");
+        if (b.ownAccountConfirmed !== true) return err(400, "confirm this is your own account");
+        const profileUrl = b.profileUrl ? String(b.profileUrl).trim() : null;
+        if (profileUrl && !/^https?:\/\/.+/.test(profileUrl)) return err(400, "profileUrl must be an http(s) URL");
+        const existing = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND platform = ?", [talentId, platform]);
+        const code = genOwnershipCode();
         const ts = nowIso();
-        await db.run("INSERT INTO social_links (id, talent_id, platform, handle, status, bio_checked, created_at, updated_at) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)",
-          [id, talentId, platform, handle, ts, ts]);
-        const row = { id, talent_id: talentId, platform, handle, status: "PENDING", bio_checked: 0, created_at: ts, updated_at: ts };
-        await audit("talent.social-link.begin", "talent", talentId, talentId, { platform, handle, status: "PENDING", note: "Talent-attested link claim; no OAuth verification yet." }, { socialLink: row });
-        return json({ ok: true, socialLink: { id, platform, handle, status: "PENDING", bioChecked: false }, next: "Confirm the link on the Social page to make it live in your extended portfolio." }, 201);
+        if (existing.length) {
+          const cur = existing[0];
+          if (cur.status === "AUTHORIZED" && cur.verification_status === "code_confirmed") {
+            return err(400, `your ${platform} account is already authorized — unlink it first to link a different account`);
+          }
+          await db.run("UPDATE social_links SET handle = ?, profile_url = ?, status = 'PENDING_VERIFICATION', verification_status = 'code_issued', ownership_code = ?, signature_name = NULL, signed_at = NULL, check_detail = NULL, checked_at = NULL, updated_at = ? WHERE id = ?",
+            [handle, profileUrl, code, ts, cur.id]);
+          const row = { ...cur, handle, profile_url: profileUrl, status: "PENDING_VERIFICATION", verification_status: "code_issued", ownership_code: code, signature_name: null, signed_at: null, check_detail: null, checked_at: null, updated_at: ts };
+          await audit("talent.social-link.begin", "talent", talentId, talentId, { platform, handle, status: "PENDING_VERIFICATION", note: "Ownership code re-issued; put it in your bio." }, { socialLink: row });
+          return json({ ok: true, socialLink: socialLinkView(row), next: `Put the code ${code} in your ${platform} bio, then sign on the Social page.` }, 201);
+        }
+        const id = genId("soc");
+        await db.run("INSERT INTO social_links (id, talent_id, platform, handle, profile_url, status, verification_status, ownership_code, bio_checked, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'PENDING_VERIFICATION', 'code_issued', ?, 0, ?, ?)",
+          [id, talentId, platform, handle, profileUrl, code, ts, ts]);
+        const row = { id, talent_id: talentId, platform, handle, profile_url: profileUrl, status: "PENDING_VERIFICATION", verification_status: "code_issued", ownership_code: code, bio_checked: 0, created_at: ts, updated_at: ts };
+        await audit("talent.social-link.begin", "talent", talentId, talentId, { platform, handle, status: "PENDING_VERIFICATION", note: "Ownership code issued; put it in your bio." }, { socialLink: row });
+        return json({ ok: true, socialLink: socialLinkView(row), next: `Put the code ${code} in your ${platform} bio, then sign on the Social page.` }, 201);
       }
       return err(404, "not found");
     }
@@ -1323,50 +1527,129 @@ async function handle(req: Request): Promise<Response> {
       if (!b) return err(400, "invalid JSON");
       const action = String(b.action || "");
       const ts = nowIso();
+      const link = rows[0];
+      const isAuthorized = link.status === "AUTHORIZED" && link.verification_status === "code_confirmed";
       if (action === "confirm") {
-        await db.run("UPDATE social_links SET status = 'LINKED', updated_at = ? WHERE id = ?", [ts, linkId]);
-        const row = { ...rows[0], status: "LINKED", updated_at: ts };
-        await audit("talent.social-link.confirm", "talent", talentId, talentId, { linkId, platform: rows[0].platform, status: "LINKED" }, { socialLink: row });
-        return ok({ socialLink: { id: linkId, platform: rows[0].platform, handle: rows[0].handle, status: "LINKED", bioChecked: Number(rows[0].bio_checked) === 1 } });
+        // v12 step 2 + v13: signing NEVER authorizes by itself. It
+        // records the signature and starts the live bio check
+        // (check_pending); only the bio-check outcome can authorize.
+        if (isAuthorized) return err(400, "this account is already authorized");
+        if (b.agreed !== true) return err(400, "agreed must be true");
+        if (b.codeInBioConfirmed !== true) return err(400, "confirm the ownership code is in your bio");
+        const t = await loadTalent(talentId);
+        if (!t) return err(404, "talent not found");
+        const sig = String(b.signatureName || "").trim();
+        if (!sig) return err(400, "signature is required");
+        if (!signatureMatchesProfile(sig, t.profile)) return err(400, "signature must match your legal name or professional name");
+        await db.run("UPDATE social_links SET signature_name = ?, signed_at = ?, verification_status = 'check_pending', updated_at = ? WHERE id = ?", [sig, ts, ts, linkId]);
+        const row = { ...link, signature_name: sig, signed_at: ts, verification_status: "check_pending", updated_at: ts };
+        await audit("talent.social-link.confirm", "talent", talentId, talentId, { linkId, platform: link.platform, status: "PENDING_VERIFICATION", verificationStatus: "check_pending", note: "Signed; live bio check pending. Signing does not authorize the account." }, { socialLink: row });
+        return ok({ socialLink: socialLinkView(row), next: "Signed. The agency runs the live bio check against your public bio — your account authorizes only when the code is found there." });
       }
-      if (action === "bio-checked") {
-        const checked = b.checked === true;
-        await db.run("UPDATE social_links SET bio_checked = ?, updated_at = ? WHERE id = ?", [checked ? 1 : 0, ts, linkId]);
-        const row = { ...rows[0], bio_checked: checked ? 1 : 0, updated_at: ts };
-        await audit("talent.social-link.bio-checked", "talent", talentId, talentId, { linkId, platform: rows[0].platform, bioChecked: checked }, { socialLink: row });
-        return ok({ socialLink: { id: linkId, platform: rows[0].platform, handle: rows[0].handle, status: rows[0].status, bioChecked: checked } });
+      if (action === "resend-bio-check") {
+        if (isAuthorized) return err(400, "this account is already authorized");
+        if (!link.signature_name) return err(400, "sign the authorization first — the bio check needs your signature on file");
+        await db.run("UPDATE social_links SET verification_status = 'check_pending', check_detail = NULL, updated_at = ? WHERE id = ?", [ts, linkId]);
+        const row = { ...link, verification_status: "check_pending", check_detail: null, updated_at: ts };
+        await audit("talent.social-link.bio-check-resend", "talent", talentId, talentId, { linkId, platform: link.platform, verificationStatus: "check_pending", note: "Bio check re-requested; the agency re-runs the live check." }, { socialLink: row });
+        return ok({ socialLink: socialLinkView(row), next: "Bio check re-requested — the agency re-runs the live check against your public bio." });
       }
-      return err(400, 'action must be "confirm" or "bio-checked"');
+      if (action === "bio-check") {
+        // Standalone adaptation of the artifact's marksocialbiochecked
+        // callback: the live check is dispatched from the agency app, so
+        // the outcome is reported by the agency (admin token) instead of
+        // a one-time dispatch token — same precedent as
+        // auth/mark-email-verification-dispatched. A wrong admin token is
+        // refused (401); a talent token can never call this.
+        const adm = requireAdmin(req); if (adm) return adm;
+        const outcome = String(b.outcome || "");
+        if (outcome !== "found" && outcome !== "not_found" && outcome !== "unreadable") return err(400, 'outcome must be "found", "not_found", or "unreadable"');
+        const detail = b.detail ? String(b.detail).slice(0, 500) : null;
+        if (outcome === "found") {
+          await db.run("UPDATE social_links SET verification_status = 'code_confirmed', status = 'AUTHORIZED', bio_checked = 1, check_detail = ?, checked_at = ?, updated_at = ? WHERE id = ?", [detail, ts, ts, linkId]);
+          const row = { ...link, verification_status: "code_confirmed", status: "AUTHORIZED", bio_checked: 1, check_detail: detail, checked_at: ts, updated_at: ts };
+          await audit("talent.social-link.bio-checked", "talent", talentId, "admin", { linkId, platform: link.platform, outcome, status: "AUTHORIZED", note: "Live bio check found the ownership code in the talent's public bio." }, { socialLink: row });
+          return ok({ socialLink: socialLinkView(row) });
+        }
+        const vs = outcome === "not_found" ? "code_not_found" : "check_unreadable";
+        await db.run("UPDATE social_links SET verification_status = ?, check_detail = ?, checked_at = ?, updated_at = ? WHERE id = ?", [vs, detail, ts, ts, linkId]);
+        const row = { ...link, verification_status: vs, check_detail: detail, checked_at: ts, updated_at: ts };
+        await audit("talent.social-link.bio-checked", "talent", talentId, "admin", { linkId, platform: link.platform, outcome, status: "PENDING_VERIFICATION", note: outcome === "not_found" ? "Live bio check did not find the code in the bio." : "Live bio check could not read the profile." }, { socialLink: row });
+        return ok({ socialLink: socialLinkView(row), next: outcome === "not_found" ? "The code was not found in your bio — check it is there, then re-run the bio check." : "Your profile could not be read (private or login-walled) — make it public, then re-run the bio check." });
+      }
+      if (action === "request-photo-pull") {
+        // v14: the browser auto-pull is dispatched from the agency app.
+        // This standalone site has no background-task dispatch, so the
+        // request is recorded as unavailable — honestly, never faked.
+        if (!isAuthorized) return err(400, "authorize this account first — the bio check must confirm your code");
+        if (link.platform !== "instagram") return err(400, "auto-pull is Instagram-only in this build");
+        const pullNote = "The standalone public site cannot dispatch a browser visit, so no auto-pull ran. The pull runs from the agency app; your own uploads still work.";
+        await db.run("UPDATE social_links SET pull_status = 'unavailable', pull_detail = ?, updated_at = ? WHERE id = ?", [pullNote, ts, linkId]);
+        const row = { ...link, pull_status: "unavailable", pull_detail: pullNote, updated_at: ts };
+        await audit("talent.social-photo-pull.unavailable", "talent", talentId, talentId, { linkId, platform: link.platform, pullStatus: "unavailable", note: "No browser dispatch in the standalone build; pull not run, nothing faked." }, { socialLink: row });
+        return ok({ requested: false, pullStatus: "unavailable", socialLink: socialLinkView(row), reason: "Instagram auto-pull runs from the agency app — this public site cannot dispatch a browser visit, so no pull ran. Add your photos with the upload form below; they show the same way." });
+      }
+      return err(400, 'action must be "confirm", "resend-bio-check", "bio-check", or "request-photo-pull"');
     }
-    if (rest.length === 4 && rest[2] === "social-links" && rest[3] && method === "DELETE") {
+    if (rest.length === 4 && rest[2] === "social-links" && method === "DELETE") {
+      // v12 unlink: by platform — the link closes AND every preview photo
+      // from that platform is removed at once.
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
-      const linkId = rest[3];
-      const rows = await db.all("SELECT * FROM social_links WHERE id = ? AND talent_id = ?", [linkId, talentId]);
+      const platform = String(rest[3] || "").toLowerCase();
+      if (platform !== "instagram" && platform !== "facebook") return err(400, 'unlink by platform: "instagram" or "facebook"');
+      const rows = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND platform = ?", [talentId, platform]);
       if (!rows.length) return err(404, "social link not found");
-      await db.run("DELETE FROM social_links WHERE id = ?", [linkId]);
-      await audit("talent.social-link.unlink", "talent", talentId, talentId, { linkId, platform: rows[0].platform }, { deleted: true, socialLinkId: linkId });
-      return ok({ deleted: true, socialLinkId: linkId });
+      const photos = await db.all("SELECT id FROM social_photos WHERE talent_id = ? AND platform = ?", [talentId, platform]);
+      await db.run("DELETE FROM social_photos WHERE talent_id = ? AND platform = ?", [talentId, platform]);
+      await db.run("DELETE FROM social_links WHERE talent_id = ? AND platform = ?", [talentId, platform]);
+      await audit("talent.social-link.unlink", "talent", talentId, talentId, { linkId: rows[0].id, platform, photosRemoved: photos.length, note: "Unlinked; all of that platform's preview photos removed at once." }, { deleted: true, socialLinkId: rows[0].id, photosRemoved: photos.length });
+      return ok({ deleted: true, socialLinkId: rows[0].id, photosRemoved: photos.length });
     }
     if (rest.length === 3 && rest[2] === "social-photos") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       if (method === "GET") {
         const photos = await db.all("SELECT * FROM social_photos WHERE talent_id = ? ORDER BY created_at", [talentId]);
-        return ok({ socialPhotos: photos.map((r: any) => ({ id: r.id, platform: r.platform, photoUrl: r.photo_url, caption: r.caption, createdAt: r.created_at })) });
+        return ok({ socialPhotos: photos.map(socialPhotoView) });
       }
       if (method === "POST") {
+        // v12 addsocialphoto: the talent uploads the photo bytes AND
+        // pastes the link to the original post on their own AUTHORIZED
+        // account, so every preview photo is traceable to the talent's
+        // own post. Bytes are stored like the 8-photo portfolio (500KB
+        // cap); the mirror state below carries metadata only, never bytes.
         const b = await body(req);
         if (!b) return err(400, "invalid JSON");
         const platform = String(b.platform || "").toLowerCase();
         if (platform !== "instagram" && platform !== "facebook") return err(400, 'platform must be "instagram" or "facebook"');
-        const photoUrl = String(b.photoUrl || "").trim();
-        if (!/^https?:\/\/.+/.test(photoUrl)) return err(400, "photoUrl must be an http(s) URL to one of your own social photos");
+        const links = await db.all("SELECT * FROM social_links WHERE talent_id = ? AND platform = ? AND status = 'AUTHORIZED' AND verification_status = 'code_confirmed'", [talentId, platform]);
+        if (!links.length) return err(400, `authorize your ${platform} account first — the bio check must confirm your ownership code before preview photos can come from it`);
+        const sourcePostUrl = String(b.sourcePostUrl || "").trim();
+        if (!/^https?:\/\/.+/.test(sourcePostUrl) || sourcePostUrl.length < 10) return err(400, "sourcePostUrl must be the http(s) link to the original post on your own authorized account");
+        let mime = "", b64 = "";
+        const raw = String(b.dataBase64 || "").trim();
+        const dataUrl = String(b.dataUrl || "").trim();
+        if (dataUrl) {
+          const dm = dataUrl.match(/^data:(image\/(jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
+          if (!dm) return err(400, "dataUrl must be data:image/jpeg|png|webp;base64,...");
+          mime = dm[1]; b64 = dm[3];
+        } else if (raw) {
+          mime = String(b.mimeType || "").toLowerCase();
+          if (mime !== "image/jpeg" && mime !== "image/png" && mime !== "image/webp") return err(400, "mimeType must be image/jpeg, image/png, or image/webp");
+          if (!/^[A-Za-z0-9+/=]+$/.test(raw)) return err(400, "dataBase64 must be base64 image data");
+          b64 = raw;
+        } else {
+          return err(400, "dataBase64 (or dataUrl) with the photo bytes is required");
+        }
+        const buf = Buffer.from(b64, "base64");
+        if (buf.length > 500 * 1024) return err(400, `photo decoded size ${buf.length} bytes exceeds the 500KB limit — downscale the image first and retry`);
+        const caption = b.caption ? String(b.caption).slice(0, 200) : null;
         const id = genId("sph");
         const ts = nowIso();
-        await db.run("INSERT INTO social_photos (id, talent_id, platform, photo_url, caption, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-          [id, talentId, platform, photoUrl, b.caption ? String(b.caption) : null, ts]);
-        const row = { id, talent_id: talentId, platform, photo_url: photoUrl, caption: b.caption ? String(b.caption) : null, created_at: ts };
-        await audit("talent.social-photo.add", "talent", talentId, talentId, { photoId: id, platform }, { socialPhoto: row });
-        return json({ ok: true, socialPhoto: { id, platform, photoUrl, caption: row.caption } }, 201);
+        await db.run("INSERT INTO social_photos (id, talent_id, platform, photo_url, mime, data_base64, source_post_url, source, caption, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, 'upload', ?, ?)",
+          [id, talentId, platform, mime, b64, sourcePostUrl, caption, ts]);
+        const row = { id, talent_id: talentId, platform, photo_url: null, mime, data_base64: b64, source_post_url: sourcePostUrl, source: "upload", selection: null, identity_verdict: null, identity_note: null, likes_label: null, caption, created_at: ts };
+        await audit("talent.social-photo.add", "talent", talentId, talentId, { photoId: id, platform, sourcePostUrl }, { socialPhoto: { id, talent_id: talentId, platform, source_post_url: sourcePostUrl, source: "upload", caption, created_at: ts } });
+        return json({ ok: true, socialPhoto: socialPhotoView(row) }, 201);
       }
       return err(404, "not found");
     }
@@ -1408,13 +1691,15 @@ async function handle(req: Request): Promise<Response> {
     if (rest.length === 2 && method === "DELETE") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       await db.run("DELETE FROM photos WHERE talent_id = ?", [talentId]);
+      await db.run("DELETE FROM social_links WHERE talent_id = ?", [talentId]);
+      await db.run("DELETE FROM social_photos WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM fast_track WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM guardians WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM consents WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM notifications WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM sessions WHERE talent_id = ?", [talentId]);
       await db.run("DELETE FROM talents WHERE id = ?", [talentId]);
-      await audit("talent.delete", "talent", talentId, chk.admin ? "admin" : talentId, { note: "Profile, photos, fast-track, guardian, and notifications deleted." }, { deleted: true });
+      await audit("talent.delete", "talent", talentId, chk.admin ? "admin" : talentId, { note: "Profile, photos, social links + preview photos, fast-track, guardian, and notifications deleted." }, { deleted: true });
       return ok({ deleted: true, talentId });
     }
     return err(404, "not found");
