@@ -247,5 +247,31 @@ check("likeness-release sign confirmation carries the review-windows notice", ()
   assert(consent.includes('okBox("Release signed. Status: AWAITING AGENCY REVIEW.") + reviewWindowsNotice()'), "sign confirmation lacks the notice");
 });
 
+// --- returning-talent sign-in (owner order 2026-11-22: the home screen
+// offered SIGN UP only; a returning talent had no visible way back in) ---
+check("landing hero offers LOG IN next to SIGN UP when logged out", () => {
+  const hero = appSrc.slice(appSrc.indexOf("function screenLanding"), appSrc.indexOf("function screenLogin"));
+  assert(hero.includes('href="#/login">LOG IN'), "hero has no LOG IN button");
+  assert(hero.includes("Already have a profile?"), "hero lacks the returning-talent line");
+  assert(hero.includes("GO TO MY DASHBOARD"), "hero does not send a signed-in talent to the dashboard");
+});
+check("header Log in link is a visible button, not plain text", () => {
+  const slot = appSrc.slice(appSrc.indexOf("function authSlotHtml"), appSrc.indexOf("function bindAuthSlot"));
+  assert(slot.includes('class="btn btn-ghost btn-sm"'), "auth slot Log in is not button-styled");
+});
+check("login screen has Forgot password reset flow + stay-signed-in line", () => {
+  const login = appSrc.slice(appSrc.indexOf("function screenLogin"), appSrc.indexOf("function screenOpportunities"));
+  assert(login.includes("Forgot your password?"), "no Forgot password link");
+  assert(login.includes("auth/request-password-reset"), "reset request endpoint not wired");
+  assert(login.includes("auth/reset-password"), "reset endpoint not wired");
+  assert(login.includes("testModeResetCode"), "test-mode code display missing");
+  assert(login.includes("stay signed in on this phone"), "stay-signed-in line missing");
+  assert(login.includes("isLoggedIn()"), "login does not redirect an already signed-in talent");
+});
+check("sidebar Talent group has a Log in link", () => {
+  const idx = fs.readFileSync(path.join(ROOT, "frontend", "index.html"), "utf8");
+  assert(idx.includes('<a href="#/login" data-route="login">Log in</a>'), "sidebar has no Log in link");
+});
+
 console.log("\nFRONTEND-UNIT: " + PASS + " passed, " + FAIL + " failed");
 process.exit(FAIL === 0 ? 0 : 1);

@@ -257,7 +257,7 @@ function logout(){
 }
 function authSlotHtml(){
   if(isLoggedIn()) return '<a href="#/dashboard">My Dashboard</a><button class="btn btn-ghost btn-sm" id="logout-btn" type="button">Log out</button>';
-  return '<a href="#/login">Log in</a>';
+  return '<a class="btn btn-ghost btn-sm" href="#/login">Log in</a>';
 }
 function bindAuthSlot(){
   var s = $("#auth-slot"); if(!s) return;
@@ -369,12 +369,18 @@ function checkHealth(){
 
 /* ---------- (6) screens: landing / login / opportunities ---------- */
 function screenLanding(app){
+  // Returning talents need a way back in at first glance: the hero used to
+  // offer SIGN UP only, and the only Log in link was a small header link.
+  var heroCta = isLoggedIn()
+    ? '<a class="btn btn-gold btn-gold-big" href="#/dashboard">GO TO MY DASHBOARD</a>'
+    : '<a class="btn btn-gold btn-gold-big" href="#/join">SIGN UP</a> <a class="btn btn-ghost btn-gold-big" href="#/login">LOG IN</a>'
+      + '<p class="muted" style="margin-top:10px">Already have a profile? <a href="#/login">Log in</a> — you will pick up right where you left off.</p>';
   app.innerHTML =
     '<section class="hero">'
     + '<div class="brand-mark hero-mark">'+brandMarkSVG(96)+'</div>'
     + '<h1 class="wordmark">TOP TEA<br><span>TALENTS</span></h1>'
     + '<p class="hero-tag">Casting discovery, matching, and bookings — nationwide, South Florida first.</p>'
-    + '<a class="btn btn-gold btn-gold-big" href="#/join">SIGN UP</a>'
+    + heroCta
     + '<div class="hero-panel"><div class="steps-grid">'
     + '<div class="step-tile"><div class="step-icon">🔍</div><h3>FIND</h3><p>New casting calls, hunted every day.</p></div>'
     + '<div class="step-tile"><div class="step-icon">🎯</div><h3>MATCH</h3><p>The right jobs for your look, skills, and location.</p></div>'
@@ -432,10 +438,19 @@ function screenLanding(app){
 }
 
 function screenLogin(app){
+  if(isLoggedIn()){ location.hash = "#/dashboard"; route(); return; }
   app.innerHTML = '<div class="card"><h2>Log in</h2><div id="login-msg"></div>'
     + '<form id="login-form"><label for="login-email">Email</label><input id="login-email" type="email" required autocomplete="email">'
     + '<label for="login-password">Password</label><input id="login-password" type="password" required autocomplete="current-password">'
     + '<p><button class="btn" type="submit">Log in</button></p></form>'
+    + '<p class="muted">Once you are in, you will stay signed in on this phone until you log out — no need to sign in every time.</p>'
+    + '<p><a href="#" id="forgot-link">Forgot your password?</a></p>'
+    + '<div id="reset-box" style="display:none"><h3>Reset your password</h3><div id="reset-msg"></div>'
+    + '<form id="reset-request-form"><label for="reset-email">Email</label><input id="reset-email" type="email" required autocomplete="email">'
+    + '<p><button class="btn btn-ghost" type="submit">Send reset code</button></p></form>'
+    + '<form id="reset-form" style="display:none"><label for="reset-code">6-digit code</label><input id="reset-code" type="text" inputmode="numeric" required autocomplete="one-time-code">'
+    + '<label for="reset-new-password">New password (at least 8 characters)</label><input id="reset-new-password" type="password" required autocomplete="new-password">'
+    + '<p><button class="btn" type="submit">Reset password</button></p></form></div>'
     + '<p class="muted">No account yet? <a href="#/join">Join Top Tea Talents — it is free.</a></p></div>';
   $("#login-form").addEventListener("submit", function(e){
     e.preventDefault();
@@ -448,6 +463,29 @@ function screenLogin(app){
         try{ localStorage.setItem("ttt_token", tok); localStorage.setItem("ttt_talent_id", id); }catch(err){}
         location.hash = "#/dashboard"; route();
       })
+      .catch(function(err){ msg.innerHTML = errBox(err.message); });
+  });
+  $("#forgot-link").addEventListener("click", function(e){
+    e.preventDefault();
+    var b = $("#reset-box"); if(b) b.style.display = (b.style.display === "none") ? "block" : "none";
+  });
+  $("#reset-request-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var msg = $("#reset-msg");
+    api("/api/v1/auth/request-password-reset", {method:"POST", body:{email:$("#reset-email").value.trim()}})
+      .then(function(d){
+        var note = "If that email has an account, a reset code was sent. Check your email for the 6-digit code, then enter it below with your new password.";
+        if(d && d.testModeResetCode){ note = "TEST MODE — email is not connected yet, so your reset code is shown here: <b>" + esc(String(d.testModeResetCode)) + "</b>. Enter it below with your new password."; }
+        msg.innerHTML = okBox(note);
+        var f = $("#reset-form"); if(f) f.style.display = "block";
+      })
+      .catch(function(err){ msg.innerHTML = errBox(err.message); });
+  });
+  $("#reset-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var msg = $("#reset-msg");
+    api("/api/v1/auth/reset-password", {method:"POST", body:{email:$("#reset-email").value.trim(), code:$("#reset-code").value.trim(), newPassword:$("#reset-new-password").value}})
+      .then(function(){ msg.innerHTML = okBox("Password reset. Log in with your new password."); var f = $("#reset-form"); if(f) f.style.display = "none"; })
       .catch(function(err){ msg.innerHTML = errBox(err.message); });
   });
 }
