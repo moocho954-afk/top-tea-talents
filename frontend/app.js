@@ -1269,7 +1269,7 @@ function screenPublicTalent(app, talentId){
       + '</div>'
       + ((p.socialPhotos||[]).length || (p.socialLinks||[]).length ? '<div class="card"><h2>From social</h2>'
         + (p.socialLinks||[]).map(function(s){ return '<p><strong>'+esc(s.platform)+'</strong> — '+esc(s.handle)+(s.bioChecked?" · bio links TOP TEA TALENTS":"")+'</p>'; }).join("")
-        + (p.socialPhotos||[]).map(function(ph){ return '<p><img src="'+esc(ph.photoUrl)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:240px"> <span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+')</span></p>'; }).join("")
+        + (p.socialPhotos||[]).map(function(ph){ var u = ph.publicPhotoUrl||ph.photoUrl||""; var src = u ? (u.charAt(0)==="/"?apiBase()+u:u) : ""; return '<p>'+(src?'<img src="'+esc(src)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:240px"> ':"")+'<span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+(ph.source? " · "+esc(ph.source):"")+(ph.selection? " · "+esc(ph.selection):"")+(ph.likesLabel? " · "+esc(ph.likesLabel):"")+')</span></p>'; }).join("")
         + '</div>' : "")
       + '<div class="card"><h2>Proof of work — credits ('+(p.credits||[]).length+')</h2>'
       + ((p.credits||[]).length ? '<ul>'+p.credits.map(function(c){ return '<li><strong>'+esc(c.title||"")+'</strong>'+(c.production?" — "+esc(c.production):"")+(c.agency?" · "+esc(c.agency):"")+'</li>'; }).join("")+'</ul>' : '<p class="muted">No completed jobs listed yet.</p>')
@@ -1286,49 +1286,97 @@ function screenSocial(app){
   var id = sessionTalentId();
   app.innerHTML = '<h1 style="color:var(--gold)">Social Links</h1>'
     + '<p class="muted">Link YOUR OWN Instagram and/or Facebook. A few of your photos then show as an extended portfolio preview, alongside your 8-photo portfolio — only what you connect and approve.</p>'
+    + '<div class="card"><h2>Instagram auto-pull — honest note</h2><p class="muted small">The agency app can pull your first three Instagram photos plus your most popular post straight from your public profile — only photos the identity check confirms are you. <strong>This public site cannot do that pull itself</strong> — it has no browser to send. The request button below records that honestly and nothing is faked. Your own uploads in the form below work right now and show the same way.</p></div>'
     + '<div class="card"><div id="social-msg"></div><div id="social-list">'+loadingBox("Loading your social links…")+'</div></div>'
     + '<div class="card"><h2>Link an account</h2><form id="social-add-form">'
     + '<label>Platform<select id="social-platform"><option value="instagram">Instagram</option><option value="facebook">Facebook</option></select></label>'
     + '<label>Your handle / profile name<input id="social-handle" placeholder="@yourhandle" required></label>'
-    + '<p><button class="btn" type="submit">Begin linking</button></p></form>'
-    + '<p class="muted small">There is no OAuth integration yet — linking is talent-attested: you state the account is yours, then confirm it. The preview only ever shows what you connected and approved.</p></div>'
+    + '<label>Profile URL (optional)<input id="social-profile-url" type="url" placeholder="https://instagram.com/yourhandle"></label>'
+    + '<label class="checkbox-row"><input type="checkbox" id="social-own" required> This is my own account</label>'
+    + '<p><button class="btn" type="submit">Begin linking — get my ownership code</button></p></form>'
+    + '<p class="muted small">There is no OAuth integration — linking is per-talent authorization: you state the account is yours, put the ownership code in your bio, sign, and the agency runs the live bio check. Only a confirmed code authorizes the account.</p></div>'
     + '<div class="card"><h2>Add a social photo to the preview</h2><form id="social-photo-form">'
-    + '<label>Platform<select id="social-photo-platform"><option value="instagram">Instagram</option><option value="facebook">Facebook</option></select></label>'
-    + '<label>Photo URL (a public link to one of your own photos)<input id="social-photo-url" type="url" placeholder="https://…" required></label>'
+    + '<label>Platform<select id="social-photo-platform"></select></label>'
+    + '<label>Photo<input id="social-photo-file" type="file" accept="image/jpeg,image/png,image/webp" required></label>'
+    + '<label>Link to the original post on your own authorized account<input id="social-photo-post-url" type="url" placeholder="https://instagram.com/p/…" required></label>'
     + '<label>Caption<input id="social-photo-caption" placeholder="Optional caption"></label>'
-    + '<p><button class="btn btn-ghost" type="submit">Add to preview</button></p></form><div id="social-photo-msg"></div></div>';
+    + '<p><button class="btn btn-ghost" type="submit">Add to preview</button></p></form><div id="social-photo-msg"></div>'
+    + '<p class="muted small">Each preview photo needs the link to the original post on your own authorized account, so every photo is traceable to your post. Photos are downscaled in your browser before upload.</p></div>';
   var load = function(){
     apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/social-links").then(function(d){
       var el = $("#social-list"); if(!el) return;
       var links = d.socialLinks||[], photos = d.socialPhotos||[];
+      var authorized = links.filter(function(l){ return l.status==="AUTHORIZED"; });
+      var sel = $("#social-photo-platform");
+      if(sel){
+        sel.innerHTML = authorized.length
+          ? authorized.map(function(l){ return '<option value="'+esc(l.platform)+'">'+esc(l.platform)+' — '+esc(l.handle)+'</option>'; }).join("")
+          : '<option value="">Authorize an account first</option>';
+        sel.disabled = !authorized.length;
+      }
       el.innerHTML = '<h3>Linked accounts ('+links.length+')</h3>'
         + (links.length ? links.map(function(l){
-            return '<div class="card"><p><strong>'+esc(l.platform)+'</strong> — '+esc(l.handle)+' · <span class="badge '+(l.status==="LINKED"?"badge-verified":"badge-unverified")+'">'+esc(l.status)+'</span></p>'
-              + '<p class="muted small">Bio links TOP TEA TALENTS: '+(l.bioChecked?"yes":"not confirmed")+'</p>'
-              + '<p>'+(l.status!=="LINKED"?'<button class="mini-btn" data-confirm="'+l.id+'">Confirm this is my account</button> ':"")
-              + '<button class="mini-btn" data-bio="'+l.id+'">'+(l.bioChecked?"Bio confirmed ✓":"Mark bio as checked")+'</button> '
-              + '<button class="mini-btn" data-unlink="'+l.id+'">Unlink</button></p></div>';
+            var v = l.verificationStatus||"";
+            var vText = v==="code_confirmed" ? "Bio check confirmed — the code was found in your bio."
+              : v==="check_pending" ? "Signed — the agency runs the live bio check against your public bio."
+              : v==="code_not_found" ? "Bio check ran and did NOT find the code in your bio — check it is there, then re-run the check."
+              : v==="check_unreadable" ? "Bio check could not read your profile (private or login-walled) — make it public, then re-run the check."
+              : "Code issued — put it in your bio, then sign below.";
+            var pullText = "";
+            if(l.platform==="instagram"){
+              if(l.pullStatus==="pulled") pullText = '<p class="muted small">Auto-pull: photos pulled from your public profile.'+(l.pullRejectedCount?" "+l.pullRejectedCount+" photo(s) were rejected by the identity check and never shown.":"")+(l.pullDetail?" "+esc(l.pullDetail):"")+'</p>';
+              else if(l.pullStatus==="unavailable") pullText = '<p class="muted small">Auto-pull: not available on this public site — it runs from the agency app.'+(l.pullDetail?" "+esc(l.pullDetail):"")+'</p>';
+              else if(l.pullStatus) pullText = '<p class="muted small">Auto-pull: '+esc(l.pullStatus)+(l.pullDetail?" — "+esc(l.pullDetail):"")+'</p>';
+            }
+            return '<div class="card"><p><strong>'+esc(l.platform)+'</strong> — '+esc(l.handle)+' · <span class="badge '+(l.status==="AUTHORIZED"?"badge-verified":"badge-unverified")+'">'+esc(l.status)+'</span></p>'
+              + '<p class="muted small">Verification: '+esc(v||"—")+' — '+vText+'</p>'
+              + (l.ownershipCode ? '<p>Your ownership code: <strong>'+esc(l.ownershipCode)+'</strong> — put this exact code in your '+esc(l.platform)+' bio.</p>' : "")
+              + (l.signedAt ? '<p class="muted small">Signed by '+esc(l.signatureName||"")+' on '+esc(l.signedAt)+'</p>' : "")
+              + (l.checkDetail ? '<p class="muted small">Last check: '+esc(l.checkDetail)+'</p>' : "")
+              + pullText
+              + (l.status==="AUTHORIZED"||l.signedAt ? "" : '<div><label>Your typed signature (must match your legal or professional name)<input data-sig-name="'+l.id+'" placeholder="Type your full name"></label>'
+              + '<label class="checkbox-row"><input type="checkbox" data-sig-bio="'+l.id+'"> The ownership code is in my bio</label>'
+              + '<label class="checkbox-row"><input type="checkbox" data-sig-agree="'+l.id+'"> I authorize TOP TEA TALENTS to check my public bio for the code</label>'
+              + '<p><button class="mini-btn" data-sign-btn="'+l.id+'">Sign &amp; start the bio check</button></p></div>')
+              + '<p>'
+              + (l.status!=="AUTHORIZED" && l.signedAt ? '<button class="mini-btn" data-recheck="'+l.id+'">Re-run bio check</button> ' : "")
+              + (l.status==="AUTHORIZED" && l.platform==="instagram" ? '<button class="mini-btn" data-pull="'+l.id+'">Request Instagram photo pull</button> ' : "")
+              + '<button class="mini-btn" data-unlink="'+l.platform+'">Unlink</button></p></div>';
           }).join("") : emptyBox("No accounts linked yet."))
         + '<h3>Extended portfolio preview ('+photos.length+' photos)</h3>'
         + (photos.length ? photos.map(function(ph){
-            return '<p><img src="'+esc(ph.photoUrl)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:200px"> <span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+')</span> <button class="mini-btn" data-del-photo="'+ph.id+'">Remove</button></p>';
+            var u = ph.photoUrl||"";
+            var src = u ? (u.charAt(0)==="/"?apiBase()+u:u) : "";
+            return '<p>'+(src?'<img src="'+esc(src)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:200px"> ':"")+'<span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+' · '+esc(ph.source||"upload")+(ph.selection? " · "+esc(ph.selection):"")+(ph.likesLabel? " · "+esc(ph.likesLabel):"")+(ph.identityNote? " — "+esc(ph.identityNote):"")+')</span> '+(ph.sourcePostUrl?'<a class="small" href="'+esc(ph.sourcePostUrl)+'" target="_blank" rel="noopener">original post</a> ':"")+'<button class="mini-btn" data-del-photo="'+ph.id+'">Remove</button></p>';
           }).join("") : '<p class="muted">No preview photos yet — add one below.</p>');
-      el.querySelectorAll("[data-confirm]").forEach(function(b){
+      el.querySelectorAll("[data-sign-btn]").forEach(function(b){
         b.addEventListener("click", function(){
-          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-confirm")), {method:"POST", body:{action:"confirm"}})
-            .then(function(){ $("#social-msg").innerHTML = okBox("Account confirmed — it now shows in your extended portfolio."); load(); })
+          var lid = b.getAttribute("data-sign-btn");
+          var nameEl = el.querySelector('[data-sig-name="'+lid+'"]');
+          var bioEl = el.querySelector('[data-sig-bio="'+lid+'"]');
+          var agreeEl = el.querySelector('[data-sig-agree="'+lid+'"]');
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(lid), {method:"POST", body:{action:"confirm", signatureName:nameEl?nameEl.value.trim():"", codeInBioConfirmed:bioEl?bioEl.checked:false, agreed:agreeEl?agreeEl.checked:false}})
+            .then(function(){ $("#social-msg").innerHTML = okBox("Signed. The agency runs the live bio check — your account authorizes only when the code is found in your bio."); load(); })
             .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
         });
       });
-      el.querySelectorAll("[data-bio]").forEach(function(b){
+      el.querySelectorAll("[data-recheck]").forEach(function(b){
         b.addEventListener("click", function(){
-          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-bio")), {method:"POST", body:{action:"bio-checked", checked:true}})
-            .then(function(){ load(); }).catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-recheck")), {method:"POST", body:{action:"resend-bio-check"}})
+            .then(function(){ $("#social-msg").innerHTML = okBox("Bio check re-requested."); load(); })
+            .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+        });
+      });
+      el.querySelectorAll("[data-pull]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-pull")), {method:"POST", body:{action:"request-photo-pull"}})
+            .then(function(d){ $("#social-msg").innerHTML = okBox(d.reason||"Auto-pull is not available on this public site."); load(); })
+            .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
         });
       });
       el.querySelectorAll("[data-unlink]").forEach(function(b){
         b.addEventListener("click", function(){
-          if(!confirm("Unlink this account?")) return;
+          if(!confirm("Unlink this account? All of its preview photos will be removed too.")) return;
           api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-unlink")), {method:"DELETE"})
             .then(function(){ load(); }).catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
         });
@@ -1344,15 +1392,24 @@ function screenSocial(app){
   load();
   $("#social-add-form").addEventListener("submit", function(e){
     e.preventDefault();
-    api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links", {method:"POST", body:{platform:$("#social-platform").value, handle:$("#social-handle").value.trim()}})
-      .then(function(){ $("#social-msg").innerHTML = okBox("Link started (PENDING). Confirm it above to make it live in your extended portfolio."); load(); })
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links", {method:"POST", body:{platform:$("#social-platform").value, handle:$("#social-handle").value.trim(), profileUrl:$("#social-profile-url").value.trim()||undefined, ownAccountConfirmed:$("#social-own").checked}})
+      .then(function(d){ $("#social-msg").innerHTML = okBox("Link started. Your ownership code is "+(d.socialLink&&d.socialLink.ownershipCode?d.socialLink.ownershipCode:"—")+" — put it in your bio, then sign above."); load(); })
       .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
   });
   $("#social-photo-form").addEventListener("submit", function(e){
     e.preventDefault();
-    api("/api/v1/talent/"+encodeURIComponent(id)+"/social-photos", {method:"POST", body:{platform:$("#social-photo-platform").value, photoUrl:$("#social-photo-url").value.trim(), caption:$("#social-photo-caption").value.trim()}})
-      .then(function(){ $("#social-photo-msg").innerHTML = okBox("Photo added to your extended portfolio preview."); load(); })
-      .catch(function(err){ $("#social-photo-msg").innerHTML = errBox(err.message); });
+    var f = $("#social-photo-file").files[0];
+    if(!f){ $("#social-photo-msg").innerHTML = errBox("Choose a photo file first."); return; }
+    var platform = $("#social-photo-platform").value;
+    if(!platform){ $("#social-photo-msg").innerHTML = errBox("Authorize an Instagram or Facebook account first."); return; }
+    var postUrl = $("#social-photo-post-url").value.trim();
+    var caption = $("#social-photo-caption").value.trim();
+    downscalePhoto(f, function(dataUrl, err){
+      if(err){ $("#social-photo-msg").innerHTML = errBox(err); return; }
+      api("/api/v1/talent/"+encodeURIComponent(id)+"/social-photos", {method:"POST", body:{platform:platform, dataUrl:dataUrl, sourcePostUrl:postUrl, caption:caption}})
+        .then(function(){ $("#social-photo-msg").innerHTML = okBox("Photo added to your extended portfolio preview."); load(); })
+        .catch(function(err){ $("#social-photo-msg").innerHTML = errBox(err.message); });
+    });
   });
 }
 
