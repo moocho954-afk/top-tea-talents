@@ -41,7 +41,7 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.2.0", d
+assert d["version"]=="1.2.1", d
 print("health ok:", d["counts"])
 PY
 
@@ -247,6 +247,41 @@ assert len(row)==1 and row[0]['decision']=='SKIPPED' and 'Gender requirement' in
 print('queue:', len(d['queue']), 'selected:', len(sel))
 PY
 check "v1.2.0: manual application male + female-only opp returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications -H 'Authorization: Bearer $MTOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$MTALENT_ID\",\"opportunityId\":\"allcasting:319858\"}' | grep -q 400"
+# ----- v1.2.1 GENDER DERIVATION FIX (mixed-role listings) -----
+# allcasting:307031 "Recruitment for Miami Girl Group" has a Female lead
+# vocal + a Both-genders dancer: pre-fix it derived open (the "(Both
+# genders; …)" annotation tripped the listing-level open-signal test) and
+# showed to male talents. It must derive female-only now, and the symmetric
+# Male+Both case must derive male-only; Both-only and Female+Male stay open.
+curl -sf "$BASE/opportunities/allcasting%3A307031" -o /tmp/ttt-body.json
+check "v1.2.1: mixed Female+Both listing 307031 derives female-only" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['opportunity']; assert d['genderRequirement']=='female', d; assert d['expired'] is False, d"
+curl -sf "$BASE/opportunities/allcasting%3A287402" -o /tmp/ttt-body.json
+check "v1.2.1: single-Female-role listing 287402 stays female-only" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['opportunity']; assert d['genderRequirement']=='female', d"
+curl -sf "$BASE/opportunities/allcasting%3A325773" -o /tmp/ttt-body.json
+check "v1.2.1: symmetric Male+Both listing 325773 derives male-only" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['opportunity']; assert d['genderRequirement']=='male', d"
+curl -sf "$BASE/opportunities/allcasting%3A325752" -o /tmp/ttt-body.json
+check "v1.2.1: Both-only listing 325752 stays open" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['opportunity']; assert d['genderRequirement'] is None, d"
+curl -sf "$BASE/opportunities/allcasting%3A325814" -o /tmp/ttt-body.json
+check "v1.2.1: Female+Male listing 325814 stays open" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json'))['opportunity']; assert d['genderRequirement'] is None, d"
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/match" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.2.1: male talent match EXCLUDES 307031, genderExcluded cites female" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+ids=[m['opportunityId'] for m in d['matches']]
+assert 'allcasting:307031' not in ids, 'mixed female-only opp matched a male talent'
+gx=[g for g in d['genderExcluded'] if g['opportunityId']=='allcasting:307031']
+assert len(gx)==1 and gx[0]['requiredGender']=='female', d['genderExcluded']
+print('307031 excluded for male talent, source:', gx[0]['source'])
+PY
+curl -sf "$BASE/talent/$MTALENT_ID/jobs-for-you" -H "Authorization: Bearer $MTOKEN" -o /tmp/ttt-body.json
+check "v1.2.1: jobs-for-you also excludes 307031 for a male talent" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+ids=[j['opportunityId'] for j in d['jobs']]
+assert 'allcasting:307031' not in ids, 'mixed female-only opp in jobs-for-you for a male talent'
+print('jobs:', len(ids), 'genderExcluded:', d['genderExcluded'])
+PY
+check "v1.2.1: manual application male + 307031 returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications -H 'Authorization: Bearer $MTOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$MTALENT_ID\",\"opportunityId\":\"allcasting:307031\"}' | grep -q 400"
 # Flip the same talent to Female: the anchor MUST now match, with a
 # gender-fit reason on the match row.
 curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"demographics":{"gender":"Female","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json

@@ -7,7 +7,7 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
@@ -2352,6 +2352,10 @@ async function countsAll(): Promise<any> {
 // logged, never silent: matchTalent counts gender-excluded listings in
 // stats.genderExcluded and names each one, and the rotation queue marks
 // them SKIPPED with the reason on the row.
+// v1.2.1: the listing-level open-signal test runs against prose + roles
+// with per-role annotations stripped, and a definite gender plus "both"
+// roles resolves to that definite gender — a "both" role never overrides
+// a definite one (allcasting:307031 was open, now female).
 const FEMALE_WORDS = /\b(female|females|woman|women|girl|girls|actress|actresses)\b/i;
 const MALE_WORDS = /\b(male|males|man|men|boy|boys)\b/i;
 // Explicit open-to-all signals — these override any single-gender mention
@@ -2363,28 +2367,40 @@ type OppGenders = "female" | "male" | "open";
 function deriveOppGenders(o: any): { genders: OppGenders; source: string } {
   const roles = String(o.roles || "");
   const prose = [o.title, o.eligibility, o.appearance].map((x) => String(x || "")).join(" ");
-  if (OPEN_GENDER_SIGNALS.test(roles + " " + prose)) return { genders: "open", source: "open-signal" };
+  // v1.2.1: per-role "(Both genders; …)" / "(All genders; …)" annotations
+  // are per-ROLE, not listing-level — they must not trip the listing-level
+  // open-signal test, or a mixed listing (Female role + Both role, e.g.
+  // allcasting:307031 "Recruitment for Miami Girl Group") is declared
+  // open before the annotation branch ever runs. Strip the annotations
+  // from roles before testing open signals; the prose test is unchanged.
+  const rolesNoAnn = roles.replace(ROLE_GENDER_ANN, " ");
+  if (OPEN_GENDER_SIGNALS.test(rolesNoAnn + " " + prose)) return { genders: "open", source: "open-signal" };
   const anns: string[] = [];
   ROLE_GENDER_ANN.lastIndex = 0;
   let am: RegExpExecArray | null;
   while ((am = ROLE_GENDER_ANN.exec(roles)) !== null) anns.push(am[1].toLowerCase());
   if (anns.length) {
-    const s = new Set<string>();
+    // v1.2.1: a "both"/"all" role never opens the whole listing on its own
+    // and never overrides a definite one. A definite gender plus "both"
+    // roles resolves to that definite gender (matching is per-opportunity,
+    // not per-role — the listing does say female/male); only both/all
+    // roles, or both definite genders present, stays open.
+    const definite = new Set<string>();
     for (const a of anns) {
-      if (a.includes("both") || a.includes("all")) { s.add("female"); s.add("male"); }
-      else if (a.includes("female")) s.add("female");
-      else if (a.includes("male")) s.add("male");
+      if (a.includes("both") || a.includes("all")) continue;
+      else if (a.includes("female")) definite.add("female");
+      else if (a.includes("male")) definite.add("male");
     }
-    if (s.has("female") && s.has("male")) return { genders: "open", source: "roles-both" };
-    if (s.has("female")) {
+    if (definite.has("female") && definite.has("male")) return { genders: "open", source: "roles-both" };
+    if (definite.has("female")) {
       if (MALE_WORDS.test(prose)) return { genders: "open", source: "roles+prose" };
       return { genders: "female", source: "roles" };
     }
-    if (s.has("male")) {
+    if (definite.has("male")) {
       if (FEMALE_WORDS.test(prose)) return { genders: "open", source: "roles+prose" };
       return { genders: "male", source: "roles" };
     }
-    return { genders: "open", source: "roles-unreadable" };
+    return { genders: "open", source: "roles-both" };
   }
   const f = FEMALE_WORDS.test(prose);
   const ml = MALE_WORDS.test(prose);
