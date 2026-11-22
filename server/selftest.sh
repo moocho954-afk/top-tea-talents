@@ -319,6 +319,56 @@ check "reset with the right code succeeds" python3 -c "import json; d=json.load(
 check "login works with the new password, old password fails" bash -c "curl -sf -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"second@toptea.example\",\"password\":\"newsecret123\"}' -o /tmp/ttt-body.json && grep -q token /tmp/ttt-body.json && curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"second@toptea.example\",\"password\":\"secret123\"}' | grep -q 401"
 TOKEN2=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
 
+# ----- v19 SIGNUP-FLOW FIX: optional checkbox groups, wizard persistence, in-wizard photos -----
+# Third talent: only the 6 core items, ZERO of languages/skills/categories/availability.
+curl -sf -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d '{"email":"t3@toptea.example","phone":"3055550102","firstName":"Third","lastName":"Talent","password":"secret123","city":"Miami","state":"FL","termsAccepted":true}' -o /tmp/ttt-body.json
+TALENT3_ID=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['talentId'])")
+TOKEN3=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['token'])")
+VCODE3=$(python3 -c "import json; print(json.load(open('/tmp/ttt-body.json'))['testModeVerificationCode'])")
+check "v19: third talent registers" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talentId'].startswith('tal_') and d['token'], d"
+# (a) core-only profile -> 100% (optional groups NOT counted)
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"city":"Miami","state":"FL","zip":"33101","height":"5ft 9in","ageRange":"25-34","experience":"5 years background work"}' -o /tmp/ttt-body.json
+check "v19: core-only profile (zero optional groups) reaches 100%" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==100, d['talent']; assert d['talent']['status']=='PROFILE UNDER REVIEW', d['talent']['status']"
+# (a2) release sign accepts a core-only profile (verify email first)
+curl -sf -X POST "$BASE/auth/verify-email" -H 'Content-Type: application/json' -d "{\"email\":\"t3@toptea.example\",\"code\":\"$VCODE3\"}" -o /tmp/ttt-body.json
+check "v19: core-only talent signs the likeness release" bash -c "curl -sf -X POST $BASE/talent/$TALENT3_ID/likeness-release/sign -H 'Authorization: Bearer $TOKEN3' -H 'Content-Type: application/json' -d '{\"agreed\":true,\"signature\":\"Third Talent\"}' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['status']=='AWAITING AGENCY REVIEW', d\""
+# (b) adding optional groups keeps 100% (never hurts)
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"languages":["English","Spanish"],"skills":["Acting"],"categories":["Background extras"],"availability":["Weekdays"]}' -o /tmp/ttt-body.json
+check "v19: optional groups filled still 100%" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['completion']==100, d['talent']"
+# (d) wizard step saves persist: step-2-style PATCH with languages, then a
+# step-3-style PATCH that omits languages entirely -> languages survive
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"languages":["English","Spanish"],"skills":["Acting"],"availability":["Weekdays"]}' -o /tmp/ttt-body.json
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"experience":"5 years background work","categories":["Background extras"],"minCompensation":100}' -o /tmp/ttt-body.json
+check "v19: step-3-style PATCH without languages does not wipe them" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); t=d['talent']; assert t['languages']==['English','Spanish'], t; assert t['skills']==['Acting'], t; assert t['availability']==['Weekdays'], t"
+# (d2) a direct empty-array PATCH is a deliberate clear (API semantics kept)
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"skills":[]}' -o /tmp/ttt-body.json
+check "v19: explicit empty-array PATCH still clears (deliberate clear kept)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talent']['skills']==[], d['talent']"
+curl -sf -X PATCH "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d '{"skills":["Acting"]}' -o /tmp/ttt-body.json
+# (c) wizard photo upload: POST a 1x1 PNG dataUrl, slot 1 -> 201; GET shows it
+T3_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+curl -sf -X POST "$BASE/talent/$TALENT3_ID/photos" -H "Authorization: Bearer $TOKEN3" -H 'Content-Type: application/json' \
+  -d "{\"slot\":1,\"dataUrl\":\"data:image/png;base64,$T3_PNG_B64\",\"caption\":\"MAIN HEADSHOT\"}" -o /tmp/ttt-body.json
+check "v19: wizard photo upload succeeds (slot 1, PNG)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['photo']['slot']==1 and d['photo']['label']=='MAIN HEADSHOT', d"
+curl -sf "$BASE/talent/$TALENT3_ID/photos" -H "Authorization: Bearer $TOKEN3" -o /tmp/ttt-body.json
+check "v19: uploaded photo appears on the profile (GET photos)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert len(d['photos'])==1 and d['photos'][0]['slot']==1, d"
+check "v19: photo slot 9 rejected (400)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT3_ID/photos -H 'Authorization: Bearer $TOKEN3' -H 'Content-Type: application/json' -d '{\"slot\":9,\"dataUrl\":\"data:image/png;base64,$T3_PNG_B64\"}' | grep -q 400"
+check "v19: photo with bad mime rejected (400)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/talent/$TALENT3_ID/photos -H 'Authorization: Bearer $TOKEN3' -H 'Content-Type: application/json' -d '{\"slot\":2,\"dataUrl\":\"data:image/gif;base64,$T3_PNG_B64\"}' | grep -q 400"
+# (e) repopulation source: GET talent returns the full profile for the wizard
+curl -sf "$BASE/talent/$TALENT3_ID" -H "Authorization: Bearer $TOKEN3" -o /tmp/ttt-body.json
+check "v19: GET talent returns full profile (wizard repopulation source)" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); t=d['talent']; assert t['languages']==['English','Spanish'] and t['categories']==['Background extras'] and t['availability']==['Weekdays'] and t['completion']==100, t"
+# (f) same-email re-registration never creates a second profile; login resumes the original
+check "v19: duplicate email returns 409 (no second profile)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/auth/register -H 'Content-Type: application/json' -d '{\"email\":\"t3@toptea.example\",\"phone\":\"3055550102\",\"firstName\":\"Third\",\"lastName\":\"Talent\",\"password\":\"secret123\",\"termsAccepted\":true}' | grep -q 409"
+check "v19: login after duplicate attempt returns the ORIGINAL talent id" bash -c "curl -sf -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"t3@toptea.example\",\"password\":\"secret123\"}' -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['talentId']=='$TALENT3_ID', d\""
+# frontend unit tests (pure functions extracted from the real app.js)
+check "v19: frontend unit tests pass (toApiProfile/completionPct/repopulation)" bash -c "node ../tools/frontend-unit-test.cjs"
+
 # Jobs For You feed
 curl -sf "$BASE/talent/$TALENT_ID/jobs-for-you" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
 check "jobs-for-you returns ranked jobs with per-job reference codes" python3 - <<'PYEOF'
@@ -568,7 +618,7 @@ parsed = [json.loads(l) for l in lines]
 assert all(set(("mirror_prev", "mirror_hash", "state")) <= set(p) for p in parsed), "mirror line missing chain/state keys"
 assert [p["seq"] for p in parsed] == list(range(1, len(parsed) + 1)), "mirror seqs not 1..N"
 reg = [p for p in parsed if p["event_type"] == "talent.register"]
-assert len(reg) == 2, reg  # talent1 + talent2 (v11 second-talent checks)
+assert len(reg) == 3, reg  # talent1 + talent2 (v11) + talent3 (v19 signup-flow fix)
 reg1 = [p for p in reg if p["state"]["talent"]["id"] == talent_id]
 assert len(reg1) == 1, reg
 assert reg1[0]["state"]["talent"]["email"] == "test@toptea.example", reg1[0]["state"]
