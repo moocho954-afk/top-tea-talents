@@ -81,17 +81,25 @@ class TursoDb implements Db {
     if (!res.ok) throw new Error(`Turso pipeline HTTP ${res.status}: ${await res.text()}`);
     const json: any = await res.json();
     const results = json.results ?? [];
+    // PROVEN by the live diagnostic (2026-11-21 ~23:55 EST): each result is
+    // {type: "ok", response: {type: "execute", result: {...}}} — the StmtResult
+    // sits ONE level deeper than {type, result}. Reading r.result directly
+    // yields undefined, so every SELECT silently came back empty while writes
+    // still landed. Errors likewise nest inside response ({type: "error"}).
+    const out: any[] = [];
     for (const r of results) {
       if (r.type === "error") throw new Error(`Turso error: ${r.error?.message ?? JSON.stringify(r.error)}`);
+      const resp = r.response ?? {};
+      if (resp.type === "error") throw new Error(`Turso error: ${resp.error?.message ?? JSON.stringify(resp.error)}`);
+      out.push(resp.result ?? r.result ?? null);
     }
-    return results;
+    return out;
   }
   async all(sql: string, args: any[] = []): Promise<Row[]> {
-    // Hrana: a statement returns NO rows unless want_rows is set — without
-    // it every SELECT comes back empty (writes still land, so the failure
-    // looks like duplicate-key crashes instead of a read bug).
-    const [r] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg), want_rows: true } }]);
-    const result = r?.result;
+    // want_rows is kept (valid Hrana field) though the live diagnostic proved
+    // rows come back with or without it — the real read bug was the response
+    // nesting, fixed in pipeline() above.
+    const [result] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg), want_rows: true } }]);
     if (!result) return [];
     const cols: string[] = (result.cols ?? []).map((c: any) => c.name);
     return (result.rows ?? []).map((row: any[]) => {
@@ -101,8 +109,7 @@ class TursoDb implements Db {
     });
   }
   async run(sql: string, args: any[] = []): Promise<{ changes: number; lastInsertRowid: number }> {
-    const [r] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg) } }]);
-    const result = r?.result;
+    const [result] = await this.pipeline([{ type: "execute", stmt: { sql, args: args.map(tursoArg) } }]);
     return {
       changes: result?.affected_row_count ?? 0,
       lastInsertRowid: result?.last_insert_rowid ? Number(result.last_insert_rowid) : 0,
