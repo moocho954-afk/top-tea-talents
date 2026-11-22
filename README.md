@@ -81,15 +81,19 @@ Dockerfile           oven/bun:1.3-slim, no install step
   consent, reviews, matches, applications, bookings, payments, ingestions).
   `GET /api/v1/ledger/verify` recomputes the chain. Ledger view + contact
   book in the UI.
-- **Community Board (v16, Phase 0 — `#/community`).** One public board:
+- **Community Board (v17, Phase 0 + bubble fix — `#/community`).** One public board:
   everybody sees everybody's posts; there are no private DMs. Text + one
   photo per post (JPG/PNG/WEBP, 500KB decoded cap, bytes in SQLite like
   portfolio photos). @ mentions autocomplete live (narrowing per letter,
   tap to insert), are stored as talent ids, highlighted to the named
   person, and delivered as an in-app notification. The direct-talk bubble
   is only a filtered view of the same public posts — it says so in its
-  header — and closes on "End chat" or 30 seconds after the last typing;
-  the messages stay on the board. Talent deletes own posts; the owner
+  header — and it is DOCKED (sticky side panel on desktop, bottom sheet
+  on phones) so it never covers the feed; it closes the instant you tap
+  the ×, End chat, anywhere outside it, or Talk to / Reply again for the
+  same person, or minimizes to a small chip (30-second auto-close is only
+  a backup); the messages stay on the board. @ suggestions dismiss the
+  instant one is picked. Talent deletes own posts; the owner
   removes any post behind the owner gate; reports are recorded for owner
   review with no automated action. Every board action is ledger-recorded
   (`BOARD_POST_CREATED`, `BOARD_MENTION_DELIVERED`, `BOARD_POST_REPORTED`,
@@ -123,15 +127,18 @@ Dockerfile           oven/bun:1.3-slim, no install step
 
 ## Version
 
-- **Artifact parity: v16.** The footer carries a visible stamp
-  (`TOP TEA TALENTS • v16 • updated <date>`, from
+- **Artifact parity: v17.** The footer carries a visible stamp
+  (`TOP TEA TALENTS • v17 • updated <date>`, from
   `window.__TTT_BUILD__` in `frontend/index.html`), and
   `/api/v1/health` reports the backend version (`1.1.0`). If the stamp
   and the artifact disagree, the package is stale — that is the drift
   check. v16 ports the artifact's Community Board (Phase 0) plus the
   returning-account wizard resume fix (WELCOME BACK panel on join step 1
   for a signed-in talent; "Sign in instead" link on the
-  already-registered error). Backend version stays 1.1.0.
+  already-registered error). v17 fixes the board bubbles (instant
+  dismiss on × / End chat / outside tap / Talk-to toggle, docked bottom
+  sheet + side panel that never covers the feed, minimize-to-chip, @
+  suggestions dismiss on pick). Backend version stays 1.1.0.
 
 ## Social linking + Instagram auto-pull — what is real here (v12–v14)
 
