@@ -114,7 +114,7 @@ function api(path, opts){
   var base = apiBase();
   if(!base) return Promise.reject(new Error("Backend not configured yet — set the API URL (TTT_API_URL) or localStorage ttt_api_url."));
   var headers = {"Content-Type":"application/json"};
-  var tok = adminToken() || sessionToken();
+  var tok = opts.token || adminToken() || sessionToken();
   if(tok) headers["Authorization"] = "Bearer " + tok;
   return fetch(base + path, {
     method: opts.method || "GET",
@@ -135,11 +135,11 @@ function api(path, opts){
 function apiGet(path){ return api(path); }
 
 /* ---------- API field mapping: wizard/profile forms use snake_case keys; the API speaks camelCase. ---------- */
-var PROFILE_KEY_MAP = {first_name:"firstName", last_name:"lastName", professional_name:"professionalName", travel_radius:"travelRadius", age_range:"ageRange", hair_color:"hairColor", eye_color:"eyeColor"};
+var PROFILE_KEY_MAP = {first_name:"firstName", last_name:"lastName", professional_name:"professionalName", travel_radius:"travelRadius", age_range:"ageRange", hair_color:"hairColor", eye_color:"eyeColor", min_compensation:"minCompensation", union_affiliation:"unionAffiliation", adult_or_minor:"adultOrMinor", contact_method:"contactMethod", share_photos:"sharePhotos"};
 function toApiProfile(d){
   var b = {};
   Object.keys(PROFILE_KEY_MAP).forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[PROFILE_KEY_MAP[k]]=d[k]; });
-  ["phone","city","state","zip","height","experience","availability","languages","skills","categories","adultOrMinor","minCompensation","unionAffiliation","clothing","clothingSizes","measurements","resume","demoReel","portfolioLinks","contactMethod","notifyEmail","notifySms","location","visibility","paused"].forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[k]=d[k]; });
+  ["phone","city","state","zip","height","experience","availability","languages","skills","categories","adultOrMinor","minCompensation","unionAffiliation","clothing","clothingSizes","measurements","resume","demoReel","portfolioLinks","contactMethod","notifyEmail","notifySms","location","visibility","sharePhotos","paused"].forEach(function(k){ if(d[k]!==undefined && d[k]!=="") b[k]=d[k]; });
   if(d.gender!==undefined || d.ethnicity!==undefined){
     b.demographics = {gender: d.gender||null, ethnicity: d.ethnicity||null};
   }
@@ -160,6 +160,27 @@ function sessionTalentId(){ try{ return localStorage.getItem("ttt_talent_id")||"
 function isLoggedIn(){ return !!sessionToken() && !!sessionTalentId(); }
 function isAdmin(){ try{ return !!localStorage.getItem("ttt_admin_token"); }catch(e){ return false; } }
 function adminToken(){ try{ return localStorage.getItem("ttt_admin_token")||""; }catch(e){ return ""; } }
+/* Owner gate (v10): the owner unlocks with a passcode; the 12-hour owner
+   session token lives in localStorage until locked or expired. Agency
+   money is fetched ONLY with this token (or the admin token). */
+function ownerToken(){ try{ return localStorage.getItem("ttt_owner_token")||""; }catch(e){ return ""; } }
+function ownerTokenValid(){
+  try{
+    var exp = localStorage.getItem("ttt_owner_expires")||"";
+    return !!localStorage.getItem("ttt_owner_token") && (!exp || new Date(exp).getTime() > Date.now());
+  }catch(e){ return false; }
+}
+function clearOwnerToken(){ try{ localStorage.removeItem("ttt_owner_token"); localStorage.removeItem("ttt_owner_expires"); }catch(e){} }
+var US_STATES = ["AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"];
+/* Version stamp (v11): rendered into the footer so drift is checkable by eye. */
+function renderVersionStamp(){
+  var el = document.getElementById("version-stamp");
+  if(!el) return;
+  var b = window.__TTT_BUILD__ || {};
+  var v = b.artifact_version || "v11";
+  var d = (b.exported || "").slice(0,10) || "2026-11-21";
+  el.textContent = "TOP TEA TALENTS • " + v + " • updated " + d;
+}
 function logout(){
   try{ localStorage.removeItem("ttt_token"); localStorage.removeItem("ttt_talent_id"); }catch(e){}
   location.hash = "#/";
@@ -187,8 +208,17 @@ function requireLogin(app, inner){
 var ROUTES = [
   {re:/^#\/$/, fn:screenLanding},
   {re:/^#\/join$/, fn:screenJoin},
+  {re:/^#\/verify$/, fn:screenVerify},
   {re:/^#\/login$/, fn:screenLogin},
   {re:/^#\/dashboard$/, fn:screenDashboard},
+  {re:/^#\/jobs$/, fn:screenJobsForYou},
+  {re:/^#\/automation$/, fn:screenAutomation},
+  {re:/^#\/earnings$/, fn:screenEarnings},
+  {re:/^#\/owner$/, fn:screenOwner},
+  {re:/^#\/talent\/([^\/]+)$/, fn:screenPublicTalent},
+  {re:/^#\/social$/, fn:screenSocial},
+  {re:/^#\/cubicles$/, fn:screenCubicles},
+  {re:/^#\/replies$/, fn:screenReplies},
   {re:/^#\/opportunities$/, fn:screenOpportunities},
   {re:/^#\/browse$/, fn:screenBrowse},
   {re:/^#\/opportunity\/([^\/]+)$/, fn:screenOpportunityDetail},
@@ -526,7 +556,7 @@ function screenOpportunityDetail(app, id){
 }
 
 /* ---------- (7) join wizard ---------- */
-var JOIN_STEPS = ["Account & contact","Personal & location","Demographics","Professional info","Portfolio","Fast-Track Authorization"];
+var JOIN_STEPS = ["Quick sign-up","About you","Professional & permissions"];
 var PHOTO_SLOTS = ["MAIN HEADSHOT","FULL-BODY PHOTO","PROFESSIONAL PORTRAIT","CASUAL LOOK","ALTERNATE LOOK","PROFILE OR SIDE VIEW","ADDITIONAL PHOTO","ADDITIONAL PHOTO"];
 function joinDraft(){
   try{ return JSON.parse(localStorage.getItem("ttt_join_draft")||"{}"); }catch(e){ return {}; }
@@ -547,90 +577,106 @@ function chipSet(id, values, selected, onPick){
     });
   });
 }
+/* v7 — 3-SCREEN SIGNUP REBUILD. Screen 1 is quick (name, email, phone,
+   password, city, state, contact preference, terms) and creates the
+   account immediately; email verification follows at #/verify. The
+   remaining fields moved to post-signup profile completion, tracked by
+   the % meter on the dashboard — nothing blocks joining. */
 function screenJoin(app){
   var d = joinDraft();
   var step = parseInt(qs("step")||"1",10) || 1;
-  if(step<1||step>6) step=1;
+  if(step<1||step>3) step=1;
   d.availability = d.availability||[]; d.categories=d.categories||[]; d.skills=d.skills||[];
   d.fast_track = d.fast_track||{A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
   var html = '<div class="brand-mark hero-mark">'+brandMarkSVG(72)+'</div>'
     + '<h1 style="color:var(--gold)">YOUR NEXT OPPORTUNITY STARTS HERE</h1>'
-    + '<p class="progress-label">Step '+step+' of 6 — '+esc(JOIN_STEPS[step-1])+'</p>'
+    + '<p class="progress-label">Screen '+step+' of 3 — '+esc(JOIN_STEPS[step-1])+'</p>'
     + '<div class="progress" aria-label="Join progress">'+JOIN_STEPS.map(function(_,i){
         return '<i class="'+(i+1<step?'done':(i+1===step?'now':''))+'"></i>';
       }).join("")+'</div>'
     + '<div class="card"><div id="join-msg"></div><form id="join-form">';
   if(step===1){
-    html += '<label>First name<input name="first_name" required value="'+esc(d.first_name||"")+'"></label>'
-      + '<div class="form-row"><div><label>Last name<input name="last_name" required value="'+esc(d.last_name||"")+'"></label></div>'
-      + '<div><label>Professional name<input name="professional_name" value="'+esc(d.professional_name||"")+'"></label></div></div>'
+    html += '<p class="muted">Quick sign-up — under a minute. The rest of your profile can be completed afterwards; your completion % shows on your dashboard.</p>'
+      + '<div class="form-row"><div><label>First name<input name="first_name" required value="'+esc(d.first_name||"")+'"></label></div>'
+      + '<div><label>Last name<input name="last_name" required value="'+esc(d.last_name||"")+'"></label></div></div>'
+      + '<label>Professional name<input name="professional_name" value="'+esc(d.professional_name||"")+'" placeholder="Stage / professional name (optional)"></label>'
       + '<label>Email<input name="email" type="email" required value="'+esc(d.email||"")+'"></label>'
       + '<label>Phone<input name="phone" type="tel" required value="'+esc(d.phone||"")+'"></label>'
       + '<label>Password<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>'
+      + '<div class="form-row"><div><label>City<input name="city" required value="'+esc(d.city||"")+'" placeholder="Miami"></label></div>'
+      + '<div><label>State<select name="state" required><option value="">Select state…</option>'+US_STATES.map(function(s){ return '<option value="'+s+'"'+(d.state===s?' selected':"")+'>'+s+'</option>'; }).join("")+'</select></label></div></div>'
+      + '<label>Preferred contact method<select name="contact_method"><option value="">No preference</option><option value="email">Email</option><option value="phone">Phone call</option><option value="text">Text</option></select></label>'
       + '<label class="checkbox-row"><input name="terms" type="checkbox" required> <span>I agree to the terms and the likeness-release process. I understand nothing is sent to an employer without my approval.</span></label>';
   } else if(step===2){
-    html += '<label>Height<input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
-      + '<div class="form-row"><div><label>City<input name="city" value="'+esc(d.city||"")+'"></label></div>'
-      + '<div><label>State<input name="state" value="'+esc(d.state||"")+'"></label></div></div>'
-      + '<label>ZIP<input name="zip" value="'+esc(d.zip||"")+'"></label>'
-      + '<label>Travel radius (miles)<input name="travel_radius" type="number" min="0" value="'+esc(d.travel_radius||"")+'"></label>'
-      + '<label>Availability</label><div class="chip-set" id="avail-set"></div>';
-  } else if(step===3){
-    html += '<p class="muted">Optional. Demographics are <strong>never used as a match score</strong> — they only help describe roles you may fit, and you can skip any of them.</p>'
+    html += '<p class="muted">About you — all optional except where marked. Anything you skip can be added later from your profile; your completion % updates as you go.</p>'
+      + '<label>Height<input name="height" placeholder="e.g. 5\'9&quot;" value="'+esc(d.height||"")+'"></label>'
+      + '<div class="form-row"><div><label>ZIP<input name="zip" value="'+esc(d.zip||"")+'"></label></div>'
+      + '<div><label>Travel radius (miles)<input name="travel_radius" type="number" min="0" value="'+esc(d.travel_radius||"")+'"></label></div></div>'
+      + '<label>Availability</label><div class="chip-set" id="avail-set"></div>'
       + '<label>Age range<select name="age_range"><option value="">Prefer not to say</option><option>18–24</option><option>25–34</option><option>35–44</option><option>45–54</option><option>55+</option></select></label>'
+      + '<label>Adult or minor<select name="adult_or_minor"><option value="">Prefer not to say</option><option value="adult">Adult (18+)</option><option value="minor">Minor (under 18 — guardian required)</option></select></label>'
+      + '<p class="muted">Optional demographics — never used as a match score. You control whether any of it is shared.</p>'
       + '<label>Gender<select name="gender"><option value="">Prefer not to say</option><option>Female</option><option>Male</option><option>Non-binary</option><option>Other</option></select></label>'
       + '<label>Ethnicity<select name="ethnicity"><option value="">Prefer not to say</option><option>Black / African American</option><option>Hispanic / Latino</option><option>White</option><option>Asian</option><option>Other</option><option>Two or more</option></select></label>'
       + '<label>Hair color<input name="hair_color" value="'+esc(d.hair_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
-      + '<label>Eye color<input name="eye_color" value="'+esc(d.eye_color||"")+'" placeholder="Prefer not to say — leave blank"></label>';
-  } else if(step===4){
-    html += '<label>Categories</label><div class="chip-set" id="cat-set"></div>'
-      + '<label>Skills (comma separated)<input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>'
+      + '<label>Eye color<input name="eye_color" value="'+esc(d.eye_color||"")+'" placeholder="Prefer not to say — leave blank"></label>'
       + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((d.languages||[]).join(", "))+'" placeholder="English, Spanish…"></label>'
-      + '<label>Experience<textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>';
-  } else if(step===5){
-    html += '<p>Upload up to 8 photos. JPG, PNG, or WEBP only. Photos are downscaled in your browser to a maximum of 1200px (JPEG, quality 0.82) before upload.</p>'
-      + '<p><strong id="photo-count">0 OF 8 PHOTOS</strong></p><div class="photo-grid" id="join-photo-grid"></div>'
-      + '<p class="muted small">Photos can also be added later from your portfolio. You can continue without photos and add them after.</p>';
+      + '<label>Skills (comma separated)<input name="skills_text" value="'+esc((d.skills||[]).join(", "))+'" placeholder="Acting, dance, modeling…"></label>';
   } else {
-    html += '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning it ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time. You can change this any time in Fast-Track settings.</p>'
+    html += '<p class="muted">Professional info &amp; permissions. Photos go in your portfolio (up to 8) — you can add them now or later.</p>'
+      + '<label>Categories</label><div class="chip-set" id="cat-set"></div>'
+      + '<label>Experience<textarea name="experience" rows="4" placeholder="Credits, training, past bookings…">'+esc(d.experience||"")+'</textarea></label>'
+      + '<label>Minimum daily pay you will accept ($)<input name="min_compensation" type="number" min="0" value="'+esc(d.min_compensation||"")+'"></label>'
+      + '<label>Union affiliation<input name="union_affiliation" value="'+esc(d.union_affiliation||"")+'" placeholder="e.g. SAG-AFTRA (optional)"></label>'
+      + '<p><a class="btn btn-ghost btn-sm" href="#/portfolio">Add portfolio photos (up to 8)</a></p>'
+      + '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning it ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time. You can change this any time in Fast-Track settings.</p>'
       + '<div id="ft-controls"></div>';
   }
   html += '<div class="actions-row">'
     + (step>1?'<button class="btn btn-ghost" type="button" id="join-back">Back</button>':"")
-    + (step<6?'<button class="btn" type="submit">Save &amp; continue</button>':'<button class="btn" type="submit">Finish — create my account</button>')
+    + (step<3?'<button class="btn" type="submit">Save &amp; continue</button>':'<button class="btn" type="submit">Finish — save my profile</button>')
     + '</div></form></div>'
     + '<p class="muted small">Your answers save automatically on this device as you go. If you are logged in, changes also save to your profile.</p>';
   app.innerHTML = html;
 
-  if(step===2) chipSet("avail-set", ["Weekdays","Weekends","Mornings","Afternoons","Evenings","Nights","On call"], d.availability, function(v){ d.availability=v; saveDraft(d); });
-  if(step===4) chipSet("cat-set", ["film-tv","commercial","modeling","music-video","extras","live-event","reality-tv","brand-activation","promo","specialty"], d.categories, function(v){ d.categories=v; saveDraft(d); });
-  if(step===5) renderJoinPhotos(d);
-  if(step===6) renderFastTrackControls($("#ft-controls"), d.fast_track, function(k,v){ d.fast_track[k]=v; saveDraft(d); });
+  if(step===2) chipSet("avail-set", ["Available immediately","Weekdays","Weekends","Evenings","Flexible","Specific dates","Temporarily unavailable"], d.availability, function(v){ d.availability=v; saveDraft(d); });
+  if(step===3){
+    chipSet("cat-set", ["Film and television","Background extras","Featured extras","Commercials","Advertising","Music videos","Modeling","Print campaigns","Promotional events","Brand activations","Reality television","Live events","Corporate productions","Specialty talent","Other paid opportunities"], d.categories, function(v){ d.categories=v; saveDraft(d); });
+    renderFastTrackControls($("#ft-controls"), d.fast_track, function(k,v){ d.fast_track[k]=v; saveDraft(d); });
+  }
 
   var back = $("#join-back");
   if(back) back.addEventListener("click", function(){ location.hash = "#/join?step="+(step-1); route(); });
   $("#join-form").addEventListener("submit", function(e){
     e.preventDefault();
     var fd = new FormData(e.target);
-    ["first_name","last_name","professional_name","email","phone","password","height","city","state","zip","travel_radius","age_range","gender","ethnicity","hair_color","eye_color","experience"].forEach(function(k){
+    ["first_name","last_name","professional_name","email","phone","password","height","city","state","zip","travel_radius","age_range","gender","ethnicity","hair_color","eye_color","experience","min_compensation","union_affiliation","contact_method"].forEach(function(k){
       if(fd.get(k)!==null && fd.get(k)!=="") d[k]=fd.get(k);
     });
+    if(fd.get("adult_or_minor")) d.adultOrMinor = fd.get("adult_or_minor");
     if(fd.get("skills_text")!==null) d.skills = String(fd.get("skills_text")||"").split(",").map(function(s){return s.trim();}).filter(Boolean);
     if(fd.get("languages_text")!==null) d.languages = String(fd.get("languages_text")||"").split(",").map(function(s){return s.trim();}).filter(Boolean);
     saveDraft(d);
     var msg = $("#join-msg");
     if(step===1){
       if(!apiBase()){ msg.innerHTML = errBox("The backend is not configured yet, so the account cannot be created right now. Your answers are saved on this device."); return; }
-      api("/api/v1/auth/register", {method:"POST", body:{email:d.email, password:d.password, firstName:d.first_name, lastName:d.last_name, professionalName:d.professional_name, phone:d.phone, termsAccepted:true}})
+      api("/api/v1/auth/register", {method:"POST", body:{email:d.email, password:d.password, firstName:d.first_name, lastName:d.last_name, professionalName:d.professional_name, phone:d.phone, city:d.city, state:d.state, contactMethod:d.contact_method, termsAccepted:true}})
         .then(function(r){
           var tok = r.token||r.access_token||"", id=(r.talent&&r.talent.id)||r.talentId||r.talent_id||r.id||"";
           if(tok&&id){ try{ localStorage.setItem("ttt_token",tok); localStorage.setItem("ttt_talent_id",id); }catch(err){} }
-          location.hash = "#/join?step=2"; route();
+          // TEST MODE: the verification code comes back in the register
+          // response because email is not connected — keep it for the
+          // verify screen, session-only.
+          try{
+            if(r.testModeVerificationCode) sessionStorage.setItem("ttt_verify_code", r.testModeVerificationCode);
+            if(r.testModeVerificationCode) sessionStorage.setItem("ttt_verify_email", d.email);
+          }catch(err){}
+          location.hash = "#/verify"; route();
         })
         .catch(function(err){ msg.innerHTML = errBox(err.message); });
       return;
     }
-    if(step<6){
+    if(step<3){
       if(isLoggedIn()){
         api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d)})
           .then(function(){ location.hash = "#/join?step="+(step+1); route(); })
@@ -638,15 +684,79 @@ function screenJoin(app){
       } else { location.hash = "#/join?step="+(step+1); route(); }
       return;
     }
-    // step 6 finish
-    if(isLoggedIn()){
+    // step 3 finish: save profile + fast-track, then the likeness release
+    var finish = function(){
+      if(!isLoggedIn()){ location.hash = "#/consent"; route(); return; }
       api("/api/v1/talent/"+encodeURIComponent(sessionTalentId())+"/fast-track", {method:"POST", body:{controls:d.fast_track}})
         .then(function(){ try{ localStorage.removeItem("ttt_join_draft"); }catch(err){} location.hash = "#/consent"; route(); })
         .catch(function(err){ msg.innerHTML = errBox(err.message); });
-    } else {
-      msg.innerHTML = okBox("Fast-Track choices saved on this device. Create your account (step 1) to finish, then review the likeness release.");
-      setTimeout(function(){ location.hash = "#/consent"; route(); }, 1200);
-    }
+    };
+    if(isLoggedIn()){
+      api("/api/v1/talent/"+encodeURIComponent(sessionTalentId()), {method:"PATCH", body:toApiProfile(d)})
+        .then(finish)
+        .catch(function(err){ msg.innerHTML = errBox(err.message); });
+    } else finish();
+  });
+}
+/* Email verification screen (v7): 6-digit code, resend, live status.
+   TEST MODE: email is not connected, so the code is shown on this screen
+   from the sign-up response (session-only) instead of arriving by email. */
+function screenVerify(app){
+  var email = "";
+  try{ email = sessionStorage.getItem("ttt_verify_email") || ""; }catch(e){}
+  if(!email && isLoggedIn()){
+    // fall back to the logged-in talent's email
+  }
+  app.innerHTML = '<div class="card"><h2>Verify your email</h2><div id="verify-msg"></div>'
+    + '<p class="muted">We sent a 6-digit code to <strong id="verify-email-label">'+esc(email||"your email")+'</strong>. It expires in 15 minutes and locks after 5 wrong tries — you can always request a new one.</p>'
+    + '<p class="notice-box" id="verify-test-note"></p>'
+    + '<form id="verify-form"><label for="verify-email">Email</label><input id="verify-email" type="email" required value="'+esc(email)+'">'
+    + '<label for="verify-code">6-digit code</label><input id="verify-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="123456" class="code-input">'
+    + '<p><button class="btn" type="submit">Verify my email</button> <button class="btn btn-ghost" id="verify-resend" type="button">Resend code</button></p></form>'
+    + '<p id="verify-status" class="muted"></p>'
+    + '<p class="muted small">Verified email is required before you can sign the likeness release.</p></div>';
+  try{
+    var tc = sessionStorage.getItem("ttt_verify_code");
+    var note = $("#verify-test-note");
+    if(note) note.innerHTML = tc
+      ? "TEST MODE — email is not connected, so your code is shown here instead of emailed: <strong>"+esc(tc)+"</strong> (shown once, session-only)."
+      : "TEST MODE — email is not connected. If you already have a code, enter it above; otherwise tap Resend code.";
+  }catch(e){}
+  var refreshStatus = function(){
+    var em = $("#verify-email").value.trim();
+    if(!em || !apiBase()) return;
+    apiGet("/api/v1/auth/verification-status?email="+encodeURIComponent(em)).then(function(d){
+      var el = $("#verify-status"); if(!el) return;
+      el.textContent = d.verified ? "Status: VERIFIED — you are all set." : (d.hasActiveCode ? "Status: code sent, waiting for you to enter it." : "Status: no active code — tap Resend code.");
+      if(d.verified){ try{ sessionStorage.removeItem("ttt_verify_code"); }catch(err){} }
+    }).catch(function(){});
+  };
+  if(email) refreshStatus();
+  $("#verify-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var msg = $("#verify-msg");
+    var em = $("#verify-email").value.trim(), code = $("#verify-code").value.trim();
+    api("/api/v1/auth/verify-email", {method:"POST", body:{email:em, code:code}})
+      .then(function(){
+        try{ sessionStorage.removeItem("ttt_verify_code"); }catch(err){}
+        msg.innerHTML = okBox("Email verified. Continue to your profile — screen 2 of sign-up.");
+        setTimeout(function(){ location.hash = "#/join?step=2"; route(); }, 1200);
+      })
+      .catch(function(err){ msg.innerHTML = errBox(err.message); });
+  });
+  $("#verify-resend").addEventListener("click", function(){
+    var msg = $("#verify-msg");
+    var em = $("#verify-email").value.trim();
+    if(!em){ msg.innerHTML = errBox("Enter your email first."); return; }
+    api("/api/v1/auth/resend-verification", {method:"POST", body:{email:em}})
+      .then(function(r){
+        try{ if(r.testModeVerificationCode) sessionStorage.setItem("ttt_verify_code", r.testModeVerificationCode); }catch(err){}
+        var note = $("#verify-test-note");
+        if(note && r.testModeVerificationCode) note.innerHTML = "TEST MODE — email is not connected, so your new code is shown here instead of emailed: <strong>"+esc(r.testModeVerificationCode)+"</strong> (shown once, session-only).";
+        msg.innerHTML = okBox("A new code was issued (15 minutes).");
+        refreshStatus();
+      })
+      .catch(function(err){ msg.innerHTML = errBox(err.message); });
   });
 }
 function renderJoinPhotos(d){
@@ -739,8 +849,29 @@ function screenDashboard(app){
       + '<div class="stat"><b>'+books.length+'</b><span>bookings</span></div></div>'
       + '<p class="muted">Auditions and callbacks appear here once the agency records them. Notifications: '+unread+' unread.</p></div>'
       + '<div class="card"><h3>Matching opportunities</h3><div id="dash-matches"><p class="muted">Run a match to see your current fits.</p><p><a class="btn btn-ghost btn-sm" href="#/matches">Run matching</a></p></div></div>'
-      + '<div class="card" id="dash-agencies"><h3>Top Repeat Agencies</h3><div id="dash-agency-list"><p class="muted">Loading agency board…</p></div><p><a href="#/agency">Open the full Agency Network board &rarr;</a></p></div>';
+      + '<div class="card" id="dash-agencies"><h3>Top Repeat Agencies</h3><div id="dash-agency-list"><p class="muted">Loading agency board…</p></div><p><a href="#/agency">Open the full Agency Network board &rarr;</a></p></div>'
+      + '<div class="card" id="dash-v11"><h3>Jobs, earnings &amp; your link</h3><p><a class="btn btn-ghost btn-sm" href="#/jobs">Jobs For You</a> <a class="btn btn-ghost btn-sm" href="#/earnings">My Earnings &amp; Credits</a> <a class="btn btn-ghost btn-sm" href="#/automation">Automation</a> <a class="btn btn-ghost btn-sm" href="#/social">Social Links</a> <a class="btn btn-ghost btn-sm" href="#/replies">Agency Replies</a></p><div id="dash-v11-detail"><p class="muted">Loading your portfolio link…</p></div></div>';
     renderTopRepeatWidget($("#dash-agency-list"), agencies);
+    Promise.all([
+      fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/portfolio-link"),
+      fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/earnings")
+    ]).then(function(r2){
+      var box = $("#dash-v11-detail"); if(!box) return;
+      var pl = r2[0]||{}, earn = r2[1]||{};
+      var vis = pl.visibility || (t.visibility || "private");
+      var linkLine = vis === "public"
+        ? '<p>Your public portfolio link: <a href="'+esc(pl.path||("#/talent/"+id))+'">'+esc(pl.path||("#/talent/"+id))+'</a> — this opens YOUR profile and portfolio, never the front page. <button class="mini-btn" id="dash-copy-link" type="button">Copy link</button></p>'
+        : '<p>Your portfolio link is <strong>private</strong> right now ('+esc(pl.path||("#/talent/"+id))+'). Set visibility to Public in Settings to share it with agencies.</p>';
+      box.innerHTML = linkLine
+        + '<p>You have made <strong>'+money(earn.totalNetCents||0)+'</strong> with TOP TEA TALENTS across '+(earn.jobCount||0)+' job'+((earn.jobCount||0)===1?"":"s")+'. <a href="#/earnings">See the breakdown &rarr;</a></p>'
+        + '<p class="muted small">Automation is <strong>'+(t.automation && t.automation.enabled ? "ON" : "OFF")+'</strong>. Email verified: <strong>'+(t.emailVerified ? "yes" : "no — verify at #/verify")+'</strong>.</p>';
+      var cp = $("#dash-copy-link");
+      if(cp) cp.addEventListener("click", function(){
+        var full = location.origin + location.pathname + (pl.path||("#/talent/"+id));
+        if(navigator.clipboard) navigator.clipboard.writeText(full).then(function(){ cp.textContent = "Copied!"; }).catch(function(){ cp.textContent = full; });
+        else cp.textContent = full;
+      });
+    }).catch(function(){});
   }).catch(function(err){ $("#dash").innerHTML = errBox(err.message); });
 }
 
@@ -813,6 +944,8 @@ function screenProfile(app){
       + '<label>Travel radius (miles)<input name="travel_radius" type="number" value="'+esc(t.travel_radius||"")+'"></label>'
       + '<label>Languages (comma separated)<input name="languages_text" value="'+esc((t.languages||[]).join(", "))+'"></label>'
       + '<label>Experience<textarea name="experience" rows="4">'+esc(t.experience||"")+'</textarea></label>'
+      + '<label>Portfolio visibility<select name="visibility"><option value="private"'+((t.visibility||"private")==="private"?" selected":"")+'>Private — nobody sees my portfolio</option><option value="agency"'+(t.visibility==="agency"?" selected":"")+'>Agency staff only</option><option value="public"'+(t.visibility==="public"?" selected":"")+'>Public — anyone with my personal link</option></select></label>'
+      + '<label class="checkbox-row"><input type="checkbox" name="share_photos"'+(t.sharePhotos?" checked":"")+'> <span>Share my portfolio photos on my public portfolio page (only when visibility is Public).</span></label>'
       + '<p><button class="btn" type="submit">Save profile</button></p></form>'
       + '<hr style="border-color:var(--line)"><h3>Guardian (for talent under 18)</h3><p class="muted small">If the talent is a minor, a parent or guardian must be on file.</p>'
       + '<form id="guardian-form"><label>Guardian name<input id="guardian-name" value="'+esc(t.guardian_name||"")+'"></label>'
@@ -827,6 +960,8 @@ function screenProfile(app){
       e.preventDefault();
       var body = {};
       new FormData(e.target).forEach(function(v,k){ body[k]=v; });
+      var sp = e.target.querySelector('[name="share_photos"]');
+      body.sharePhotos = sp ? sp.checked : false;
       if(body.languages_text!==undefined){ body.languages = String(body.languages_text||"").split(",").map(function(s){return s.trim();}).filter(Boolean); delete body.languages_text; }
       api("/api/v1/talent/"+encodeURIComponent(id), {method:"PATCH", body:toApiProfile(body)})
         .then(function(){ $("#prof-msg").innerHTML = okBox("Profile saved."); })
@@ -858,6 +993,7 @@ function screenFastTrack(app){
   var id = sessionTalentId();
   app.innerHTML = '<h1 style="color:var(--gold)">Fast-Track Permissions</h1><div class="card"><div id="ft-msg"></div>'
     + '<p class="notice-box"><strong>Auto-submit is OFF by default.</strong> Turning control A ON permits the agency to submit your profile automatically to matches that fit your rules — without asking you first each time.</p>'
+    + '<p><a class="btn btn-ghost btn-sm" href="#/automation">Open the BIG automation toggle &rarr;</a></p>'
     + '<div id="ft-controls">Loading…</div><p><button class="btn" id="ft-save" type="button">Save permissions</button></p></div>';
   var state = {A:false,B:false,C:false,D:false,E:false,F:false,G:false,H:false};
   apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/fast-track").then(function(d){
@@ -951,6 +1087,349 @@ function screenMatches(app){
   });
 }
 
+/* ---------- (8b) v7–v11 screens: Jobs For You, automation, earnings, owner, public talent, social, cubicles, replies ---------- */
+function screenJobsForYou(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Jobs For You</h1>'
+    + '<p class="muted">Your ranked matches, evolved as your profile changes. Each job carries its personal reference code — the same code the agency sees in its email for you.</p>'
+    + '<div id="jobs-list">'+loadingBox("Loading your jobs…")+'</div>';
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/jobs-for-you").then(function(d){
+    var list = d.jobs||[];
+    var el = $("#jobs-list"); if(!el) return;
+    if(!list.length){ el.innerHTML = emptyBox("No jobs for you yet. Complete your profile and portfolio, then check back — new matches appear as listings land."); return; }
+    el.innerHTML = '<p class="muted">'+list.length+' job'+(list.length===1?"":"s")+' for you · Automation is <strong>'+(d.automationEnabled?"ON":"OFF")+'</strong> · '+esc(d.note||"")+'</p>'
+      + list.map(function(j){
+        return '<div class="opp-card"><h3>'+esc(j.title||"Job")+'</h3>'
+          + '<p><strong>'+esc(j.classification||"")+'</strong> — '+esc((j.reasons||[]).join(" · "))+'</p>'
+          + '<p class="meta">'+esc(j.agency||"")+' · '+esc(j.location?((j.location.city||"")+", "+(j.location.state||"")):"")+' · Pay: '+esc(j.compensation||"Not stated")+'</p>'
+          + '<p class="meta">Reference code: <strong class="mono">'+esc(j.referenceCode||"")+'</strong> · '+esc(j.automationNote||"")+'</p>'
+          + '<p><a class="btn btn-ghost btn-sm" href="#/opportunity/'+encodeURIComponent(j.opportunityId)+'">View opportunity</a></p></div>';
+      }).join("");
+  }).catch(function(err){ $("#jobs-list").innerHTML = errBox(err.message); });
+}
+
+function screenAutomation(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Automation</h1>'
+    + '<div class="card"><div id="auto-msg"></div>'
+    + '<p class="muted">One BIG switch. When it is ON, the agency may send your profile to matching jobs automatically — agency mailbox sends, you are CC\'d, Reply-To is you, and every send carries your personal reference code for that job. When it is OFF, every job waits for your approval.</p>'
+    + '<div class="big-toggle-row"><span class="big-toggle-label">AUTOMATION</span>'
+    + '<button type="button" class="big-toggle" id="auto-toggle" aria-pressed="false"><span class="toggle-knob"></span><span class="toggle-state">OFF</span></button></div>'
+    + '<p class="notice-box">TEST MODE — even with automation ON, nothing is ever sent live. Would-be sends queue for review instead.</p>'
+    + '<div id="auto-detail"><p class="muted">Loading your automation settings…</p></div>'
+    + '<p><button class="btn" id="auto-save" type="button">Save automation</button></p></div>';
+  var state = {enabled:false, agencySendEmail:true, ccTalent:true, replyToTalent:true};
+  var paint = function(){
+    var t = $("#auto-toggle"); if(!t) return;
+    t.classList.toggle("on", !!state.enabled);
+    t.setAttribute("aria-pressed", state.enabled?"true":"false");
+    var s = t.querySelector(".toggle-state"); if(s) s.textContent = state.enabled ? "ON" : "OFF";
+  };
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/automation").then(function(d){
+      state = d.automation||state;
+      paint();
+      var el = $("#auto-detail"); if(!el) return;
+      el.innerHTML = '<dl class="kv"><dt>Agency-send email</dt><dd>'+(state.agencySendEmail?"Yes — the agency mailbox sends":"No")+'</dd>'
+        + '<dt>You are CC\'d</dt><dd>'+(state.ccTalent?"Yes":"No")+'</dd>'
+        + '<dt>Reply-To</dt><dd>'+(state.replyToTalent?"You (the talent)":"The agency")+'</dd>'
+        + '<dt>Geography</dt><dd>'+esc(state.geography||"Your fast-track rules")+'</dd>'
+        + '<dt>Minimum daily pay</dt><dd>'+esc(state.minDaily!==null&&state.minDaily!==undefined?"$"+state.minDaily:"Your fast-track rules")+'</dd></dl>'
+        + '<p class="muted small">Fine-grained rules (categories, geography, pay floor) live in <a href="#/fast-track">Fast-Track Permissions</a>.</p>';
+    }).catch(function(err){ $("#auto-detail").innerHTML = errBox(err.message); });
+  };
+  $("#auto-toggle").addEventListener("click", function(){ state.enabled = !state.enabled; paint(); });
+  $("#auto-save").addEventListener("click", function(){
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/automation", {method:"POST", body:state})
+      .then(function(){ $("#auto-msg").innerHTML = okBox(state.enabled ? "Automation is ON. TEST MODE: nothing is ever sent live." : "Automation is OFF. Nothing will be submitted automatically."); })
+      .catch(function(err){ $("#auto-msg").innerHTML = errBox(err.message); });
+  });
+  load();
+}
+
+function screenEarnings(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">My Earnings &amp; Credits</h1>'
+    + '<p class="muted">Proof of work: every job you accepted and completed successfully, plus exactly what <strong>you</strong> made on each one. Agency commission is never shown here — only the owner sees agency money.</p>'
+    + '<div id="earn-box">'+loadingBox("Loading your earnings…")+'</div>'
+    + '<div id="credits-box">'+loadingBox("Loading your credits…")+'</div>';
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/earnings").then(function(d){
+    var el = $("#earn-box"); if(!el) return;
+    var jobs = d.jobs||[];
+    el.innerHTML = '<div class="card"><h2>What you made</h2>'
+      + '<p>Running total with TOP TEA TALENTS: <strong class="gold">'+money(d.totalNetCents)+'</strong> across '+d.jobCount+' job'+(d.jobCount===1?"":"s")+' · Completed jobs: <strong>'+money(d.completedNetCents)+'</strong></p>'
+      + (jobs.length ? '<table><thead><tr><th>Job</th><th>Agency</th><th>Status</th><th>Net to you</th></tr></thead><tbody>'
+        + jobs.map(function(j){ return '<tr><td>'+esc(j.title||"")+'</td><td>'+esc(j.agency||"—")+'</td><td>'+esc(j.status||"")+'</td><td><strong>'+money(j.netCents)+'</strong></td></tr>'; }).join("")+'</tbody></table>'
+        : emptyBox("No jobs yet. When you book and complete work, your pay per job and your running total appear here."))
+      + '</div>';
+  }).catch(function(err){ $("#earn-box").innerHTML = errBox(err.message); });
+  apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/credits").then(function(d){
+    var el = $("#credits-box"); if(!el) return;
+    var list = d.credits||[];
+    el.innerHTML = '<div class="card"><h2>Proof of work — credits ('+d.completedCount+')</h2>'
+      + (list.length ? '<ul>'+list.map(function(c){ return '<li><strong>'+esc(c.title||"")+'</strong>'+(c.production?" — "+esc(c.production):"")+(c.agency?" · "+esc(c.agency):"")+' · Completed '+esc(fmtDate(c.completedAt))+'</li>'; }).join("")+'</ul>'
+        : emptyBox("No completed jobs yet. Finished work shows up here as your proof of work."))
+      + (d.acceptedInProgress ? '<p class="muted">'+d.acceptedInProgress+' job'+(d.acceptedInProgress===1?"":"s")+' accepted and in progress.</p>' : "")
+      + '</div>';
+  }).catch(function(err){ $("#credits-box").innerHTML = errBox(err.message); });
+}
+
+function screenOwner(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Owner View</h1>'
+    + '<p class="muted">Agency money lives here and nowhere else. Unlock with the owner passcode — the session lasts 12 hours. Talent, staff, and casting never see agency earnings.</p>'
+    + '<div class="card"><div id="owner-msg"></div><div id="owner-body">'+loadingBox("Checking the owner gate…")+'</div></div>'
+    + '<div id="owner-earnings"></div>';
+  var body = $("#owner-body"), earn = $("#owner-earnings");
+  var showEarnings = function(){
+    var tok = ownerToken();
+    api("/api/v1/agency-earnings", {token: tok || undefined}).then(function(d){
+      earn.innerHTML = '<div class="card"><h2>Agency Earnings (owner only)</h2>'
+        + '<p>Total commission tracked: <strong class="gold">'+money(d.totalCommissionCents)+'</strong> · Total gross: '+money(d.totalGrossCents)+' · Total net paid to talent: '+money(d.totalNetCents)+' · '+d.bookingCount+' booking'+(d.bookingCount===1?"":"s")+'</p>'
+        + ((d.byAgency||[]).length ? '<table><thead><tr><th>Agency</th><th>Bookings</th><th>Gross</th><th>Commission</th><th>Net to talent</th></tr></thead><tbody>'
+          + d.byAgency.map(function(a){ return '<tr><td>'+esc(a.agency)+'</td><td>'+a.bookings+'</td><td>'+money(a.grossCents)+'</td><td><strong>'+money(a.commissionCents)+'</strong></td><td>'+money(a.netCents)+'</td></tr>'; }).join("")+'</tbody></table>' : emptyBox("No bookings yet — no agency earnings to count."))
+        + '<p><button class="btn btn-ghost btn-sm" id="owner-lock" type="button">Lock owner view</button></p></div>';
+      var lock = $("#owner-lock");
+      if(lock) lock.addEventListener("click", function(){
+        api("/api/v1/owner/lock", {method:"POST", body:{}, token: ownerToken() || undefined}).catch(function(){});
+        clearOwnerToken();
+        $("#owner-msg").innerHTML = okBox("Owner view locked.");
+        earn.innerHTML = ""; route();
+      });
+    }).catch(function(err){ earn.innerHTML = errBox(err.message); });
+  };
+  var renderForms = function(gate){
+    var setFormHtml = isAdmin()
+      ? '<hr style="border-color:var(--line)"><h3>Set / change the owner passcode</h3><p class="muted small">Staff (admin token) only. The passcode hash is stored in settings — never in the ledger or the mirror.</p>'
+        + '<form id="owner-set-form"><label>New owner passcode (min 6 characters)<input id="owner-new-passcode" type="password" required minlength="6" autocomplete="new-password"></label>'
+        + '<p><button class="btn btn-ghost" type="submit">Save passcode</button></p></form>'
+      : '<p class="muted small">No passcode set yet? The owner sets it from the staff view (admin token).</p>';
+    var bindSetForm = function(){
+      var setForm = $("#owner-set-form");
+      if(setForm) setForm.addEventListener("submit", function(e){
+        e.preventDefault();
+        api("/api/v1/owner/set-passcode", {method:"POST", body:{passcode:$("#owner-new-passcode").value}})
+          .then(function(){ $("#owner-msg").innerHTML = okBox("Owner passcode saved. Now unlock with it above."); })
+          .catch(function(err){ $("#owner-msg").innerHTML = errBox(err.message); });
+      });
+    };
+    if(gate.unlocked){
+      body.innerHTML = '<p class="success-box">Owner view is UNLOCKED (12-hour session).</p>'
+        + '<p><button class="btn btn-ghost btn-sm" id="owner-lock-2" type="button">Lock owner view</button></p>' + setFormHtml;
+      var l2 = $("#owner-lock-2");
+      if(l2) l2.addEventListener("click", function(){
+        api("/api/v1/owner/lock", {method:"POST", body:{}, token: ownerToken() || undefined}).catch(function(){});
+        clearOwnerToken(); earn.innerHTML = ""; route();
+      });
+      bindSetForm();
+      showEarnings();
+      return;
+    }
+    body.innerHTML = '<h3>Unlock the owner view</h3>'
+      + '<form id="owner-unlock-form"><label>Owner passcode<input id="owner-passcode" type="password" required autocomplete="off"></label>'
+      + '<p><button class="btn" type="submit">Unlock (12 hours)</button></p></form>'
+      + setFormHtml;
+    $("#owner-unlock-form").addEventListener("submit", function(e){
+      e.preventDefault();
+      api("/api/v1/owner/unlock", {method:"POST", body:{passcode:$("#owner-passcode").value}})
+        .then(function(d){
+          try{ localStorage.setItem("ttt_owner_token", d.ownerToken); localStorage.setItem("ttt_owner_expires", d.expiresAt); }catch(err){}
+          $("#owner-msg").innerHTML = okBox("Owner view unlocked for 12 hours.");
+          route();
+        })
+        .catch(function(err){ $("#owner-msg").innerHTML = errBox(err.message); });
+    });
+    bindSetForm();
+  };
+  api("/api/v1/owner/gate", {token: ownerTokenValid() ? ownerToken() : undefined}).then(renderForms).catch(function(err){ body.innerHTML = errBox(err.message); });
+}
+
+function screenPublicTalent(app, talentId){
+  try{ talentId = decodeURIComponent(talentId); }catch(e){}
+  app.innerHTML = '<p><a href="#/">&larr; Back to Top Tea Talents</a></p><div id="pub-talent">'+loadingBox("Loading portfolio…")+'</div>';
+  if(!apiBase()){ $("#pub-talent").innerHTML = emptyBox("This portfolio loads from the live backend once it is connected."); return; }
+  apiGet("/api/v1/public/talent/"+encodeURIComponent(talentId)).then(function(d){
+    var p = d.portfolio||{};
+    var el = $("#pub-talent"); if(!el) return;
+    var name = p.professionalName || ((p.firstName||"")+" "+(p.lastName||"")).trim() || "Talent";
+    el.innerHTML = '<div class="card"><div class="brand-mark hero-mark">'+brandMarkSVG(64)+'</div>'
+      + '<h1>'+esc(name)+'</h1>'
+      + '<p class="muted">TOP TEA TALENTS · '+esc([p.city, p.state].filter(Boolean).join(", ")||"")+'</p>'
+      + '<p>Categories: <strong>'+esc((p.categories||[]).join(", ")||"—")+'</strong></p>'
+      + '<p>Skills: '+esc((p.skills||[]).join(", ")||"—")+' · Languages: '+esc((p.languages||[]).join(", ")||"—")+'</p>'
+      + '<p>Height: '+esc(p.height||"—")+' · Availability: '+esc((p.availability||[]).join(", ")||"—")+'</p>'
+      + (p.experience?'<p>'+esc(p.experience)+'</p>':"")
+      + '</div>'
+      + '<div class="card"><h2>Portfolio</h2>'
+      + (p.photos && p.photos.length
+          ? '<div class="photo-grid">'+p.photos.map(function(ph){ return '<div class="photo-slot"><img src="'+esc(apiBase()+ph.url)+'" alt="'+esc(ph.caption||ph.label)+'"><p class="small">'+esc(ph.caption||ph.label)+'</p></div>'; }).join("")+'</div>'
+          : '<p class="muted">No portfolio photos shared publicly.</p>')
+      + '</div>'
+      + ((p.socialPhotos||[]).length || (p.socialLinks||[]).length ? '<div class="card"><h2>From social</h2>'
+        + (p.socialLinks||[]).map(function(s){ return '<p><strong>'+esc(s.platform)+'</strong> — '+esc(s.handle)+(s.bioChecked?" · bio links TOP TEA TALENTS":"")+'</p>'; }).join("")
+        + (p.socialPhotos||[]).map(function(ph){ return '<p><img src="'+esc(ph.photoUrl)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:240px"> <span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+')</span></p>'; }).join("")
+        + '</div>' : "")
+      + '<div class="card"><h2>Proof of work — credits ('+(p.credits||[]).length+')</h2>'
+      + ((p.credits||[]).length ? '<ul>'+p.credits.map(function(c){ return '<li><strong>'+esc(c.title||"")+'</strong>'+(c.production?" — "+esc(c.production):"")+(c.agency?" · "+esc(c.agency):"")+'</li>'; }).join("")+'</ul>' : '<p class="muted">No completed jobs listed yet.</p>')
+      + '</div>'
+      + '<p class="muted small">This is a personal portfolio page for '+esc(name)+' — shared with the talent\'s permission. Contact details are never shown here; reach the talent through TOP TEA TALENTS.</p>';
+  }).catch(function(err){
+    var el = $("#pub-talent"); if(!el) return;
+    el.innerHTML = '<div class="card"><h2>Portfolio unavailable</h2><p>'+esc(err.message)+'</p><p class="muted">Portfolios are private by default and shared only with the talent\'s permission.</p></div>';
+  });
+}
+
+function screenSocial(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Social Links</h1>'
+    + '<p class="muted">Link YOUR OWN Instagram and/or Facebook. A few of your photos then show as an extended portfolio preview, alongside your 8-photo portfolio — only what you connect and approve.</p>'
+    + '<div class="card"><div id="social-msg"></div><div id="social-list">'+loadingBox("Loading your social links…")+'</div></div>'
+    + '<div class="card"><h2>Link an account</h2><form id="social-add-form">'
+    + '<label>Platform<select id="social-platform"><option value="instagram">Instagram</option><option value="facebook">Facebook</option></select></label>'
+    + '<label>Your handle / profile name<input id="social-handle" placeholder="@yourhandle" required></label>'
+    + '<p><button class="btn" type="submit">Begin linking</button></p></form>'
+    + '<p class="muted small">There is no OAuth integration yet — linking is talent-attested: you state the account is yours, then confirm it. The preview only ever shows what you connected and approved.</p></div>'
+    + '<div class="card"><h2>Add a social photo to the preview</h2><form id="social-photo-form">'
+    + '<label>Platform<select id="social-photo-platform"><option value="instagram">Instagram</option><option value="facebook">Facebook</option></select></label>'
+    + '<label>Photo URL (a public link to one of your own photos)<input id="social-photo-url" type="url" placeholder="https://…" required></label>'
+    + '<label>Caption<input id="social-photo-caption" placeholder="Optional caption"></label>'
+    + '<p><button class="btn btn-ghost" type="submit">Add to preview</button></p></form><div id="social-photo-msg"></div></div>';
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/social-links").then(function(d){
+      var el = $("#social-list"); if(!el) return;
+      var links = d.socialLinks||[], photos = d.socialPhotos||[];
+      el.innerHTML = '<h3>Linked accounts ('+links.length+')</h3>'
+        + (links.length ? links.map(function(l){
+            return '<div class="card"><p><strong>'+esc(l.platform)+'</strong> — '+esc(l.handle)+' · <span class="badge '+(l.status==="LINKED"?"badge-verified":"badge-unverified")+'">'+esc(l.status)+'</span></p>'
+              + '<p class="muted small">Bio links TOP TEA TALENTS: '+(l.bioChecked?"yes":"not confirmed")+'</p>'
+              + '<p>'+(l.status!=="LINKED"?'<button class="mini-btn" data-confirm="'+l.id+'">Confirm this is my account</button> ':"")
+              + '<button class="mini-btn" data-bio="'+l.id+'">'+(l.bioChecked?"Bio confirmed ✓":"Mark bio as checked")+'</button> '
+              + '<button class="mini-btn" data-unlink="'+l.id+'">Unlink</button></p></div>';
+          }).join("") : emptyBox("No accounts linked yet."))
+        + '<h3>Extended portfolio preview ('+photos.length+' photos)</h3>'
+        + (photos.length ? photos.map(function(ph){
+            return '<p><img src="'+esc(ph.photoUrl)+'" alt="'+esc(ph.caption||"Social photo")+'" style="max-width:200px"> <span class="small">'+esc(ph.caption||"")+' ('+esc(ph.platform)+')</span> <button class="mini-btn" data-del-photo="'+ph.id+'">Remove</button></p>';
+          }).join("") : '<p class="muted">No preview photos yet — add one below.</p>');
+      el.querySelectorAll("[data-confirm]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-confirm")), {method:"POST", body:{action:"confirm"}})
+            .then(function(){ $("#social-msg").innerHTML = okBox("Account confirmed — it now shows in your extended portfolio."); load(); })
+            .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+        });
+      });
+      el.querySelectorAll("[data-bio]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-bio")), {method:"POST", body:{action:"bio-checked", checked:true}})
+            .then(function(){ load(); }).catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+        });
+      });
+      el.querySelectorAll("[data-unlink]").forEach(function(b){
+        b.addEventListener("click", function(){
+          if(!confirm("Unlink this account?")) return;
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links/"+encodeURIComponent(b.getAttribute("data-unlink")), {method:"DELETE"})
+            .then(function(){ load(); }).catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+        });
+      });
+      el.querySelectorAll("[data-del-photo]").forEach(function(b){
+        b.addEventListener("click", function(){
+          api("/api/v1/talent/"+encodeURIComponent(id)+"/social-photos/"+encodeURIComponent(b.getAttribute("data-del-photo")), {method:"DELETE"})
+            .then(function(){ load(); }).catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+        });
+      });
+    }).catch(function(err){ $("#social-list").innerHTML = errBox(err.message); });
+  };
+  load();
+  $("#social-add-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/social-links", {method:"POST", body:{platform:$("#social-platform").value, handle:$("#social-handle").value.trim()}})
+      .then(function(){ $("#social-msg").innerHTML = okBox("Link started (PENDING). Confirm it above to make it live in your extended portfolio."); load(); })
+      .catch(function(err){ $("#social-msg").innerHTML = errBox(err.message); });
+  });
+  $("#social-photo-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    api("/api/v1/talent/"+encodeURIComponent(id)+"/social-photos", {method:"POST", body:{platform:$("#social-photo-platform").value, photoUrl:$("#social-photo-url").value.trim(), caption:$("#social-photo-caption").value.trim()}})
+      .then(function(){ $("#social-photo-msg").innerHTML = okBox("Photo added to your extended portfolio preview."); load(); })
+      .catch(function(err){ $("#social-photo-msg").innerHTML = errBox(err.message); });
+  });
+}
+
+function screenCubicles(app){
+  app.innerHTML = '<h1 style="color:var(--gold)">Cubicles</h1>'
+    + '<p class="muted">Specialist cubicles — the discovery workforce. Each cubicle has a department, mission, sources, and a live status. TEST MODE: nothing runs live; statuses reflect configuration only.</p>'
+    + '<div id="cub-list">'+loadingBox("Loading cubicles…")+'</div>'
+    + '<div class="card" id="cub-add-box"><h2>Add a cubicle (staff)</h2><div id="cub-msg"></div>'
+    + '<form id="cub-add-form"><label>Name<input id="cub-name" required placeholder="e.g. South Florida Extras Scout"></label>'
+    + '<label>Department<input id="cub-dept" placeholder="Film and Television Casting"></label>'
+    + '<label>Mission<input id="cub-mission" placeholder="What this specialist hunts for"></label>'
+    + '<p><button class="btn" type="submit">Create cubicle</button></p></form>'
+    + '<p class="muted small">Staff only — needs the admin token (enter it on the Agency page).</p></div>';
+  var load = function(){
+    if(!apiBase()){ $("#cub-list").innerHTML = emptyBox("Cubicles load from the live backend once it is connected."); return; }
+    apiGet("/api/v1/cubicles").then(function(d){
+      var list = d.cubicles||[];
+      var el = $("#cub-list"); if(!el) return;
+      if(!list.length){ el.innerHTML = emptyBox("No cubicles configured yet. The spec targets 50 specialist cubicles across 6 departments."); return; }
+      el.innerHTML = list.map(function(c){
+        return '<div class="card card-lift"><h3>'+esc(c.name||c.id)+'</h3>'
+          + '<p class="meta">'+esc(c.department||c.dept||"—")+' · Status: <strong>'+esc(c.status||"OPEN")+'</strong></p>'
+          + '<p>'+esc(c.mission||c.assignment||"")+'</p>'
+          + (isAdmin()?'<p><label>Status <select data-cub-status="'+esc(c.id)+'"><option'+(c.status==="OPEN"?" selected":"")+'>OPEN</option><option'+(c.status==="PAUSED"?" selected":"")+'>PAUSED</option><option'+(c.status==="CLOSED"?" selected":"")+'>CLOSED</option></select></label> <button class="mini-btn" data-cub-save="'+esc(c.id)+'">Save status</button></p>':"")
+          + '</div>';
+      }).join("");
+      el.querySelectorAll("[data-cub-save]").forEach(function(b){
+        b.addEventListener("click", function(){
+          var sel = el.querySelector('[data-cub-status="'+b.getAttribute("data-cub-save")+'"]');
+          api("/api/v1/cubicles/"+encodeURIComponent(b.getAttribute("data-cub-save"))+"/status", {method:"PATCH", body:{status: sel ? sel.value : "OPEN"}})
+            .then(function(){ load(); }).catch(function(err){ $("#cub-msg").innerHTML = errBox(err.message); });
+        });
+      });
+    }).catch(function(err){ $("#cub-list").innerHTML = errBox(err.message); });
+  };
+  load();
+  $("#cub-add-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    api("/api/v1/cubicles", {method:"POST", body:{name:$("#cub-name").value.trim(), department:$("#cub-dept").value.trim(), mission:$("#cub-mission").value.trim()}})
+      .then(function(){ $("#cub-msg").innerHTML = okBox("Cubicle created."); load(); })
+      .catch(function(err){ $("#cub-msg").innerHTML = errBox(err.message); });
+  });
+}
+
+function screenReplies(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Agency Replies</h1>'
+    + '<p class="muted">Replies from agencies and casting directors to your applications — auditions, callbacks, questions, offers. Recorded by staff as they arrive.</p>'
+    + '<div id="replies-list">'+loadingBox("Loading replies…")+'</div>'
+    + (isAdmin()?'<div class="card"><h2>Record an inbound reply (staff)</h2><div id="reply-msg"></div>'
+      + '<form id="reply-form"><label>Application ID<input id="reply-app" required placeholder="app_…"></label>'
+      + '<label>From (agency / casting name)<input id="reply-from" placeholder="Project Casting"></label>'
+      + '<label>Channel<input id="reply-channel" placeholder="Email, phone, portal…"></label>'
+      + '<label>Reply<textarea id="reply-body" rows="4" required placeholder="What they said…"></textarea></label>'
+      + '<p><button class="btn" type="submit">Record reply</button></p></form></div>':"");
+  var load = function(){
+    apiGet("/api/v1/application-replies?talentId="+encodeURIComponent(id)).then(function(d){
+      var list = d.replies||[];
+      var el = $("#replies-list"); if(!el) return;
+      if(!list.length){ el.innerHTML = emptyBox("No replies yet. When an agency answers one of your applications, their reply shows up here."); return; }
+      el.innerHTML = list.map(function(r){
+        return '<div class="card"><p><strong>'+esc(r.fromName||"Agency")+'</strong> · '+esc(r.channel||"")+' · '+esc(fmtDT(r.receivedAt))+'</p>'
+          + '<p>'+esc(r.body||"")+'</p><p class="muted small">Application: '+esc(r.applicationId)+'</p></div>';
+      }).join("");
+    }).catch(function(err){ $("#replies-list").innerHTML = errBox(err.message); });
+  };
+  load();
+  var f = $("#reply-form");
+  if(f) f.addEventListener("submit", function(e){
+    e.preventDefault();
+    api("/api/v1/application-replies", {method:"POST", body:{applicationId:$("#reply-app").value.trim(), fromName:$("#reply-from").value.trim(), channel:$("#reply-channel").value.trim(), body:$("#reply-body").value.trim()}})
+      .then(function(){ $("#reply-msg").innerHTML = okBox("Reply recorded."); load(); })
+      .catch(function(err){ $("#reply-msg").innerHTML = errBox(err.message); });
+  });
+}
+
 /* ---------- (9) applications / bookings / notifications / settings / compliance ---------- */
 function screenApplications(app){
   if(!requireLogin(app)) return;
@@ -981,13 +1460,14 @@ function screenBookings(app){
       var fee = b.commissionCents ?? b.feeCents ?? b.fee_cents ?? (b.fee!==undefined?Math.round(b.fee*100):null);
       var net = b.netCents ?? b.net_cents ?? (b.net!==undefined?Math.round(b.net*100):null);
       var pct = b.rate ?? b.fee_percent ?? b.commission_percent ?? b.fee_pct ?? "";
+      var showFee = isAdmin() || ownerTokenValid();
       return '<div class="card card-lift"><h3>'+esc(b.title||b.opportunity_title||b.opportunityId||"Booking")+'</h3>'
         + '<p>Status: <strong>'+esc(b.status||"—")+'</strong> · Payment: <strong>'+esc(b.payment_status||"—")+'</strong></p>'
         + '<table><tbody>'
         + '<tr><td>Gross</td><td><strong>'+(gross!==null?money(gross):"—")+'</strong></td></tr>'
-        + '<tr><td>Agency fee'+(pct!==""?' ('+esc(pct)+'%)':"")+'</td><td><strong>'+(fee!==null?money(fee):"—")+'</strong></td></tr>'
+        + (showFee?'<tr><td>Agency fee'+(pct!==""?' ('+esc(pct)+'%)':"")+'</td><td><strong>'+(fee!==null?money(fee):"—")+'</strong></td></tr>':"")
         + '<tr><td>Net to you</td><td><strong class="gold">'+(net!==null?money(net):"—")+'</strong></td></tr>'
-        + '</tbody></table></div>';
+        + '</tbody></table>'+(showFee?"":'<p class="muted small">Agency fee is hidden here — only the owner sees agency money. Your net is what you were paid.</p>')+'</div>';
     }).join("");
   }).catch(function(err){ $("#book-list").innerHTML = errBox(err.message); });
 }
@@ -1337,6 +1817,7 @@ function initNav(){
 document.addEventListener("DOMContentLoaded", function(){
   initNav();
   initSplash();
+  renderVersionStamp();
   loadApiConfig().then(function(){ apiBanner(); bindAuthSlot(); checkHealth(); route(); });
 });
 window.addEventListener("hashchange", route);

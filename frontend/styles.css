@@ -187,3 +187,13 @@ th{color:var(--gold);font-family:'Helvetica Neue',Arial,sans-serif;font-size:.85
 .seg-toggle button{background:transparent;color:var(--gray);border:0;padding:.45rem .9rem;cursor:pointer;font-family:inherit;font-size:.95rem}
 .seg-toggle button[aria-pressed="true"]{background:var(--gold);color:#14100a;font-weight:700}
 .opp-card.expired{opacity:.62;border-left:3px solid var(--red)}
+
+/* ---------- v11: BIG automation toggle, verification code, version stamp ---------- */
+.big-toggle-row{display:flex;align-items:center;gap:1rem;margin:1rem 0}
+.big-toggle-label{font-weight:900;letter-spacing:.12em;color:var(--gold);font-size:1.1rem}
+.big-toggle{position:relative;width:120px;height:52px;border-radius:999px;border:2px solid var(--line);background:#26221a;color:var(--gray);cursor:pointer;font-family:inherit;font-weight:800;font-size:1rem;display:inline-flex;align-items:center;justify-content:flex-end;padding:0 14px;transition:background .2s ease,border-color .2s ease}
+.big-toggle .toggle-knob{position:absolute;left:6px;top:5px;width:38px;height:38px;border-radius:50%;background:#8a8578;transition:left .2s ease,background .2s ease}
+.big-toggle.on{background:var(--gold);border-color:var(--gold);color:#14100a;justify-content:flex-start}
+.big-toggle.on .toggle-knob{left:74px;background:#14100a}
+.code-input{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:1.5rem;letter-spacing:.5em;text-align:center}
+#version-stamp{font-size:.8rem;letter-spacing:.08em;color:var(--gold);opacity:.85}
