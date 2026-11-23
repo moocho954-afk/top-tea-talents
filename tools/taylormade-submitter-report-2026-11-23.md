@@ -72,6 +72,13 @@ The Playwright engine is built, but **local Chromium cannot reach the internet o
 - `tools/taylormade-submissions.jsonl` — submission log (empty; created on first real submit).
 - This report: `tools/taylormade-submitter-report-2026-11-23.md`.
 
+## Addendum 2026-11-23 ~13:35 EST — owner answers landed (mapper extension)
+
+- Owner answered 11 of 18 by voice note (DOB 1987-10-16 confirmed, 180 lbs, haircut MAYBE, beard+mustache, bathing suit YES, tattoos YES ribs/chest/right arm, shirt L, jacket L, shoe 12, no vintage car, paid fitting YES, overnights YES, legal YES).
+- Found: the mapper hardcoded DOB/weight/consents as gaps (no record fields) AND a false-gap bug — an unconditional `gaps.setdefault()` after clothing `fill()` reported shirt/shoe as gaps even with values present. Fixed both: a `close()` post-pass in `map_talent_to_form` reads `demographics.*` / `measurements.*` and closes gaps with the form's exact option texts; setdefaults are now conditional on the value actually missing.
+- PATCHed live (verified on the record): demographics (dateOfBirth, hairCut MAYBE, bathingSuit YES, tattoos YES + locations, vintageVehicle NO, paidFitting YES, overnights, legalToWork YES), measurements {weightLbs 180}, clothing {shirt L, shoe 12}.
+- Gaps now 7 (was 18): facial hair (shave willingness unknown), neck, sleeve, waist, inseam, jacket size, filming availability (dates ambiguous — "Dec 7 and 6"). Plan 33 steps, every confirmed answer mapped to an exact option.
+
 ## Verification done this run
 
 - Live form parsed from `tally.so/r/LZAXbv` (form open, 50 questions, required flags + full option lists + conditional logic).

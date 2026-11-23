@@ -357,22 +357,29 @@ def map_talent_to_form(talent, questions):
 
     # Sizes — gendered by the form's conditional logic: men's set for Male,
     # women's set for Female; the other set is not-applicable, not a gap.
+    # NOTE (fixed 2026-11-23): the gap line must only fire when the value is
+    # actually missing — an unconditional setdefault after fill() reports a
+    # false gap even when clothing{} carries the size (shirt/shoe proved it).
     if gender.lower() == "male":
         for qname in ("Neck size (men)", "Sleeve length (men)", "Pants waist (men)",
                       "Pants inseam (men)", "Suit jacket size (men)"):
             fill(qname, clothing.get(qname))
-            gaps.setdefault(qname, "clothing{} empty on the talent record")
+            if not clothing.get(qname):
+                gaps.setdefault(qname, "clothing{} empty on the talent record")
         na += ["Pants / jean size (women)", "Dress size", "Bra band size (women)", "Bra cup size (women) (hidden for Male)"]
     elif gender.lower() == "female":
         for qname in ("Pants / jean size (women)", "Dress size",
                       "Bra band size (women)", "Bra cup size (women)"):
             fill(qname, clothing.get(qname))
-            gaps.setdefault(qname, "clothing{} empty on the talent record")
+            if not clothing.get(qname):
+                gaps.setdefault(qname, "clothing{} empty on the talent record")
         na += ["Neck size (men)", "Sleeve length (men)", "Pants waist (men)", "Pants inseam (men)", "Suit jacket size (men) (hidden for Female)"]
     fill("Shirt / blouse size", clothing.get("Shirt / blouse size"))
-    gaps.setdefault("Shirt / blouse size", "clothing{} empty on the talent record")
+    if not clothing.get("Shirt / blouse size"):
+        gaps.setdefault("Shirt / blouse size", "clothing{} empty on the talent record")
     fill("Shoe size", clothing.get("Shoe size"))
-    gaps.setdefault("Shoe size", "clothing{} empty on the talent record")
+    if not clothing.get("Shoe size"):
+        gaps.setdefault("Shoe size", "clothing{} empty on the talent record")
 
     # Vintage vehicle
     fill("Do you have a 1960–1989 car we can use for filming on set?", None)
@@ -402,6 +409,81 @@ def map_talent_to_form(talent, questions):
         if o:
             plan.append({"question": "Referred by", "type": "TEXT", "action": "select", "value": o})
             fill("Which agency referred you?", "Top Tea Talents")
+
+    # --- Casting answers from the talent record (owner-supplied 2026-11-23) ---
+    # The mapping above hardcodes several consent/measurement fields as gaps
+    # because the record had no fields for them. When the profile carries the
+    # owner's answers (demographics.* / measurements.*), close those gaps here
+    # with the form's exact option texts. NOTHING is invented: a field with no
+    # answer stays a gap, and a needle that matches no option re-opens it.
+    meas = p.get("measurements") or {}
+
+    def close(qname, value, needle=None):
+        if value is None or value == "":
+            return
+        if qname not in qmap:
+            return
+        if needle is not None:
+            o = _opt(opts(qname), needle)
+            if o is None:
+                gaps[qname] = f"no matching option for {needle!r}"
+                return
+            gaps.pop(qname, None)
+            plan.append({"question": qname, "type": qmap[qname]["inputs"][0]["type"],
+                         "action": "select", "value": o})
+        else:
+            gaps.pop(qname, None)
+            plan.append({"question": qname, "type": qmap[qname]["inputs"][0]["type"],
+                         "action": "fill", "value": value})
+
+    close("Date of birth", demo.get("dateOfBirth"))
+    close("Weight (lbs)", meas.get("weightLbs"))
+    if demo.get("hairCut"):
+        close("Hair cut / modification", demo["hairCut"], needle=demo["hairCut"])
+    if demo.get("facialHair"):
+        close("Facial hair", demo["facialHair"], needle=demo["facialHair"])
+    if demo.get("bathingSuit") == "YES":
+        close("Bathing suit / wardrobe comfort", "YES", needle="I am COMFORTABLE")
+    elif demo.get("bathingSuit") == "NO":
+        close("Bathing suit / wardrobe comfort", "NO", needle="do not wish to be considered")
+    if demo.get("tattoos") == "YES":
+        close("Tattoos", "YES", needle="I have tattoos")
+        try:
+            na.remove("Tattoo locations (only if Tattoos = YES)")
+        except ValueError:
+            pass
+        for loc in demo.get("tattooLocations") or []:
+            close("Tattoo locations", loc, needle=loc)
+        if not (demo.get("tattooLocations") or []):
+            gaps.setdefault("Tattoo locations", "tattoos = YES but no locations on the record")
+    elif demo.get("tattoos") == "NO":
+        close("Tattoos", "NO", needle="do not have tattoos")
+    if demo.get("vintageVehicle") == "NO":
+        close("Do you have a 1960–1989 car we can use for filming on set?", "NO",
+              needle="do not have a car")
+    elif demo.get("vintageVehicle") == "YES":
+        close("Do you have a 1960–1989 car we can use for filming on set?", "YES",
+              needle="I have a car that can be used")
+    for d in demo.get("filmingDates") or []:
+        close("Filming availability", d, needle=d)
+    if demo.get("paidFitting") == "YES":
+        close("Paid fitting availability", "YES", needle="I can attend a fitting")
+    elif demo.get("paidFitting") == "NO":
+        close("Paid fitting availability", "NO", needle="would not be available for a fitting")
+    if demo.get("overnights"):
+        close("Are you okay with overnights or splits?", demo["overnights"],
+              needle=demo["overnights"])
+    if demo.get("legalToWork") == "YES":
+        close("You must be legal to work in the USA", "YES", needle="I AM LEGAL TO WORK")
+    if demo.get("southFloridaResident"):
+        res_q = "Classic vehicles / Miami cultural / lifestyle experience"
+        o = _opt(opts(res_q), "South Florida Native or Longtime Resident")
+        if o:
+            plan[:] = [s for s in plan
+                       if not (s["question"] == res_q and s.get("value") == "None")]
+            gaps.pop(res_q, None)
+            plan.append({"question": res_q, "type": "CHECKBOX", "action": "check", "value": o})
+
     return plan, gaps, na
 
 
