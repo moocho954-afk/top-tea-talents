@@ -1780,10 +1780,43 @@ function screenReplies(app){
 }
 
 /* ---------- (9) applications / bookings / notifications / settings / compliance ---------- */
+/* ---------- (9a) release button (v1.3.1) ----------
+   A BOOKED booking carries a Release button. One-tap confirm (destructive
+   — the booking leaves her page), then POST /api/v1/bookings/:id/release.
+   The backend enforces the 72-hour rule server-side; a refusal comes back
+   as a plain error message and the booking stays put. RELEASED bookings
+   never render on the talent side. */
+function releaseBookingHTML(b){
+  var date = b.eventDate || b.event_date || "";
+  var hours = (b.hoursUntilEvent !== undefined && b.hoursUntilEvent !== null) ? b.hoursUntilEvent : null;
+  return '<p class="muted small">Booking date: <strong>'+esc(date || "not listed")+'</strong>'
+    + (hours !== null ? ' · '+esc(String(Math.round(hours)))+' hours away' : '')
+    + '<br>Releases must be made at least 72 hours before the booking.</p>'
+    + '<p><button class="btn btn-danger" data-release="'+b.id+'" type="button">Release this booking</button></p>';
+}
+function wireReleaseButtons(el, reload){
+  el.querySelectorAll("[data-release]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var id = btn.getAttribute("data-release");
+      if(!confirm("Release this booking? It will leave your page and the agency will be emailed that you won't be available due to certain circumstances. Releases must be made at least 72 hours before the booking.")) return;
+      btn.disabled = true;
+      api("/api/v1/bookings/"+encodeURIComponent(id)+"/release", {method:"POST", body:{}}).then(function(){
+        var m = el.querySelector("#release-msg");
+        if(m) m.innerHTML = okBox("Booking released. It no longer appears on your page and the agency has been notified.");
+        reload();
+      }).catch(function(err){
+        btn.disabled = false;
+        var m = el.querySelector("#release-msg");
+        if(m) m.innerHTML = errBox(err.message); else alert(err.message);
+      });
+    });
+  });
+}
+
 function screenApplications(app){
   if(!requireLogin(app)) return;
   var id = sessionTalentId();
-  app.innerHTML = '<h1 style="color:var(--gold)">Applications</h1><div id="apps-list">'+loadingBox("Loading applications…")+'</div>';
+  app.innerHTML = '<h1 style="color:var(--gold)">Applications</h1><div id="apps-list">'+loadingBox("Loading applications…")+'</div><h2 style="color:var(--gold)">Your bookings</h2><div id="release-msg"></div><div id="apps-bookings">'+loadingBox("Loading bookings…")+'</div>';
   apiGet("/api/v1/applications?talentId="+encodeURIComponent(id)).then(function(d){
     var list = d.applications||d||[];
     var el = $("#apps-list"); if(!el) return;
@@ -1794,14 +1827,25 @@ function screenApplications(app){
         + '<p class="muted small">Applied '+esc(fmtDT(a.createdAt||a.created_at||a.submitted_at))+'</p></div>';
     }).join("");
   }).catch(function(err){ $("#apps-list").innerHTML = errBox(err.message); });
+  apiGet("/api/v1/bookings?talentId="+encodeURIComponent(id)).then(function(d){
+    var books = (d.bookings||d||[]).filter(function(b){ return b.status === "BOOKED" || b.status === "BOOKING CONFIRMED"; });
+    var el = $("#apps-bookings"); if(!el) return;
+    if(!books.length){ el.innerHTML = emptyBox("No booked jobs to release. When you book, the job shows here with a Release button."); return; }
+    el.innerHTML = books.map(function(b){
+      return '<div class="card card-lift"><h3>'+esc(b.title||b.opportunity_title||b.opportunityId||"Booking")+'</h3>'
+        + '<p>Status: <strong>'+esc(b.status||"—")+'</strong></p>'
+        + releaseBookingHTML(b) + '</div>';
+    }).join("");
+    wireReleaseButtons(el, function(){ screenApplications(app); });
+  }).catch(function(err){ var el2 = $("#apps-bookings"); if(el2) el2.innerHTML = errBox(err.message); });
 }
 
 function screenBookings(app){
   if(!requireLogin(app)) return;
   var id = sessionTalentId();
-  app.innerHTML = '<h1 style="color:var(--gold)">Bookings</h1><div id="book-list">'+loadingBox("Loading bookings…")+'</div>';
+  app.innerHTML = '<h1 style="color:var(--gold)">Bookings</h1><div id="release-msg"></div><div id="book-list">'+loadingBox("Loading bookings…")+'</div>';
   apiGet("/api/v1/bookings?talentId="+encodeURIComponent(id)).then(function(d){
-    var list = d.bookings||d||[];
+    var list = (d.bookings||d||[]).filter(function(b){ return b.status !== "RELEASED"; });
     var el = $("#book-list"); if(!el) return;
     if(!list.length){ el.innerHTML = emptyBox("No bookings yet. When you book, the gross, fee, and net appear here to the cent."); return; }
     el.innerHTML = list.map(function(b){
@@ -1816,8 +1860,10 @@ function screenBookings(app){
         + '<tr><td>Gross</td><td><strong>'+(gross!==null?money(gross):"—")+'</strong></td></tr>'
         + (showFee?'<tr><td>Agency fee'+(pct!==""?' ('+esc(pct)+'%)':"")+'</td><td><strong>'+(fee!==null?money(fee):"—")+'</strong></td></tr>':"")
         + '<tr><td>Net to you</td><td><strong class="gold">'+(net!==null?money(net):"—")+'</strong></td></tr>'
-        + '</tbody></table>'+(showFee?"":'<p class="muted small">Agency fee is hidden here — only the owner sees agency money. Your net is what you were paid.</p>')+'</div>';
+        + '</tbody></table>'+(showFee?"":'<p class="muted small">Agency fee is hidden here — only the owner sees agency money. Your net is what you were paid.</p>')
+        + ((b.status === "BOOKED" || b.status === "BOOKING CONFIRMED") ? releaseBookingHTML(b) : "") + '</div>';
     }).join("");
+    wireReleaseButtons(el, function(){ screenBookings(app); });
   }).catch(function(err){ $("#book-list").innerHTML = errBox(err.message); });
 }
 
