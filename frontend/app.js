@@ -297,6 +297,7 @@ var ROUTES = [
   {re:/^#\/consent$/, fn:screenConsent},
   {re:/^#\/matches$/, fn:screenMatches},
   {re:/^#\/applications$/, fn:screenApplications},
+  {re:/^#\/complete-profile$/, fn:screenCompleteProfile},
   {re:/^#\/bookings$/, fn:screenBookings},
   {re:/^#\/notifications$/, fn:screenNotifications},
   {re:/^#\/community$/, fn:screenCommunity},
@@ -1095,7 +1096,8 @@ function screenDashboard(app){
     fetchJsonOrNull("/api/v1/applications?talentId="+encodeURIComponent(id)),
     fetchJsonOrNull("/api/v1/bookings?talentId="+encodeURIComponent(id)),
     fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/notifications"),
-    fetchJsonOrNull("/api/v1/agencies")
+    fetchJsonOrNull("/api/v1/agencies"),
+    fetchJsonOrNull("/api/v1/talent/"+encodeURIComponent(id)+"/missing-info")
   ]).then(function(res){
     var t = normTalent((res[0]&&(res[0].talent||res[0]))||{});
     var photos = (res[1]&&(res[1].photos||res[1]))||[];
@@ -1103,12 +1105,22 @@ function screenDashboard(app){
     var books = (res[3]&&(res[3].bookings||res[3]))||[];
     var notifs = (res[4]&&(res[4].notifications||res[4]))||[];
     var agencies = (res[5]&&(res[5].agencies||res[5]))||[];
+    var mi = res[6]||{};
     var pct = (typeof t.completion === "number") ? t.completion : completionPct(t);
     var missing = (t.completionChecklist||[]).filter(function(c){ return !c.done; }).map(function(c){ return c.label; });
     var pending = apps.filter(function(a){ return (a.status||"").toLowerCase().indexOf("pend")>=0; }).length;
     var unread = notifs.filter(function(n){ return !n.read && !n.read_at; }).length;
     var el = $("#dash"); if(!el) return;
-    el.innerHTML = '<div class="card"><h2>Welcome, '+esc(t.professional_name||t.first_name||"talent")+'</h2>'
+    el.innerHTML = ((mi.gaps && mi.gaps.length)
+      ? '<div class="card" style="border-color:var(--gold)"><h3>Details we still need from you</h3>'
+        + '<p>These are holding back submissions. Answer them once — they stay on your record.</p><ul>'
+        + mi.gaps.map(function(g){
+            if(g.kind === "photos") return '<li>'+esc(g.label)+' — <a href="#/portfolio">upload in your portfolio</a></li>';
+            return '<li>'+esc(g.label)+'</li>';
+          }).join("")
+        + '</ul><p><a class="btn btn-gold btn-sm" href="#/complete-profile">Complete My Details</a></p></div>'
+      : "")
+      + '<div class="card"><h2>Welcome, '+esc(t.professional_name||t.first_name||"talent")+'</h2>'
       + '<p>Profile completion: <strong>'+pct+'%</strong> · Photos: <strong>'+photos.length+' of 8</strong> · Readiness: <strong>'+esc(t.readiness_status||t.status||(pct>=80?"Ready":"In progress"))+'</strong></p>'
       + (isAwaitingReview(t) ? reviewWindowsNotice() : "")
       + (pct<100 && missing.length ? '<p class="muted small">To reach 100%: '+esc(missing.join(", "))+'.</p>' : "")
@@ -1757,7 +1769,20 @@ function screenReplies(app){
       + '<label>From (agency / casting name)<input id="reply-from" placeholder="Project Casting"></label>'
       + '<label>Channel<input id="reply-channel" placeholder="Email, phone, portal…"></label>'
       + '<label>Reply<textarea id="reply-body" rows="4" required placeholder="What they said…"></textarea></label>'
-      + '<p><button class="btn" type="submit">Record reply</button></p></form></div>':"");
+      + '<p><button class="btn" type="submit">Record reply</button></p></form></div>'
+      + '<div class="card"><h2>Record the outcome (staff)</h2><p class="muted small">Use this when an agency answers an application. Every detail comes from their reply — leave blank anything they did not say and it will be reported as still to come, never guessed. Accepted creates the booking from the details you enter.</p><div id="outcome-msg"></div>'
+      + '<form id="outcome-form"><label>Application ID<input id="outcome-app" required placeholder="app_…"></label>'
+      + '<label>Outcome<select id="outcome-kind"><option value="accepted">Accepted — booked</option><option value="callback">Callback / questions</option><option value="rejected">Rejected — not selected</option></select></label>'
+      + '<label>From (agency / casting name)<input id="outcome-from" placeholder="Project Casting"></label>'
+      + '<label>Reply ID (optional)<input id="outcome-reply" placeholder="rpl_… — links the reply record"></label>'
+      + '<label>Call time<input id="outcome-calltime" placeholder="9:00 AM"></label>'
+      + '<label>Event date<input id="outcome-date" type="date"></label>'
+      + '<label>Location<input id="outcome-location" placeholder="Studio, address…"></label>'
+      + '<label>What to bring<input id="outcome-bring" placeholder="ID, headshot, black clothes…"></label>'
+      + '<label>Contact<input id="outcome-contact" placeholder="Name + phone/email"></label>'
+      + '<label>What the agency asks<textarea id="outcome-ask" rows="2" placeholder="Their question or request…"></textarea></label>'
+      + '<label>Notes<textarea id="outcome-notes" rows="2" placeholder="Anything else from the reply…"></textarea></label>'
+      + '<p><button class="btn" type="submit">Record outcome &amp; notify the talent</button></p></form></div>':"");
   var load = function(){
     apiGet("/api/v1/application-replies?talentId="+encodeURIComponent(id)).then(function(d){
       var list = d.replies||[];
@@ -1776,6 +1801,32 @@ function screenReplies(app){
     api("/api/v1/application-replies", {method:"POST", body:{applicationId:$("#reply-app").value.trim(), fromName:$("#reply-from").value.trim(), channel:$("#reply-channel").value.trim(), body:$("#reply-body").value.trim()}})
       .then(function(){ $("#reply-msg").innerHTML = okBox("Reply recorded."); load(); })
       .catch(function(err){ $("#reply-msg").innerHTML = errBox(err.message); });
+  });
+  var of = $("#outcome-form");
+  if(of) of.addEventListener("submit", function(e){
+    e.preventDefault();
+    var appId = $("#outcome-app").value.trim();
+    var details = {};
+    var v = function(id){ var el = $(id); return el ? el.value.trim() : ""; };
+    if(v("#outcome-calltime")) details.callTime = v("#outcome-calltime");
+    if(v("#outcome-date")) details.eventDate = v("#outcome-date");
+    if(v("#outcome-location")) details.location = v("#outcome-location");
+    if(v("#outcome-bring")) details.whatToBring = v("#outcome-bring");
+    if(v("#outcome-contact")) details.contact = v("#outcome-contact");
+    if(v("#outcome-ask")) details.ask = v("#outcome-ask");
+    if(v("#outcome-notes")) details.notes = v("#outcome-notes");
+    var body = {outcome:$("#outcome-kind").value, details:details};
+    if(v("#outcome-from")) body.fromName = v("#outcome-from");
+    if(v("#outcome-reply")) body.replyId = v("#outcome-reply");
+    api("/api/v1/applications/"+encodeURIComponent(appId)+"/outcome", {method:"POST", body:body})
+      .then(function(d){
+        var msg = "Outcome recorded: " + (d.application && d.application.outcome ? d.application.outcome : "saved") + ".";
+        if(d.booking) msg += " Booking " + d.booking.id + " created.";
+        msg += d.emailSent ? " The talent was emailed." : " The talent was NOT emailed (" + (d.emailReason || "no email on file") + ") — the profile notification still went out.";
+        $("#outcome-msg").innerHTML = okBox(msg);
+        load();
+      })
+      .catch(function(err){ $("#outcome-msg").innerHTML = errBox(err.message); });
   });
 }
 
@@ -1822,8 +1873,15 @@ function screenApplications(app){
     var el = $("#apps-list"); if(!el) return;
     if(!list.length){ el.innerHTML = emptyBox("No applications yet. Browse opportunities and apply — you approve before anything is sent."); return; }
     el.innerHTML = list.map(function(a){
+      var s = a.snapshotSummary||null;
       return '<div class="card card-lift"><h3>'+esc((a.opportunity&&a.opportunity.title)||a.opportunity_title||a.opportunityId||a.opportunity_id||"Application")+'</h3>'
         + '<p>Status: <strong>'+esc(a.status||"pending")+'</strong></p>'
+        + (a.outcome ? '<p>Outcome: <strong>'+esc(a.outcome)+'</strong>'+(a.outcomeAt? ' · '+esc(fmtDT(a.outcomeAt)):'')+'</p>' : '')
+        + (s ? '<p class="muted small">Receipt: '+esc(s.status||"")
+          + (s.destination ? ' · sent to '+esc(s.destination) : '')
+          + (s.submitVia ? ' · <a href="'+esc(s.submitVia)+'" target="_blank" rel="noopener">submission link</a>' : '')
+          + (s.sentAt ? ' · '+esc(fmtDT(s.sentAt)) : '')+'</p>' : '')
+        + (a.submissionLink ? '<p class="muted small">Portal link: <a href="'+esc(a.submissionLink)+'" target="_blank" rel="noopener">'+esc(a.submissionLink)+'</a></p>' : '')
         + '<p class="muted small">Applied '+esc(fmtDT(a.createdAt||a.created_at||a.submitted_at))+'</p></div>';
     }).join("");
   }).catch(function(err){ $("#apps-list").innerHTML = errBox(err.message); });
@@ -1838,6 +1896,78 @@ function screenApplications(app){
     }).join("");
     wireReleaseButtons(el, function(){ screenApplications(app); });
   }).catch(function(err){ var el2 = $("#apps-bookings"); if(el2) el2.innerHTML = errBox(err.message); });
+}
+
+/* ---------- (9b) complete profile — in-house missing-info form (v1.3.2) ----------
+   One card per missing question, in the server's order (easy taps first,
+   sensitive near the end). Taps for choices, typing only for date/number/
+   text. Conditional cards (tattoo locations, car details) appear only when
+   their parent is answered YES — the server omits them otherwise, so after
+   saving a YES the form re-loads and the follow-up cards appear. The
+   photos gap is a link-out card to #/portfolio, never a form question. */
+function screenCompleteProfile(app){
+  if(!requireLogin(app)) return;
+  var id = sessionTalentId();
+  app.innerHTML = '<h1 style="color:var(--gold)">Complete My Details</h1>'
+    + '<p class="muted">Answer once — these stay on your record, so a new role only asks for what is genuinely new. Some questions only appear once the one above is answered — save and they will show.</p>'
+    + '<div id="cp-msg"></div><div id="cp-form-wrap">'+loadingBox("Loading your questions…")+'</div>';
+  var load = function(){
+    apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/missing-info").then(function(d){
+      var wrap = $("#cp-form-wrap"); if(!wrap) return;
+      var gaps = d.gaps||[];
+      var qs = (d.questions||[]).filter(function(q){ return !q.answered; });
+      if(!gaps.length){ wrap.innerHTML = '<div class="card">'+okBox("Nothing missing — your profile carries every answer we need.")+'</div>'; return; }
+      var html = '<form id="cp-form">';
+      if(gaps.some(function(g){ return g.kind === "photos"; })){
+        html += '<div class="card"><h3>Close-up + full-body photos</h3><p>Two photos: one close-up, one full body. Upload them in your portfolio.</p><p><a class="btn btn-ghost btn-sm" href="#/portfolio">Open my portfolio</a></p></div>';
+      }
+      qs.forEach(function(q){
+        if(q.kind === "bool"){
+          html += '<div class="card"><label class="check"><input type="checkbox" data-q="'+esc(q.id)+'" value="true"> <strong>'+esc(q.label)+'</strong></label></div>';
+          return;
+        }
+        html += '<div class="card"><label><strong>'+esc(q.label)+'</strong>';
+        if(q.kind === "choice"){
+          html += '<select data-q="'+esc(q.id)+'"><option value="">— pick one —</option>' + (q.options||[]).map(function(o){ return '<option value="'+esc(o)+'">'+esc(o)+'</option>'; }).join("") + '</select>';
+        } else if(q.kind === "multi"){
+          html += '<div>' + (q.options||[]).map(function(o){ return '<label class="check"><input type="checkbox" data-q="'+esc(q.id)+'" data-multi="1" value="'+esc(o)+'"> '+esc(o)+'</label>'; }).join("") + '</div>';
+        } else if(q.kind === "date"){
+          html += '<input type="date" data-q="'+esc(q.id)+'">';
+        } else if(q.kind === "number"){
+          html += '<input type="number" data-q="'+esc(q.id)+'">';
+        } else {
+          html += '<input type="text" data-q="'+esc(q.id)+'">';
+        }
+        html += '</label></div>';
+      });
+      html += '<p><button class="btn" type="submit">Save my answers</button></p></form>';
+      wrap.innerHTML = html;
+      var form = $("#cp-form");
+      form.addEventListener("submit", function(e){
+        e.preventDefault();
+        var answers = {};
+        form.querySelectorAll("[data-q]").forEach(function(el){
+          var qid = el.getAttribute("data-q");
+          if(el.type === "checkbox"){
+            if(!el.checked) return;
+            if(el.getAttribute("data-multi") === "1"){ (answers[qid] = answers[qid] || []).push(el.value); }
+            else { answers[qid] = true; }
+          } else if(el.value !== "" && el.value !== null){
+            answers[qid] = el.type === "number" ? Number(el.value) : el.value;
+          }
+        });
+        if(!Object.keys(answers).length){ $("#cp-msg").innerHTML = errBox("Answer at least one question first."); return; }
+        api("/api/v1/talent/"+encodeURIComponent(id)+"/answers", {method:"POST", body:{answers:answers}})
+          .then(function(d){
+            var rem = (d.remainingGaps||[]).length;
+            $("#cp-msg").innerHTML = okBox("Saved " + (d.saved||[]).length + " answer" + ((d.saved||[]).length===1?"":"s") + "." + (rem ? " " + rem + " still to go." : " Nothing left — you're complete."));
+            load();
+          })
+          .catch(function(err){ $("#cp-msg").innerHTML = errBox(err.message); });
+      });
+    }).catch(function(err){ $("#cp-form-wrap").innerHTML = errBox(err.message); });
+  };
+  load();
 }
 
 function screenBookings(app){
