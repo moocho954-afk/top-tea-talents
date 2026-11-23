@@ -2542,6 +2542,24 @@ async function handle(req: Request): Promise<Response> {
       const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
       return ok({ booking: { ...bookingView(updated[0]), paymentStatus: b.status }, note: "Payment tracking only — no payment processed." });
     }
+    // ----- v1.3.1: delete a booking (admin only) — only a RELEASED or
+    // CANCELLED booking can be deleted. A BOOKED booking must be released
+    // first; a COMPLETED one is proof-of-work and stays. Added to clear the
+    // release-button live-proof scratch booking, which the API could not
+    // remove (no delete route existed).
+    if (method === "DELETE" && rest.length === 2) {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const rows = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "booking not found");
+      const status = String(rows[0].status || "");
+      if (status !== "RELEASED" && status !== "CANCELLED") {
+        return err(400, `only a released or cancelled booking can be deleted — release a booked one first (currently ${status})`);
+      }
+      await db.run("DELETE FROM bookings WHERE id = ?", [rest[1]]);
+      await audit("booking.delete", "booking", rest[1], "admin",
+        { status, talentId: String(rows[0].talent_id), opportunityId: String(rows[0].opportunity_id) }, { deleted: true });
+      return ok({ ok: true, deletedId: rest[1] });
+    }
     return err(404, "not found");
   }
 
