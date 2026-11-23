@@ -94,7 +94,7 @@ Live DB state at audit time: 434 opportunities. By source: projectcasting 229, a
 - **Checked live (search results):** Mandy listing pages show "Become a Mandy member or log in to view additional details, including key audition and/or submission instructions." No public contact email was found anywhere.
 - **Apply flow:** on-site, account required (Mandy is part of the Backstage network).
 - **Platform contact:** null.
-- **Harvester change needed:** none without account.
+- **Harvester change needed:** none without an account.
 
 ### 13. Casting TaylorMade — NO email; apply = per-production web forms
 - **Checked live (search results):** no email address found anywhere for Casting TaylorMade. Applications run through per-production web forms on their own site — verified live links: `castingtaylormade.com/miamivice` (Miami Vice background + specialty), `/mv-kids`, `/classicsmiami`, `/baseball`. Contact is by text (Heather, (305) 951-8291, seen on their MIA pages) — not email.

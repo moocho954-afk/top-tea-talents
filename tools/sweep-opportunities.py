@@ -16,6 +16,14 @@ HONESTY RULES (the whole point of this script):
 - Sources that refuse this VM (403, timeout, DNS) are logged as failed
   and the run continues with the rest. Exit 0 when at least one source
   succeeded; exit 1 when every source failed; exit 2 on config error.
+- Email harvest (2026-11-23): an address enters a record ONLY if it was
+  seen on the live listing page. AllCasting detail pages embed a
+  castingCall object with agent_email + type — type "email" listings get
+  contact_email set; web/url listings never take the agent email (it is
+  the poster's contact, not the submission route). A second net runs an
+  email regex over the listing body, but only when the surrounding text
+  frames it as a submission address. Platform support addresses are
+  never destinations (see BLOCKED_DESTINATION_EMAILS).
 
 Credentials: the admin token comes ONLY from the TTT_ADMIN_TOKEN
 environment variable, supplied at run time from the Secure Vault by the
@@ -179,6 +187,148 @@ def extract_main_content(page_text):
     return page_text
 
 
+# ---------------------------------------------------------------- email harvest (2026-11-23)
+# An address enters a record ONLY if it was seen on the live listing page.
+# Platform support / general-contact addresses are NEVER destinations.
+BLOCKED_DESTINATION_EMAILS = {
+    "support@allcasting.com", "support@projectcasting.com",
+    "support@productionbeast.com", "hello@heybooker.app",
+    "casting@backstage.com", "uigroup@ep.com",
+    "billing@castingnetworks.com", "talentsupport@castitsystems.com",
+}
+PLACEHOLDER_EMAIL_DOMAINS = {"example.com", "example.org", "example.net",
+                             "email.com", "domain.com", "yoursite.com", "test.com"}
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+SUBMISSION_HINTS = ("submit", "send to", "send your", "send us", "send it to",
+                    "email your", "email us", "please email", "apply by email",
+                    "submissions to", "submissions via", "send submissions")
+
+
+def _brace_match(page_text, start):
+    """Return the raw substring of the {...} object starting at start.
+    Escape-aware: a quote toggles in-string only when preceded by an even
+    number of backslashes; braces count only outside strings."""
+    depth = 0
+    in_str = False
+    i = start
+    while i < len(page_text):
+        ch = page_text[i]
+        if ch == '"':
+            bs = 0
+            j = i - 1
+            while j >= 0 and page_text[j] == "\\":
+                bs += 1
+                j -= 1
+            if bs % 2 == 0:
+                in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return page_text[start:i + 1]
+        i += 1
+    return None
+
+
+def extract_casting_call(page_text, want_id=None):
+    """Extract the page's OWN castingCall object from an AllCasting detail
+    page. The page embeds one JSON blob that is itself a JSON string, so
+    quotes are backslash-escaped (\\"key\\"). The blob ALSO carries OTHER
+    listings' agent emails in a preceding feed array — scoping is enforced
+    by taking only the single castingCall object and verifying its id
+    matches the URL id. Decode is two-step: json.loads the region as a
+    JSON string (outer level), then json.loads the result (inner level).
+    Returns ({"id","agent_name","agent_email","type"}, None) or (None, reason)."""
+    m = re.search(r'\\*"castingCall\\*"\s*:\s*\{', page_text)
+    if not m:
+        m = re.search(r'"castingCall"\s*:\s*\{', page_text)
+    if not m:
+        return None, "no castingCall key"
+    start = page_text.find("{", m.start())
+    region = _brace_match(page_text, start)
+    if region is None:
+        return None, "unbalanced braces"
+    try:
+        inner = json.loads('"' + region + '"')
+    except Exception as e:
+        return None, f"outer decode failed: {e}"
+    try:
+        obj = json.loads(inner)
+    except Exception as e:
+        return None, f"inner decode failed: {e}"
+    if want_id is not None and str(obj.get("id")) != str(want_id):
+        return None, f"id mismatch: object id {obj.get('id')} != url id {want_id}"
+    return {
+        "id": obj.get("id"),
+        "agent_name": (obj.get("agent_name") or "").strip() or None,
+        "agent_email": (obj.get("agent_email") or "").strip() or None,
+        "type": (obj.get("type") or "").strip().lower() or None,
+    }, None
+
+
+def find_submission_email(body):
+    """Second net: an email in the listing body that the surrounding text
+    explicitly frames as a submission address (e.g. a Central Casting
+    per-project email inside a reposted call). Never the first email on
+    the page — the hint framing is what qualifies it. Blocked and
+    placeholder addresses are skipped."""
+    if not body:
+        return None
+    for m in EMAIL_RE.finditer(body):
+        email = m.group(0)
+        if email.lower() in BLOCKED_DESTINATION_EMAILS:
+            continue
+        if email.partition("@")[2].lower() in PLACEHOLDER_EMAIL_DOMAINS:
+            continue
+        window = body[max(0, m.start() - 150):m.end() + 150].lower()
+        if any(h in window for h in SUBMISSION_HINTS):
+            return email
+    return None
+
+
+def find_casting_org(body):
+    """A casting company named in the post text (e.g. AuditionsFree posts
+    naming Casting TaylorMade, or a Central Casting repost). Generic
+    phrases (Casting Call, Casting Director) are not an org."""
+    if not body:
+        return None
+    if re.search(r"\bCentral Casting\b", body):
+        return "Central Casting"
+    m = re.search(r"\bCasting\s+([A-Z][A-Za-z0-9&'’\-]{2,30}(?:\s+[A-Z][A-Za-z0-9&'’\-]{2,30})?)", body)
+    if m:
+        name = ("Casting " + m.group(1).strip()).rstrip(".,;:")
+        # Reject if ANY captured word is generic nav text ("Casting Calls"
+        # in a page header is not an org).
+        generic = {"call", "calls", "casting", "director", "directors",
+                   "company", "companies", "agency", "agencies", "notice",
+                   "notices", "team", "office", "audition", "auditions"}
+        if any(w.lower() in generic for w in name.split()[1:]):
+            return None
+        return name
+    return None
+
+
+def resolve_casting_click(page_text):
+    """CastingAndActing apply route: a 'See the original listing' button
+    to api.castingandacting.com/api/casting-click.php?id=N, which
+    redirects to the original posting. Follow it once; return the final
+    URL, or None when the link is absent / unresolvable."""
+    m = re.search(r"(?:https?:)?//api\.castingandacting\.com/api/casting-click\.php\?id=\d+", page_text)
+    if not m:
+        return None
+    url = m.group(0)
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.geturl()
+    except Exception:
+        return None
+
+
 def parse_detail(url, page_text):
     """Parse a listing detail page into an opportunity record (or None to skip)."""
     title_m = re.search(r"<h1[^>]*>(.*?)</h1>", page_text, flags=re.S | re.I)
@@ -201,12 +351,52 @@ def parse_detail(url, page_text):
     pm = re.search(r"(?:shoot(?:ing)?\s+dates?|filming\s+dates?|production\s+dates?)[^.;]{0,120}", body, flags=re.I)
     if pm:
         prod = pm.group(0).strip()
+    # --- email harvest (2026-11-23): an address enters a record ONLY if
+    # it was seen on this live listing page.
+    contact_email = None
+    submission_instructions = None
+    casting_org = None
+    casting_professional = None
+    is_allcasting = "allcasting.com" in url
+    cc_type = None
+    if is_allcasting:
+        idm = re.search(r"/castingcall/(\d+)", url)
+        cc, _cc_err = extract_casting_call(page_text, want_id=idm.group(1) if idm else None)
+        if cc:
+            cc_type = cc.get("type")
+            agent_email = cc.get("agent_email")
+            agent_name = cc.get("agent_name")
+            if agent_name:
+                # The poster identity; drives the backend contacts-table
+                # fallback for this org's later listings.
+                casting_org = agent_name
+                casting_professional = agent_name
+            if cc_type == "email" and agent_email and EMAIL_RE.fullmatch(agent_email) \
+                    and agent_email.lower() not in BLOCKED_DESTINATION_EMAILS:
+                contact_email = agent_email
+                submission_instructions = f"Submit by email to {agent_email}"
+            elif cc_type == "web":
+                # The agent email on a web-type listing is the poster's
+                # contact, NOT the submission route — never use it.
+                submission_instructions = "Apply on AllCasting"
+            elif cc_type == "url":
+                submission_instructions = "Apply via the listing link"
+    if contact_email is None and (not is_allcasting or cc_type == "email" or cc_type is None):
+        # Second net: a submission-framed email in the listing body
+        # (reposted Central Casting / Casting Networks calls). Skipped for
+        # AllCasting web/url listings — their type is authoritative.
+        found = find_submission_email(body)
+        if found:
+            contact_email = found
+            submission_instructions = f"Submit by email to {found}"
+    if casting_org is None:
+        casting_org = find_casting_org(body)
     return {
         "title": title[:200],
         "production": None,
         "employer": None,
-        "casting_org": None,
-        "casting_professional": None,
+        "casting_org": casting_org,
+        "casting_professional": casting_professional,
         "category": classify_category(title, body),
         "roles": None,
         "positions": None,
@@ -223,10 +413,12 @@ def parse_detail(url, page_text):
         "appearance": None,
         "travel": None,
         "usage_exclusivity": None,
-        "submission_instructions": None,
+        "contact_email": contact_email,
+        "submission_instructions": submission_instructions,
         "source_url": url,
         "verification_status": "UNVERIFIED",
-        "verification_notes": "Swept by tools/sweep-opportunities.py: listing page parsed; fields not found on the page are null, never guessed.",
+        "verification_notes": "Swept by tools/sweep-opportunities.py: listing page parsed; fields not found on the page are null, never guessed." + (
+            " Submission email harvested from the listing page." if contact_email else ""),
     }, None
 
 
@@ -427,6 +619,166 @@ def et_now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+DERIVED_OPP_KEYS = ("expired", "selectivity", "selectivityReason", "genderRequirement")
+
+
+def backfill_allcasting(api, token, checkpoint_path):
+    """Rec 2: re-fetch every live AllCasting detail page, run the same
+    castingCall extraction as the sweeper, and PATCH (via POST upsert)
+    contact_email / submission_instructions / casting_org where the page
+    supplies them. Resumable: one JSON line per record is appended to the
+    checkpoint file as it is processed; a re-run skips finished ids.
+    Also writes tools/allcasting-contacts-seed.json — verified org->email
+    pairs from type=email listings only (rec 3 input)."""
+    done = {}
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    done[e["opportunity_id"]] = e
+                except Exception:
+                    continue
+    print(f"backfill: checkpoint has {len(done)} finished records")
+    try:
+        d = api_get(api, "/api/v1/opportunities?source=allcasting&status=all&limit=500", token)
+    except Exception as e:
+        print(f"ERROR: cannot list AllCasting opportunities ({e})", file=sys.stderr)
+        return 1
+    opps = d.get("opportunities", [])
+    before_with_email = sum(1 for o in opps if o.get("contact_email"))
+    print(f"backfill: {len(opps)} AllCasting records, {before_with_email} already carry contact_email")
+    contacts = {}
+    counts = {"updated_email": 0, "updated_instructions": 0, "skipped_already": 0,
+              "skipped_no_email": 0, "error": 0, "no_change": 0}
+    ck = open(checkpoint_path, "a", encoding="utf-8")
+
+    def record_checkpoint(oid, status, detail=None):
+        ck.write(json.dumps({"opportunity_id": oid, "status": status,
+                             "detail": detail, "ts": et_now()}) + "\n")
+        ck.flush()
+
+    for opp in opps:
+        oid = opp["id"]
+        if oid in done and done[oid].get("status") in ("updated_email", "updated_instructions", "skipped_already", "skipped_no_email", "no_change"):
+            counts[done[oid]["status"]] += 1
+            continue
+        # Numeric listing id: prefer the source_url (/castingcall/NNNNN) —
+        # some older records carry slug ids (musicvideo:allcasting:<slug>)
+        # with no digits at all.
+        num_m = re.search(r"/castingcall/(\d+)", opp.get("source_url") or "")
+        num = num_m.group(1) if num_m else None
+        if not num:
+            num_m = re.search(r"(\d+)$", oid)
+            num = num_m.group(1) if num_m else None
+        url = opp.get("source_url") or (f"https://allcasting.com/castingcall/{num}" if num else None)
+        if not num or not url:
+            counts["error"] += 1
+            record_checkpoint(oid, "error", "no numeric id / url")
+            continue
+        try:
+            row = api_get(api, f"/api/v1/opportunities/{oid}", token)
+            rec = row.get("opportunity") or {}
+        except Exception as e:
+            counts["error"] += 1
+            record_checkpoint(oid, "error", f"GET record failed: {e}"[:200])
+            continue
+        if rec.get("contact_email"):
+            counts["skipped_already"] += 1
+            record_checkpoint(oid, "skipped_already", rec.get("contact_email"))
+            continue
+        status, data = fetch(url)
+        time.sleep(DETAIL_DELAY)
+        if status != 200 or not data:
+            counts["error"] += 1
+            record_checkpoint(oid, "error", f"GET detail -> {status}")
+            continue
+        cc, cc_err = extract_casting_call(data.decode("utf-8", "ignore"), want_id=num)
+        if cc is None:
+            counts["error"] += 1
+            record_checkpoint(oid, "error", f"extract failed: {cc_err}"[:200])
+            continue
+        for k in DERIVED_OPP_KEYS:
+            rec.pop(k, None)
+        changed = False
+        agent_email = cc.get("agent_email")
+        agent_name = cc.get("agent_name")
+        cc_type = cc.get("type")
+        if agent_name and (not rec.get("casting_org")
+                           or str(rec.get("casting_org")).strip().lower() == "allcasting"):
+            # Older records carry the platform name as casting_org; the
+            # poster name is what the contacts fallback needs.
+            rec["casting_org"] = agent_name
+            changed = True
+        if agent_name and not rec.get("casting_professional"):
+            rec["casting_professional"] = agent_name
+            changed = True
+        if cc_type == "email" and agent_email and EMAIL_RE.fullmatch(agent_email) \
+                and agent_email.lower() not in BLOCKED_DESTINATION_EMAILS:
+            rec["contact_email"] = agent_email
+            rec["submission_instructions"] = f"Submit by email to {agent_email}"
+            rec["verification_notes"] = (rec.get("verification_notes") or "") + \
+                " Submission email harvested from the listing page (backfill 2026-11-23)."
+            changed = True
+            status_kind = "updated_email"
+            if agent_name:
+                contacts[agent_name] = agent_email
+        elif cc_type == "web":
+            if not rec.get("submission_instructions"):
+                rec["submission_instructions"] = "Apply on AllCasting"
+                changed = True
+            status_kind = "updated_instructions"
+        elif cc_type == "url":
+            if not rec.get("submission_instructions"):
+                rec["submission_instructions"] = "Apply via the listing link"
+                changed = True
+            status_kind = "updated_instructions"
+        else:
+            counts["skipped_no_email"] += 1
+            record_checkpoint(oid, "skipped_no_email", f"type={cc_type}")
+            continue
+        if not changed:
+            counts["no_change"] += 1
+            record_checkpoint(oid, "no_change")
+            continue
+        st, resp = api_post(api, "/api/v1/opportunities", token, rec)
+        if st in (200, 201):
+            counts[status_kind] += 1
+            record_checkpoint(oid, status_kind, agent_email or cc_type)
+        else:
+            counts["error"] += 1
+            record_checkpoint(oid, "error", f"POST -> {st}: {str(resp)[:150]}")
+        time.sleep(0.2)
+    ck.close()
+    seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "allcasting-contacts-seed.json")
+    # Merge with any existing seed file (a resume run must not wipe the
+    # pairs a previous run collected).
+    merged = {}
+    if os.path.exists(seed_path):
+        try:
+            for e in json.load(open(seed_path, encoding="utf-8")):
+                merged[(e.get("name"), e.get("email"))] = e
+        except Exception:
+            pass
+    seed = []
+    for name, email in sorted(contacts.items()):
+        org_like = bool(re.search(r"\b(Inc|LLC|Ltd|Casting|Studios|Productions|Media|Entertainment|Talent|Agency|Group)\b", name))
+        seed.append({"name": name, "kind": "agency" if org_like else "casting-professional",
+                     "email": email, "phone": None, "source": "allcasting castingCall (backfill 2026-11-23)",
+                     "verified_on": "live listing page"})
+    # Casting TaylorMade: no email anywhere; contact is by text (Heather),
+    # verified in the 2026-11-23 audit on their MIA pages.
+    seed.append({"name": "Casting TaylorMade", "kind": "agency", "email": None,
+                 "phone": "(305) 951-8291", "source": "castingtaylormade.com MIA pages (audit 2026-11-23)",
+                 "verified_on": "live page", "note": "Contact by text (Heather) — no email published"})
+    for e in seed:
+        merged[(e.get("name"), e.get("email"))] = e
+    with open(seed_path, "w", encoding="utf-8") as f:
+        json.dump(sorted(merged.values(), key=lambda e: (e.get("name") or "")), f, indent=1)
+    print(f"backfill done: {counts} | contacts seed: {len(seed)} entries -> {seed_path}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sweep casting sources for new South Florida listings.")
     ap.add_argument("--api", default=os.environ.get("TTT_API_URL", API_DEFAULT))
@@ -434,12 +786,16 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="fetch + parse only; post nothing")
     ap.add_argument("--sources", default="all", help="comma list of source keys, or 'all'")
     ap.add_argument("--max-detail", type=int, default=15, help="detail pages fetched per source per run")
+    ap.add_argument("--backfill-allcasting", action="store_true",
+                    help="rec 2: re-fetch all live AllCasting detail pages and upsert harvested contact emails (resumable via tools/allcasting-backfill-progress.jsonl)")
     args = ap.parse_args()
     api = args.api.rstrip("/")
     token = os.environ.get("TTT_ADMIN_TOKEN", "")
     if not args.dry_run and not token:
         print("ERROR: TTT_ADMIN_TOKEN is not set. The token is read from the Secure Vault at run time by the caller — it is never stored in a file.", file=sys.stderr)
         return 2
+    if args.backfill_allcasting:
+        return backfill_allcasting(api, token, os.path.join(os.path.dirname(os.path.abspath(__file__)), "allcasting-backfill-progress.jsonl"))
     wanted = None if args.sources == "all" else set(args.sources.split(","))
     run_id = f"sweep-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     known = set()
@@ -524,6 +880,13 @@ def main():
                 if rec is None:
                     summary["skipped"] += 1
                     continue
+                if src["key"] == "castingandacting":
+                    # Follow the click-through to the original listing and
+                    # keep it as the apply destination (source_url stays
+                    # the CastingAndActing summary page).
+                    apply_url = resolve_casting_click(data.decode("utf-8", "ignore"))
+                    if apply_url:
+                        rec["apply_url"] = apply_url
                 rec["id"] = oid
                 rec["source"] = src["key"]
                 rec["discovered_at"] = et_now()

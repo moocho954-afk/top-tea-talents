@@ -20,5 +20,5 @@
   "16:00",
   "20:00"
  ],
- "recommendation": "Only 1 day(s) of sweep data — too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
+ "recommendation": "Only 1 day(s) of sweep data \u2014 too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
 }
