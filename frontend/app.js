@@ -366,6 +366,27 @@ function checkHealth(){
     if(b){ b.classList.remove("hidden"); b.textContent = "Backend URL is set but the API did not answer its health check — live data is unavailable right now."; }
   });
 }
+/* v1.3.0: live-mode banner. The settings endpoint is public-read; the
+   banner + footer lines follow the server's liveMode flag so the page
+   never claims TEST MODE while the agency is sending, or LIVE while it
+   is not. Safe default is TEST MODE until the fetch answers. */
+window.__tttLiveMode = false;
+function refreshMode(){
+  if(!apiBase()) return;
+  apiGet("/api/v1/settings").then(function(s){
+    var live = !!(s && s.liveMode);
+    window.__tttLiveMode = live;
+    var banner = document.getElementById("mode-banner");
+    if(banner) banner.textContent = live ? "LIVE — the agency sends applications by email." : "TEST MODE — submissions paused, nothing is sent live.";
+    var line = document.getElementById("mode-line");
+    if(line) line.textContent = live ? "LIVE — applications are sent by the agency email." : "TEST MODE — submissions paused, nothing is sent live.";
+    var mail = document.getElementById("mail-line");
+    if(mail) mail.textContent = live
+      ? (s.mailConfigured ? "Email connected — the agency sends from the agency mailbox." : "Email not connected yet — sends queue until the agency mailbox is connected.")
+      : "Email is not connected — notifications stay in-app.";
+  }).catch(function(){ /* settings unreachable: TEST MODE copy stays */ });
+}
+function isLiveMode(){ return window.__tttLiveMode === true; }
 
 /* ---------- (6) screens: landing / login / opportunities ---------- */
 function screenLanding(app){
@@ -660,7 +681,7 @@ function screenOpportunityDetail(app, id){
       + '<div class="actions-row"><button class="btn" id="check-match" type="button">Check my match</button>'
       + '<button class="btn btn-ghost" id="apply-btn" type="button">Apply (request approval)</button></div>'
       + '<div id="apply-msg"></div>'
-      + '<p class="muted small">TEST MODE — submissions paused, nothing is sent live. Applying here records an application request for agency review; nothing leaves the platform.</p></div>';
+      + '<p class="muted small">'+(isLiveMode() ? "LIVE — applying here records an application request for agency review; the agency sends it to the employer by email once approved." : "TEST MODE — submissions paused, nothing is sent live. Applying here records an application request for agency review; nothing leaves the platform.")+'</p></div>';
     $("#check-match").addEventListener("click", function(){
       var box = $("#match-box");
       if(!isLoggedIn()){ box.innerHTML = errBox("Log in or join first so we can check this opportunity against your profile."); return; }
@@ -684,7 +705,7 @@ function screenOpportunityDetail(app, id){
       var msg = $("#apply-msg");
       if(!isLoggedIn()){ msg.innerHTML = errBox("Log in or join first to apply."); return; }
       api("/api/v1/applications", {method:"POST", body:{talentId:sessionTalentId(), opportunityId:o.id}})
-        .then(function(){ msg.innerHTML = okBox("Application request recorded. It is pending agency review — nothing has been sent to the employer yet (TEST MODE)."); })
+        .then(function(){ msg.innerHTML = okBox("Application request recorded. It is pending agency review — nothing has been sent to the employer yet."); })
         .catch(function(err){ msg.innerHTML = errBox(err.message); });
     });
   }).catch(function(err){ $("#opp-detail").innerHTML = errBox(err.message); });
@@ -951,7 +972,9 @@ function screenVerify(app){
     var note = $("#verify-test-note");
     if(note) note.innerHTML = tc
       ? "TEST MODE — email is not connected, so your code is shown here instead of emailed: <strong>"+esc(tc)+"</strong> (shown once, session-only)."
-      : "TEST MODE — email is not connected. If you already have a code, enter it above; otherwise tap Resend code.";
+      : (isLiveMode()
+        ? "Check your email for the code — it was sent from the agency mailbox. If you don't see it, tap Resend code."
+        : "TEST MODE — email is not connected. If you already have a code, enter it above; otherwise tap Resend code.");
   }catch(e){}
   var refreshStatus = function(){
     var em = $("#verify-email").value.trim();
@@ -1029,7 +1052,7 @@ var FT_DEFS = [
   ["E","Category limits","Only auto-submit for the categories you selected."],
   ["F","Require approval for unpaid work","Never auto-submit to a listing with no stated pay."],
   ["G","Notify me before each submit","Send an in-app notification before any automatic submission."],
-  ["H","Pause auto-submit","Temporarily stop all automatic submissions. (TEST MODE: submissions are paused platform-wide anyway.)"]
+  ["H","Pause auto-submit","Temporarily stop all automatic submissions. (The agency can also pause submissions platform-wide.)"]
 ];
 function renderFastTrackControls(el, state, onChange){
   if(!el) return;
@@ -1346,7 +1369,7 @@ function screenMatches(app){
   }).catch(function(err){ var b=$("#queue-box"); if(b) b.innerHTML = emptyBox("The rotation queue is unavailable right now." + (err && err.message ? " " + esc(err.message) : "")); });
   $("#queue-selected").addEventListener("click", function(){
     api("/api/v1/talent/"+encodeURIComponent(id)+"/queue-selected", {method:"POST", body:{opportunityIds:(window.__tttQueueSelected||[])}})
-      .then(function(){ $("#queue-msg").innerHTML = okBox("Selected queue entries queued. TEST MODE: nothing is sent live."); })
+      .then(function(){ $("#queue-msg").innerHTML = okBox(isLiveMode() ? "Selected queue entries queued for agency review — the agency sends approved applications by email." : "Selected queue entries queued. TEST MODE: nothing is sent live."); })
       .catch(function(err){ $("#queue-msg").innerHTML = errBox(err.message); });
   });
 }
@@ -1384,7 +1407,7 @@ function screenAutomation(app){
     + '<p class="muted">One BIG switch. When it is ON, the agency may send your profile to matching jobs automatically — agency mailbox sends, you are CC\'d, Reply-To is you, and every send carries your personal reference code for that job. When it is OFF, every job waits for your approval.</p>'
     + '<div class="big-toggle-row"><span class="big-toggle-label">AUTOMATION</span>'
     + '<button type="button" class="big-toggle" id="auto-toggle" aria-pressed="false"><span class="toggle-knob"></span><span class="toggle-state">OFF</span></button></div>'
-    + '<p class="notice-box">TEST MODE — even with automation ON, nothing is ever sent live. Would-be sends queue for review instead.</p>'
+    + '<p class="notice-box" id="auto-mode-note">TEST MODE — even with automation ON, nothing is ever sent live. Would-be sends queue for review instead.</p>'
     + '<div id="auto-detail"><p class="muted">Loading your automation settings…</p></div>'
     + '<p><button class="btn" id="auto-save" type="button">Save automation</button></p></div>';
   var state = {enabled:false, agencySendEmail:true, ccTalent:true, replyToTalent:true};
@@ -1398,6 +1421,8 @@ function screenAutomation(app){
     apiGet("/api/v1/talent/"+encodeURIComponent(id)+"/automation").then(function(d){
       state = d.automation||state;
       paint();
+      var noteEl = $("#auto-mode-note");
+      if(noteEl && d.note) noteEl.textContent = d.note;
       var el = $("#auto-detail"); if(!el) return;
       el.innerHTML = '<dl class="kv"><dt>Agency-send email</dt><dd>'+(state.agencySendEmail?"Yes — the agency mailbox sends":"No")+'</dd>'
         + '<dt>You are CC\'d</dt><dd>'+(state.ccTalent?"Yes":"No")+'</dd>'
@@ -1410,7 +1435,7 @@ function screenAutomation(app){
   $("#auto-toggle").addEventListener("click", function(){ state.enabled = !state.enabled; paint(); });
   $("#auto-save").addEventListener("click", function(){
     api("/api/v1/talent/"+encodeURIComponent(id)+"/automation", {method:"POST", body:state})
-      .then(function(){ $("#auto-msg").innerHTML = okBox(state.enabled ? "Automation is ON. TEST MODE: nothing is ever sent live." : "Automation is OFF. Nothing will be submitted automatically."); })
+      .then(function(r){ $("#auto-msg").innerHTML = okBox(state.enabled ? (r && r.testMode===false ? "Automation is ON. Eligible jobs will be sent by the agency email." : "Automation is ON. TEST MODE: nothing is ever sent live.") : "Automation is OFF. Nothing will be submitted automatically."); })
       .catch(function(err){ $("#auto-msg").innerHTML = errBox(err.message); });
   });
   load();
@@ -1682,7 +1707,7 @@ function screenSocial(app){
 
 function screenCubicles(app){
   app.innerHTML = '<h1 style="color:var(--gold)">Cubicles</h1>'
-    + '<p class="muted">Specialist cubicles — the discovery workforce. Each cubicle has a department, mission, sources, and a live status. TEST MODE: nothing runs live; statuses reflect configuration only.</p>'
+    + '<p class="muted">Specialist cubicles — the discovery workforce. Each cubicle has a department, mission, sources, and a live status. Statuses reflect configuration only; discovery runs on the sweep schedule.</p>'
     + '<div id="cub-list">'+loadingBox("Loading cubicles…")+'</div>'
     + '<div class="card" id="cub-add-box"><h2>Add a cubicle (staff)</h2><div id="cub-msg"></div>'
     + '<form id="cub-add-form"><label>Name<input id="cub-name" required placeholder="e.g. South Florida Extras Scout"></label>'
@@ -2072,7 +2097,7 @@ function screenCommunity(app){
   app.innerHTML = '<h1 style="color:var(--gold)">Community Board</h1>'
     + '<div class="card"><p><strong>This board is public.</strong> Everyone on the board can see every post and every conversation — there are no private messages here. Talk to someone directly by @-mentioning them: it reaches them highlighted, like a direct message, but it stays on the open board for everyone to see.</p>'
     + '<p class="muted">Share your experiences, post photos from jobs, and find people in the talent pool for what you need — a videographer, a photographer, a partner for your next project. Create together, make friends, make partners.</p>'
-    + '<p class="muted small">Moderation: there is no automatic content filter. You can delete your own posts, report any post, and the agency owner reviews reports and can remove posts. TEST MODE: posting is not a submission — nothing is sent anywhere.</p></div>'
+    + '<p class="muted small">Moderation: there is no automatic content filter. You can delete your own posts, report any post, and the agency owner reviews reports and can remove posts. Posting here is not a submission — nothing is sent to an employer.</p></div>'
     + (signedIn ? "" : '<div class="card"><h2>Join the conversation</h2><p>You can read the whole board right now — it\'s public. To post, @-mention, and talk with other talent, sign up or open your profile first.</p><p><a class="btn" href="#/join">SIGN UP — JOIN FREE</a> <a class="btn btn-ghost" href="#/dashboard">My Dashboard</a></p></div>')
     + (signedIn ? '<div class="card"><h2>Post to the board</h2><div style="position:relative">'
       + '<label for="board-text">Share something with the community… type @ to mention someone</label>'
@@ -2236,7 +2261,7 @@ function renderTopRepeatWidget(el, agencies){
 }
 function screenAgency(app){
   app.innerHTML = '<h1 style="color:var(--gold)">Agency Network</h1>'
-    + '<p class="muted">TEST MODE — monitoring and highlighting only. No submissions, no contacts, no payments.</p>'
+    + '<p class="muted">Monitoring and highlighting only. No submissions, no contacts, no payments from this view.</p>'
     + '<div class="card"><h2>Top Repeat Agencies</h2><p class="muted">Ranked by booking volume. Agencies at or above the repeat threshold are flagged; spikes are flagged too. One click opens the full history.</p><div id="agency-board">'+loadingBox("Loading agencies…")+'</div></div>'
     + '<div class="card"><h2>Production intel</h2><div id="prod-intel">'+loadingBox("Loading production intel…")+'</div></div>'
     + '<div class="card"><h2>Staff view</h2><div id="staff-box"></div></div>';
@@ -2492,6 +2517,6 @@ document.addEventListener("DOMContentLoaded", function(){
   initNav();
   initSplash();
   renderVersionStamp();
-  loadApiConfig().then(function(){ apiBanner(); bindAuthSlot(); checkHealth(); route(); });
+  loadApiConfig().then(function(){ apiBanner(); bindAuthSlot(); checkHealth(); refreshMode(); route(); });
 });
 window.addEventListener("hashchange", route);

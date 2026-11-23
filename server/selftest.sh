@@ -41,7 +41,8 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.2.1", d
+assert d["version"]=="1.3.0", d
+assert d["live_mode"] is False and d["mail_configured"] is False, d
 print("health ok:", d["counts"])
 PY
 
@@ -355,6 +356,76 @@ check "booking created an in-app notification" python3 -c "import json; d=json.l
 
 # SUBMITTED - CONFIRMED blocked in TEST MODE
 check "SUBMITTED-CONFIRMED blocked in TEST MODE (400)" bash -c "curl -s -o /dev/null -w '%{http_code}' -X PATCH $BASE/applications/$APP_ID/status -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"status\":\"SUBMITTED — CONFIRMED\"}' | grep -q 400"
+
+# ----- v1.3.0 LIVE MAIL PATH -----
+# (a) the applications list is no longer public: unauthenticated -> 401,
+# a talent sees only their own, an admin sees all.
+check "v1.3.0: GET /applications without auth returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/applications | grep -q 401"
+curl -sf "$BASE/applications" -H "Authorization: Bearer $TOKEN" -o /tmp/ttt-body.json
+check "v1.3.0: talent sees only their own applications" python3 - "$TALENT_ID" <<'PY'
+import sys, json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["total"]>=1 and all(a["talentId"]==sys.argv[1] for a in d["applications"]), d
+print("own applications:", d["total"])
+PY
+curl -sf "$BASE/applications" -H 'Authorization: Bearer test-admin-token' -o /tmp/ttt-body.json
+check "v1.3.0: admin sees the full applications list" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['total']>=1, d"
+# (b) email status: admin only, reports TEST MODE + unconfigured mail.
+check "v1.3.0: GET /email/status without admin returns 401" bash -c "curl -s -o /dev/null -w '%{http_code}' $BASE/email/status | grep -q 401"
+curl -sf "$BASE/email/status" -H 'Authorization: Bearer test-admin-token' -o /tmp/ttt-body.json
+check "v1.3.0: email status reports TEST MODE, agency sender, mail unconfigured" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["liveMode"] is False and d["mailConfigured"] is False, d
+assert d["agencyEmail"]=="moocho954@gmail.com", d
+assert d["mailMissing"], d["mailMissing"]
+print("mail missing:", d["mailMissing"])
+PY
+# (c) dryRun previews the exact email without queueing, sending, or
+# changing status — and the email carries the ref code + pay-ask line
+# when the posting lists no parseable pay.
+curl -sf -X POST "$BASE/applications/$APP_ID/send" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"dryRun":true}' -o /tmp/ttt-body.json
+check "v1.3.0: send dryRun previews the email, claims nothing sent" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["dryRun"] is True and d["liveMode"] is False, d
+e=d["email"]
+assert e["subject"].startswith("Application — ") and "Ref TTT-" in e["subject"], e["subject"]
+assert e["referenceCode"].startswith("TTT-"), e["referenceCode"]
+assert "Reference code:" in e["body"], e["body"]
+assert "confirm the pay rate" in e["body"] or "Listed pay:" in e["body"], e["body"]
+assert d.get("sent") is not True, d
+print("dryRun ref:", e["referenceCode"], "payAsk:", e["payAsk"], "destination:", d.get("destination"))
+PY
+# (d) a real send in TEST MODE is refused, 400.
+check "v1.3.0: send without dryRun in TEST MODE returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications/$APP_ID/send -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{}' | grep -q 400"
+# (e) drain in TEST MODE sends nothing and says why.
+curl -sf -X POST "$BASE/email/drain" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.3.0: drain in TEST MODE sends 0 and reports TEST MODE" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['sent']==0 and 'TEST MODE' in (d.get('reason') or ''), d"
+# (f) flip live mode ON via settings (admin), approve the application,
+# then send with NO transport configured: the email QUEUES, nothing is
+# claimed sent, and the reason names the missing credentials. The `to`
+# is supplied explicitly here because the seed listing carries no email
+# address of its own (the real flow resolves it from the listing). Then
+# the drain also reports the blocker. Flip live mode back OFF after.
+curl -sf -X PATCH "$BASE/applications/$APP_ID/status" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"status":"APPROVED"}' -o /tmp/ttt-body.json
+curl -sf -X POST "$BASE/settings" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"liveMode":true}' -o /tmp/ttt-body.json
+check "v1.3.0: settings flip turns live mode ON (health confirms)" bash -c "curl -sf $BASE/health -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['live_mode'] is True and d['test_mode'] is False, d\""
+curl -sf -X POST "$BASE/applications/$APP_ID/send" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"to":"casting@example.com"}' -o /tmp/ttt-body.json
+check "v1.3.0: live-mode send with no transport queues, claims nothing sent" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+assert d["sent"] is False and d["queued"] is True, d
+assert "not configured" in (d.get("reason") or ""), d
+print("send blocked honestly:", d["reason"])
+PY
+curl -sf -X POST "$BASE/email/drain" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{}' -o /tmp/ttt-body.json
+check "v1.3.0: live-mode drain with no transport sends 0, skips the queue" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['sent']==0 and d['skipped']>=1 and 'not configured' in (d.get('reason') or ''), d"
+curl -sf -X POST "$BASE/settings" -H 'Authorization: Bearer test-admin-token' -H 'Content-Type: application/json' -d '{"liveMode":false}' -o /tmp/ttt-body.json
+check "v1.3.0: live mode flips back OFF (health confirms TEST MODE)" bash -c "curl -sf $BASE/health -o /tmp/ttt-body.json && python3 -c \"import json; d=json.load(open('/tmp/ttt-body.json')); assert d['live_mode'] is False and d['test_mode'] is True, d\""
+# (g) SUBMITTED-CONFIRMED is still blocked without a SENT email even
+# after the live-mode flip test above (the app was approved, not sent).
+check "v1.3.0: SUBMITTED-CONFIRMED still 400 with no SENT email on file" bash -c "curl -s -o /dev/null -w '%{http_code}' -X PATCH $BASE/applications/$APP_ID/status -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"status\":\"SUBMITTED — CONFIRMED\"}' | grep -q 400"
 
 # ----- LEDGER -----
 curl -sf "$BASE/ledger?entity_id=$TALENT_ID&limit=100" -o /tmp/ttt-body.json

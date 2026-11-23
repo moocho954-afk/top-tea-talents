@@ -144,8 +144,54 @@ chat or post it anywhere.
 - **Sign-up says "missing field"** — you are on an old cached copy; hard
   refresh the page (or wait a minute for Pages to serve the new build).
 
+## Live mode (v1.3.0) — how the system starts sending for real
+
+TEST MODE is still the default. Nothing sends until the owner turns live
+mode on AND the agency mailbox is connected. Two switches, both deliberate:
+
+1. **Live-mode flag** — either set the Render env var
+   `TTT_LIVE_MODE=true` (then **Save and deploy** — "Save only" + restart
+   does NOT reload env) or flip the DB setting as an admin:
+   `POST /api/v1/settings {"liveMode": true}`. Either switch turns it on;
+   turning it off needs both off. `GET /api/v1/health` reports
+   `live_mode` / `test_mode` / `mail_configured` so you can see the state.
+2. **Gmail transport** — the sender is a Google OAuth client for the
+   agency mailbox. In Render → Environment set:
+   `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`
+   (refresh token for the mailbox, scope gmail.send). The sender address
+   is the DB setting `agency_email` (default `moocho954@gmail.com`; swap
+   to `topteatalents@gmail.com` once that mailbox exists — no redeploy
+   needed, it is a setting). Until the credentials are set,
+   `mail_configured` is false and every send is refused honestly —
+   nothing is ever claimed sent.
+
+How a send works: an approved application is sent with
+`POST /api/v1/applications/:id/send` (admin). The email is built by
+`buildApplicationEmail` — subject carries the per-(talent, job) ref code,
+the talent's personal portfolio link appears only when the talent agreed
+to be pitched, and when the posting lists no pay the email asks for the
+pay rate. The destination resolves as: admin-supplied address > an
+address parsed from the listing > a contact email on file. **Most
+listings carry no submission email at all** (verified: 0 of 984 records)
+— then the application becomes `PACKAGE READY` with the official
+submission link, never a faked send. `{"dryRun": true}` previews the
+exact email without queueing or sending. The queue drains every 60s in
+the server plus on demand (`POST /api/v1/email/drain`, admin); a row
+becomes SENT only after Gmail returns a message id, and every send is
+written to the ledger with that id. `SUBMITTED — CONFIRMED` requires a
+SENT email on file first. `GET /api/v1/email/status` (admin) shows the
+queue counts. The auto-runner (cron instruction file
+`docs/AUTO-RUNNER.md`) approves eligible jobs and sends them within the
+3/day, 10/week caps. The listing sweep (tools/sweep-opportunities.py,
+cron instructions in `docs/SWEEP.md`) fetches new listings 4x/day.
+
+**Do NOT set `submissions_paused` false until the proof send works**
+(one real send, delivery + talent CC verified). The pause gates the
+manual queue endpoints; live mode gates the actual sending.
+
 ## TEST MODE reminder
 
-The public site runs in TEST MODE: submissions paused, nothing sent live,
-no payments collected. Lifting TEST MODE is a separate owner decision —
-nothing in this deploy changes that.
+The public site runs in TEST MODE until live mode is turned on as above:
+submissions paused, nothing sent live, no payments collected. Lifting
+TEST MODE is a separate owner decision — nothing in this deploy changes
+that.
