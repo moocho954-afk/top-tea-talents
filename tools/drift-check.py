@@ -37,7 +37,10 @@ REPORT = os.path.join(PACKAGE, "tools", "drift-report.json")
 HISTORY = os.path.join(PACKAGE, "tools", "drift-history.jsonl")
 
 # Files tracked for repo-vs-disk comparison (node_modules and .git excluded).
-SKIP_DIRS = {"node_modules", ".git", "__pycache__"}
+# taylormade-work holds a real talent's portfolio photos + per-run work files
+# for the form submitter — local-only by design, never pushed to the public
+# repo (owner decision 2026-11-23: photos stay out of git).
+SKIP_DIRS = {"node_modules", ".git", "__pycache__", "taylormade-work"}
 # Runtime-generated state/logs mutate every run (reply-watch ~30 min, sweep
 # ~4 h) and can never stay byte-identical to a pushed snapshot; the page
 # does not depend on them, so they are not tracked for drift.
