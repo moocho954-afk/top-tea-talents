@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS applications (
   talent_id TEXT NOT NULL,
   opportunity_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'AWAITING APPROVAL',
+  -- v1.3.2 (talent alerts + receipts): submission snapshot (JSON of exactly
+  -- what went out), portal submission link, and the agency outcome.
+  snapshot_json TEXT,
+  submission_link TEXT,
+  outcome TEXT,
+  outcome_at TEXT,
+  outcome_detail_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

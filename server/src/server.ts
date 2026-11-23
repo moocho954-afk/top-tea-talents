@@ -10,6 +10,7 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
+import { MISSING_INFO_QUESTIONS, TAYLORMADE_MIAMI_VICE_DATES, shortCode, type MissingInfoQuestion } from "./missing-info-questions.js";
 
 const VERSION = "1.3.1";
 const PORT = Number(process.env.PORT || 3000);
@@ -370,6 +371,21 @@ await migrateMailV13();
 // v1.3.1: bookings gain an event date (the 72-hour release rule needs a
 // concrete booking date) + released_at. Idempotent (same catch pattern).
 await migrateReleaseV131();
+// v1.3.2: applications gain a submission snapshot, a portal submission
+// link, and the agency outcome. Idempotent (same catch pattern).
+await migrateAlertsV132();
+async function migrateAlertsV132(): Promise<void> {
+  const adds: [string, string][] = [
+    ["applications", "snapshot_json TEXT"],
+    ["applications", "submission_link TEXT"],
+    ["applications", "outcome TEXT"],
+    ["applications", "outcome_at TEXT"],
+    ["applications", "outcome_detail_json TEXT"],
+  ];
+  for (const [table, col] of adds) {
+    await db.run(`ALTER TABLE ${table} ADD COLUMN ${col}`).catch(() => {});
+  }
+}
 async function migrateReleaseV131(): Promise<void> {
   const adds: [string, string][] = [
     ["bookings", "event_date TEXT"],
@@ -2079,6 +2095,114 @@ async function handle(req: Request): Promise<Response> {
       const v = await talentView(talentId);
       return ok({ talent: v });
     }
+    // ----- v1.3.2: missing-info form (talent alerts + receipts) -----
+    // GET /talent/:id/missing-info — the in-house form's question set:
+    // every profile-gap question with its exact option list, whether it is
+    // already answered, and the current value. Gendered sizes and
+    // conditionals (tattoo locations, car details) appear only when they
+    // apply. Photos are a separate gap entry (answered in the portfolio).
+    if (rest.length === 3 && rest[2] === "missing-info" && method === "GET") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const t = await loadTalent(talentId);
+      if (!t) return err(404, "talent not found");
+      const oppId = q.get("opportunityId");
+      const formSlug = q.get("formSlug");
+      let opp: any = null;
+      if (oppId) {
+        const oRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [oppId]);
+        if (oRows.length) opp = JSON.parse(String(oRows[0].data_json));
+      }
+      const photoRows = await db.all("SELECT COUNT(*) AS n FROM photos WHERE talent_id = ?", [talentId]);
+      const info = computeMissingInfo(t.profile, Number(photoRows[0]?.n ?? 0), opp, formSlug);
+      return ok({ talentId, opportunityId: oppId, formSlug, questions: info.questions, gaps: info.gaps, photosCount: Number(photoRows[0]?.n ?? 0) });
+    }
+    // POST /talent/:id/missing-info-alert — admin sends the alert: email to
+    // the talent (exact gap list + in-profile form link + reply option) AND
+    // a profile notification. dryRun previews the email without sending.
+    // When there are no gaps, nothing is sent and the response says so.
+    if (rest.length === 3 && rest[2] === "missing-info-alert" && method === "POST") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const t = await loadTalent(talentId);
+      if (!t) return err(404, "talent not found");
+      const b = (await body(req)) || {};
+      const oppId = b.opportunityId ? String(b.opportunityId) : null;
+      const formSlug = b.formSlug ? String(b.formSlug) : null;
+      let opp: any = null;
+      if (oppId) {
+        const oRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [oppId]);
+        if (oRows.length) opp = JSON.parse(String(oRows[0].data_json));
+      }
+      const photoRows = await db.all("SELECT COUNT(*) AS n FROM photos WHERE talent_id = ?", [talentId]);
+      const info = computeMissingInfo(t.profile, Number(photoRows[0]?.n ?? 0), opp, formSlug);
+      if (!info.gaps.length) return ok({ alerted: false, gaps: [], reason: "no missing info — the profile already carries every answer" });
+      const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+      const formUrl = base ? `${base}/#/complete-profile` : null;
+      const talentName = (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || "Talent");
+      const email = await buildMissingInfoEmail(talentName, info.gaps, formUrl, opp ? String(opp.title || opp.id) : null);
+      if (b.dryRun === true) {
+        return ok({ dryRun: true, talentId, opportunityId: oppId, gaps: info.gaps, formUrl, email: { from: email.from, to: String(t.profile.email || ""), replyTo: email.replyTo, subject: email.subject, body: email.body } });
+      }
+      const talentEmail = String(t.profile.email || "");
+      if (!talentEmail) return err(400, "talent has no email on file — the alert cannot be sent");
+      const emailId = await enqueueEmail({ to: talentEmail, replyTo: email.replyTo, talentId, applicationId: null, kind: "missing-info", subject: email.subject, body: email.body });
+      const attempt = await drainOneEmail(emailId);
+      const ntfId = await notify(talentId, `Details needed${opp ? ` for ${String(opp.title || opp.id)}` : ""} — ${info.gaps.length} item${info.gaps.length === 1 ? "" : "s"}`,
+        `TOP TEA TALENTS needs ${info.gaps.length} more detail${info.gaps.length === 1 ? "" : "s"} before we can submit you: ${info.gaps.map((g: any) => g.label).join(", ")}. Answer them in your profile (Complete My Details) or reply to the email we just sent.`);
+      await audit("talent.missing-info.alert", "talent", talentId, "admin", { opportunityId: oppId, gaps: info.gaps.map((g: any) => g.id), emailId, emailSent: attempt.sent, messageId: attempt.messageId ?? null, notificationId: ntfId }, { gaps: info.gaps });
+      return ok({ alerted: true, talentId, opportunityId: oppId, gaps: info.gaps, formUrl, emailQueued: true, emailSent: attempt.sent, messageId: attempt.messageId ?? null, emailReason: attempt.sent ? undefined : attempt.reason, notificationId: ntfId });
+    }
+    // POST /talent/:id/answers — the in-profile form submit. Validates every
+    // answer against the question's exact option list (or date/number
+    // rules) FIRST; if any answer is invalid, nothing is saved and every
+    // error is reported. Valid answers land on the record forever (the
+    // same fields the submitter reads). The talent herself or admin.
+    if (rest.length === 3 && rest[2] === "answers" && method === "POST") {
+      const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
+      const t = await loadTalent(talentId);
+      if (!t) return err(404, "talent not found");
+      const b = await body(req);
+      if (!b || typeof b.answers !== "object" || b.answers === null) return err(400, "answers object is required");
+      const oppId = b.opportunityId ? String(b.opportunityId) : null;
+      const formSlug = b.formSlug ? String(b.formSlug) : null;
+      let opp: any = null;
+      if (oppId) {
+        const oRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [oppId]);
+        if (oRows.length) opp = JSON.parse(String(oRows[0].data_json));
+      }
+      const photoRows = await db.all("SELECT COUNT(*) AS n FROM photos WHERE talent_id = ?", [talentId]);
+      const info = computeMissingInfo(t.profile, Number(photoRows[0]?.n ?? 0), opp, formSlug);
+      const byId = new Map(info.questions.map((x: any) => [x.id, x]));
+      const errors: string[] = [];
+      const toSave: { q: any; value: any }[] = [];
+      for (const [qid, value] of Object.entries(b.answers)) {
+        const def = MISSING_INFO_QUESTIONS.find((x) => x.id === qid);
+        if (!def) { errors.push(`unknown question: ${qid}`); continue; }
+        const shown = byId.get(qid);
+        if (!shown) { errors.push(`${def.label}: this question does not apply right now`); continue; }
+        const errText = validateAnswer(def, value, shown.options ?? def.options);
+        if (errText) { errors.push(errText); continue; }
+        toSave.push({ q: def, value });
+      }
+      if (errors.length) return err(400, errors.join(" | "));
+      if (!toSave.length) return err(400, "no answers to save");
+      const p = { ...t.profile };
+      const saved: string[] = [];
+      for (const { q, value } of toSave) {
+        setProfileValue(p, q.path, storeAnswerValue(q, value));
+        saved.push(q.id);
+        if (q.id === "english" && shortCode(String(value)) === "YES") {
+          const langs = Array.isArray(p.languages) ? [...p.languages] : [];
+          if (!langs.some((l: any) => String(l).toLowerCase() === "english")) langs.push("English");
+          p.languages = langs;
+        }
+      }
+      await saveProfile(talentId, p);
+      const status = await refreshStatus(talentId);
+      const after = await loadTalent(talentId);
+      const remaining = computeMissingInfo(after?.profile || p, Number(photoRows[0]?.n ?? 0), opp, formSlug);
+      await audit("talent.answers", "talent", talentId, chk.admin ? "admin" : talentId, { saved, remainingGaps: remaining.gaps.map((g: any) => g.id), status }, { profile: after?.profile ?? null });
+      return ok({ saved, remainingGaps: remaining.gaps, status });
+    }
     if (rest.length === 2 && method === "DELETE") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       await db.run("DELETE FROM photos WHERE talent_id = ?", [talentId]);
@@ -2278,11 +2402,41 @@ async function handle(req: Request): Promise<Response> {
       const ts = nowIso();
       await db.run("UPDATE applications SET status = 'PACKAGE READY', updated_at = ? WHERE id = ?", [ts, appId]);
       await audit("application.package.ready", "application", appId, "admin", { opportunityId: String(app.opportunity_id), referenceCode: email.referenceCode, portfolioLink: email.portfolioLink, payAsk: email.payAsk, submitVia: opp.source_url || null, note: "No submission email on file for this listing — the package is prepared; submit via the official link." }, { application: { id: appId, status: "PACKAGE READY" } });
+      // v1.3.2: the package-ready receipt — the talent gets the snapshot
+      // (what would have gone out + the portal link) even though no email
+      // went to the agency. A snapshot failure never fails the send.
+      try {
+        const snap = await storeSnapshot(appId, "package-ready", {
+          email, destination: null, destinationSource: null, submitVia: opp.source_url || null,
+          sentAt: null, messageId: null, status: "PACKAGE READY",
+          note: "The agency has no submission email on file — the full package is ready for the portal; the snapshot carries everything that would have gone out.",
+        });
+        if (snap) {
+          const sres = await sendSnapshotEmailToTalent(appId, snap);
+          await audit("application.snapshot.email", "application", appId, "admin", { snapshotEmailSent: sres.sent, messageId: sres.messageId ?? null, reason: sres.reason ?? null }, { snapshot: snap });
+        }
+      } catch (e) { console.error("snapshot failed for", appId, (e as any)?.message || e); }
       return ok({ sent: false, packageReady: true, applicationId: appId, status: "PACKAGE READY", destination: null, submitVia: opp.source_url || null, email: { from: email.from, cc: email.cc, replyTo: email.replyTo, subject: email.subject, body: email.body, referenceCode: email.referenceCode, portfolioLink: email.portfolioLink, payAsk: email.payAsk } });
     }
     const emailId = await enqueueEmail({ to: dest.to, cc: email.cc, replyTo: email.replyTo, talentId: String(app.talent_id), applicationId: appId, kind: "application", subject: email.subject, body: email.body });
     const attempt = await drainOneEmail(emailId);
-    if (attempt.sent) return ok({ sent: true, applicationId: appId, status: "SUBMITTED — SENT", messageId: attempt.messageId, destination: dest.to, destinationSource: dest.source, referenceCode: email.referenceCode });
+    if (attempt.sent) {
+      // v1.3.2: the sent receipt — snapshot stored on the application and
+      // the receipt email queued to the talent. A snapshot failure never
+      // fails the send.
+      try {
+        const qRows = await db.all("SELECT sent_at, message_id FROM email_queue WHERE id = ?", [emailId]);
+        const snap = await storeSnapshot(appId, "email-sent", {
+          email, destination: dest.to, destinationSource: dest.source, submitVia: null,
+          sentAt: qRows[0]?.sent_at ?? null, messageId: attempt.messageId ?? null, status: "SUBMITTED — SENT",
+        });
+        if (snap) {
+          const sres = await sendSnapshotEmailToTalent(appId, snap);
+          await audit("application.snapshot.email", "application", appId, "admin", { snapshotEmailSent: sres.sent, messageId: sres.messageId ?? null, reason: sres.reason ?? null }, { snapshot: snap });
+        }
+      } catch (e) { console.error("snapshot failed for", appId, (e as any)?.message || e); }
+      return ok({ sent: true, applicationId: appId, status: "SUBMITTED — SENT", messageId: attempt.messageId, destination: dest.to, destinationSource: dest.source, referenceCode: email.referenceCode });
+    }
     return ok({ sent: false, queued: true, applicationId: appId, status: String(app.status), emailId, destination: dest.to, reason: attempt.reason, note: "Email queued — it was not sent. The drain will retry it; nothing is claimed sent." });
   }
 
@@ -2311,7 +2465,7 @@ async function handle(req: Request): Promise<Response> {
       // only their own applications (never anyone else's).
       if (isAdmin(req)) {
         const rows = await db.all("SELECT * FROM applications ORDER BY created_at DESC");
-        let list = rows.map((r) => ({ id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at }));
+        let list = rows.map(applicationSummary);
         if (q.get("talentId")) list = list.filter((a) => a.talentId === q.get("talentId"));
         if (q.get("status")) list = list.filter((a) => a.status === q.get("status"));
         return ok({ applications: list, total: list.length });
@@ -2319,7 +2473,7 @@ async function handle(req: Request): Promise<Response> {
       const me = await talentFromToken(req);
       if (!me) return err(401, "authentication required");
       const rows = await db.all("SELECT * FROM applications WHERE talent_id = ? ORDER BY created_at DESC", [me]);
-      let list = rows.map((r) => ({ id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at }));
+      let list = rows.map(applicationSummary);
       if (q.get("status")) list = list.filter((a) => a.status === q.get("status"));
       return ok({ applications: list, total: list.length });
     }
@@ -2348,6 +2502,150 @@ async function handle(req: Request): Promise<Response> {
       await db.run("DELETE FROM applications WHERE id = ?", [rest[1]]);
       await audit("application.delete", "application", rest[1], "admin", {}, { deleted: true });
       return ok({ deleted: true, applicationId: rest[1] });
+    }
+    // ----- v1.3.2: submission link, snapshot, outcome (receipts) -----
+    // GET /applications/:id — the full record: snapshot, submission link,
+    // outcome. The list below carries the summary only.
+    if (method === "GET" && rest.length === 2) {
+      const rows = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "application not found");
+      const chk = await requireTalentOrAdmin(req, String(rows[0].talent_id)); if (!chk.ok) return chk.res!;
+      return ok({ application: applicationView(rows[0]) });
+    }
+    // POST /applications/:id/submission-link — record the portal link for a
+    // form/portal submission (e.g. the TaylorMade Tally form). The talent
+    // gets the link in her snapshot email; the agency can go back and
+    // check it. The snapshot is refreshed with the link when one exists.
+    if (method === "POST" && rest.length === 3 && rest[2] === "submission-link") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const b = await body(req);
+      if (!b || !b.link) return err(400, "link is required");
+      const link = String(b.link).trim();
+      if (!/^https?:\/\/.+/.test(link) || link.length < 10) return err(400, "link must be an http(s) URL");
+      const rows = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "application not found");
+      await db.run("UPDATE applications SET submission_link = ?, updated_at = ? WHERE id = ?", [link, nowIso(), rest[1]]);
+      const note = b.note ? String(b.note).slice(0, 500) : null;
+      const existing = rows[0].snapshot_json ? JSON.parse(String(rows[0].snapshot_json)) : null;
+      if (existing) {
+        existing.link = link;
+        existing.submitVia = link;
+        if (note) existing.note = note;
+        await db.run("UPDATE applications SET snapshot_json = ? WHERE id = ?", [JSON.stringify(existing), rest[1]]);
+      }
+      await audit("application.submission-link", "application", rest[1], "admin", { link, note }, { submissionLink: link });
+      const updated = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      return ok({ application: applicationView(updated[0]) });
+    }
+    // POST /applications/:id/snapshot — (re)build the snapshot from the
+    // current record and email the receipt to the talent. The send flow
+    // calls the same routine automatically when a submission is confirmed.
+    if (method === "POST" && rest.length === 3 && rest[2] === "snapshot") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const rows = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "application not found");
+      const b = (await body(req)) || {};
+      const snap = await storeSnapshot(rest[1], "manual", { status: String(rows[0].status), submitVia: rows[0].submission_link || null, note: b.note ? String(b.note).slice(0, 500) : null });
+      if (!snap) return err(404, "application not found");
+      const sent = await sendSnapshotEmailToTalent(rest[1], snap);
+      await audit("application.snapshot.send", "application", rest[1], "admin", { emailSent: sent.sent, messageId: sent.messageId ?? null, reason: sent.reason ?? null }, { snapshot: snap });
+      return ok({ snapshot: snap, snapshotEmailQueued: sent.queued, snapshotEmailSent: sent.sent, messageId: sent.messageId ?? null, emailReason: sent.reason ?? null });
+    }
+    // POST /applications/:id/outcome — record the agency's outcome on an
+    // application (accepted / callback / rejected) and notify the talent
+    // INSTANTLY (email + profile notification). Every detail comes from
+    // the agency's reply as supplied — nothing is invented: a missing call
+    // time or location is reported as "still to come". Accepted creates
+    // (or updates) the booking from the supplied facts only.
+    if (method === "POST" && rest.length === 3 && rest[2] === "outcome") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const rows = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "application not found");
+      const app = rows[0];
+      const b = await body(req);
+      if (!b || !b.outcome) return err(400, "outcome is required");
+      const outcome = String(b.outcome).toLowerCase();
+      if (outcome !== "accepted" && outcome !== "callback" && outcome !== "rejected") return err(400, 'outcome must be "accepted", "callback", or "rejected"');
+      const details = (b.details && typeof b.details === "object") ? b.details : {};
+      for (const k of ["callTime", "location", "whatToBring", "contact", "ask", "notes"]) {
+        if (details[k] !== undefined && (typeof details[k] !== "string" || details[k].length > 500)) return err(400, `${k} must be text (max 500 characters)`);
+      }
+      let eventDate: string | null = null;
+      if (details.eventDate !== undefined && details.eventDate !== null && details.eventDate !== "") {
+        eventDate = String(details.eventDate).trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return err(400, "eventDate must be YYYY-MM-DD");
+      }
+      let replyBody: string | null = null;
+      if (b.replyId) {
+        const rRows = await db.all("SELECT * FROM application_replies WHERE id = ? AND application_id = ?", [String(b.replyId), rest[1]]);
+        if (!rRows.length) return err(400, "replyId does not belong to this application");
+        replyBody = String(rRows[0].body || "");
+      }
+      const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [app.opportunity_id]);
+      const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+      const t = await loadTalent(String(app.talent_id));
+      const talentName = t ? (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || "Talent") : String(app.talent_id);
+      const fromName = b.fromName ? String(b.fromName).slice(0, 100) : (opp?.casting_org || opp?.employer || null);
+      const ts = nowIso();
+      const detailJson = JSON.stringify({ ...details, eventDate, replyId: b.replyId ? String(b.replyId) : null });
+      await db.run("UPDATE applications SET outcome = ?, outcome_at = ?, outcome_detail_json = ?, updated_at = ? WHERE id = ?", [outcome, ts, detailJson, ts, rest[1]]);
+      let booking: any = null;
+      if (outcome === "accepted") {
+        const existing = await db.all("SELECT * FROM bookings WHERE application_id = ? AND status IN ('BOOKED', 'BOOKING CONFIRMED') ORDER BY created_at DESC LIMIT 1", [rest[1]]);
+        const evidence = (details.notes ? String(details.notes) : null) || (replyBody ? replyBody.slice(0, 200) : null) || "Accepted per agency reply";
+        if (existing.length) {
+          booking = existing[0];
+          if (eventDate) await db.run("UPDATE bookings SET event_date = ?, updated_at = ? WHERE id = ?", [eventDate, ts, booking.id]);
+          await audit("booking.outcome.update", "booking", String(booking.id), "admin", { applicationId: rest[1], outcome, eventDate }, { bookingId: String(booking.id) });
+          const upd = await db.all("SELECT * FROM bookings WHERE id = ?", [booking.id]);
+          booking = bookingView(upd[0]);
+        } else {
+          const grossDollars = parseMoney(opp?.compensation);
+          const grossCents = grossDollars !== null && Number.isFinite(grossDollars) ? Math.round(grossDollars * 100) : 0;
+          const s = await commissionSettings();
+          const daily = normalizedDaily(opp?.compensation_type, opp?.compensation, opp?.hours);
+          const rate = commissionRate(daily, s);
+          const { feeCents, netCents } = commissionFor(grossCents, rate);
+          const id = genId("bkg");
+          await db.run("INSERT INTO bookings (id, application_id, talent_id, opportunity_id, status, event_date, released_at, evidence, gross_cents, rate, commission_cents, net_cents, created_at, updated_at) VALUES (?, ?, ?, ?, 'BOOKED', ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+            [id, rest[1], app.talent_id, app.opportunity_id, eventDate, evidence, grossCents, rate, feeCents, netCents, ts, ts]);
+          const title = opp?.title ?? String(app.opportunity_id);
+          const summary = `Booking confirmed: ${title} for ${talentName}. Gross $${(grossCents / 100).toFixed(2)} — commission ${rate}% $${(feeCents / 100).toFixed(2)} — net $${(netCents / 100).toFixed(2)}. Evidence on file. No payment processed — tracking only.`;
+          await notify(String(app.talent_id), `Booking confirmed: ${title}`, summary);
+          const talentEmail = t ? String(t.profile.email || "") : "";
+          const emailId = genId("eml");
+          await db.run("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at, to_addr, application_id, kind) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, 'booking')",
+            [emailId, app.talent_id, `Booking confirmed: ${title}`, summary, ts, talentEmail || null, rest[1]]);
+          await audit("booking.create", "booking", id, "admin", { applicationId: rest[1], talentId: app.talent_id, opportunityId: app.opportunity_id, status: "BOOKED", grossCents, rate, commissionCents: feeCents, netCents, agency: opp ? (opp.casting_org || opp.employer || null) : null, note: "Booking created from a recorded agency acceptance — facts from the reply only." }, {
+            booking: { id, application_id: rest[1], talent_id: app.talent_id, opportunity_id: app.opportunity_id, status: "BOOKED", event_date: eventDate, released_at: null, evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts },
+          });
+          const created = await db.all("SELECT * FROM bookings WHERE id = ?", [id]);
+          booking = bookingView(created[0]);
+        }
+      }
+      const email = await buildOutcomeEmail(talentName, outcome, opp, { ...details, eventDate }, fromName);
+      const talentEmail = t ? String(t.profile.email || "") : "";
+      let emailSent = false, messageId: string | undefined, emailReason: string | undefined, emailQueued = false;
+      if (talentEmail) {
+        const emailId = await enqueueEmail({ to: talentEmail, replyTo: email.replyTo, talentId: String(app.talent_id), applicationId: rest[1], kind: "outcome", subject: email.subject, body: email.body });
+        emailQueued = true;
+        const attempt = await drainOneEmail(emailId);
+        emailSent = attempt.sent;
+        messageId = attempt.messageId;
+        emailReason = attempt.sent ? undefined : attempt.reason;
+      } else {
+        emailReason = "no talent email on file";
+      }
+      const ntfTitle = outcome === "accepted" ? `You're booked: ${opp?.title ?? String(app.opportunity_id)}` : outcome === "callback" ? `Callback from ${fromName || "the agency"}: ${opp?.title ?? String(app.opportunity_id)}` : `Update: ${opp?.title ?? String(app.opportunity_id)} — not selected`;
+      const ntfBody = outcome === "accepted"
+        ? `You were booked for ${opp?.title ?? String(app.opportunity_id)}.${details.callTime ? ` Call time: ${details.callTime}.` : ""}${eventDate ? ` Date: ${eventDate}.` : ""}${details.location ? ` Location: ${details.location}.` : ""}${!details.callTime || !eventDate || !details.location ? " Anything not listed here is still to come from the agency — we will send it the moment it arrives." : ""}`
+        : outcome === "callback"
+          ? `${fromName || "The agency"} came back on ${opp?.title ?? String(app.opportunity_id)}.${details.ask ? ` They ask: ${details.ask}` : ""}${details.notes ? ` Notes: ${details.notes}` : ""}`
+          : `You were not selected for ${opp?.title ?? String(app.opportunity_id)}. Your other applications are unaffected.`;
+      const ntfId = await notify(String(app.talent_id), ntfTitle, ntfBody);
+      await audit("application.outcome", "application", rest[1], "admin", { outcome, replyId: b.replyId ? String(b.replyId) : null, fromName, eventDate, emailQueued, emailSent, messageId: messageId ?? null, notificationId: ntfId, bookingId: booking?.id ?? null }, { outcome, outcomeAt: ts, booking: booking ?? null });
+      const updated = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
+      return ok({ application: applicationView(updated[0]), booking: booking ?? null, emailQueued, emailSent, messageId: messageId ?? null, emailReason, notificationId: ntfId });
     }
     return err(404, "not found");
   }
@@ -2601,6 +2899,129 @@ async function notify(talentId: string, title: string, body: string): Promise<st
   await db.run("INSERT INTO notifications (id, talent_id, title, body, read, created_at) VALUES (?, ?, ?, ?, 0, ?)", [id, talentId, title, body, ts]);
   await audit("notification.create", "notification", id, "system", { talentId, title }, { notification: { id, talent_id: talentId, title, body, read: false, created_at: ts } });
   return id;
+}
+
+// ---------- v1.3.2: missing-info questions (talent alerts + receipts) ----------
+// The in-house TTT form. Question definitions live in
+// missing-info-questions.ts (exact casting-form option texts, captured from
+// the live TaylorMade form). These helpers compute gaps from the talent
+// record, validate answers against the exact option lists, and store them
+// on the record forever — the same storage the submitter reads, so an
+// answer given once never becomes a gap again.
+function profileValue(profile: any, path: string): any {
+  const m = path.match(/^clothing\["(.+)"\]$/);
+  if (m) return (profile.clothing || {})[m[1]];
+  const parts = path.split(".");
+  if (parts.length === 2) return (profile[parts[0]] || {})[parts[1]];
+  return profile[path];
+}
+function setProfileValue(profile: any, path: string, value: any): void {
+  const m = path.match(/^clothing\["(.+)"\]$/);
+  if (m) { if (!profile.clothing) profile.clothing = {}; profile.clothing[m[1]] = value; return; }
+  const parts = path.split(".");
+  if (parts.length === 2) { if (!profile[parts[0]]) profile[parts[0]] = {}; profile[parts[0]][parts[1]] = value; return; }
+  profile[path] = value;
+}
+function storedShort(profile: any, path: string): string | null {
+  const v = profileValue(profile, path);
+  return typeof v === "string" ? v : null;
+}
+function questionApplies(q: MissingInfoQuestion, profile: any): boolean {
+  if (q.applies) {
+    const g = storedShort(profile, "demographics.gender") || (typeof profile.gender === "string" ? profile.gender : null);
+    if (!g || g !== q.applies) return false;
+  }
+  if (q.requires) {
+    const [reqPath, reqVal] = q.requires.split("=");
+    const key = reqPath === "tattoos" ? "demographics.tattoos" : reqPath === "vintageVehicle" ? "demographics.vintageVehicle" : reqPath;
+    if (storedShort(profile, key) !== reqVal) return false;
+  }
+  return true;
+}
+function isAnswered(q: MissingInfoQuestion, profile: any): boolean {
+  const v = profileValue(profile, q.path);
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === "boolean") return v === true;
+  if (typeof v === "number") return Number.isFinite(v);
+  if (typeof v === "string") return v.trim() !== "";
+  return v !== null && v !== undefined;
+}
+function filmingDateOptions(opp: any, formSlug: string | null): { options: string[] | null; source: string } {
+  const title = String(opp?.title || "");
+  if (formSlug === "miamivice" || /miami vice/i.test(title)) {
+    return { options: [...TAYLORMADE_MIAMI_VICE_DATES], source: "taylormade-miamivice" };
+  }
+  if (opp) {
+    const tokens = extractDateTokens(opp.production_dates || opp.deadline);
+    if (tokens.length >= 2) {
+      const display = tokens.map((t) => {
+        const m = t.match(/^([a-z]+)-(\d{1,2})-(\d{4})$/);
+        if (!m) return t;
+        return m[1].charAt(0).toUpperCase() + m[1].slice(1) + " " + m[2] + ", " + m[3];
+      });
+      return { options: display, source: "opportunity" };
+    }
+  }
+  return { options: null, source: "free-text" };
+}
+function computeMissingInfo(profile: any, photosCount: number, opp: any = null, formSlug: string | null = null): { questions: any[]; gaps: any[] } {
+  const questions: any[] = [];
+  for (const q of MISSING_INFO_QUESTIONS) {
+    if (!questionApplies(q, profile)) continue;
+    let options: string[] | null = q.options;
+    let optionsSource = "casting-form";
+    if (q.id === "filmingDates") {
+      const r = filmingDateOptions(opp, formSlug);
+      options = r.options;
+      optionsSource = r.source;
+    }
+    const answered = isAnswered(q, profile);
+    questions.push({ id: q.id, label: q.label, kind: q.kind, options, optionsSource, store: q.store, order: q.order, answered, currentValue: profileValue(profile, q.path) ?? null });
+  }
+  questions.sort((a, b) => a.order - b.order);
+  const gaps = questions.filter((x) => !x.answered).map((x) => ({ id: x.id, label: x.label, kind: x.kind }));
+  if (photosCount < 2) {
+    gaps.push({ id: "photos", label: "Close-up + full-body photos", kind: "photos" });
+  }
+  return { questions, gaps };
+}
+function validateAnswer(q: MissingInfoQuestion, value: any, options: string[] | null): string | null {
+  if (q.kind === "bool") {
+    if (value !== true) return `${q.label}: check the box to confirm`;
+    return null;
+  }
+  if (q.kind === "choice") {
+    if (typeof value !== "string" || !(options || []).includes(value)) return `${q.label}: pick one of the listed options`;
+    return null;
+  }
+  if (q.kind === "multi") {
+    if (!Array.isArray(value) || value.length === 0) return `${q.label}: pick at least one`;
+    for (const v of value) if (typeof v !== "string" || !(options || []).includes(v)) return `${q.label}: "${String(v)}" is not one of the listed options`;
+    return null;
+  }
+  if (q.kind === "date") {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(value + "T00:00:00Z"))) return `${q.label}: use YYYY-MM-DD`;
+    if (value > todayStr()) return `${q.label}: date of birth cannot be in the future`;
+    return null;
+  }
+  if (q.kind === "number") {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return `${q.label}: enter a number`;
+    if (q.id === "weightLbs" && (n < 50 || n > 700)) return `${q.label}: weight must be 50–700 lbs`;
+    if (q.id === "carYear" && (n < 1960 || n > 1989)) return `${q.label}: car year must be 1960–1989`;
+    return null;
+  }
+  if (q.kind === "text") {
+    if (typeof value !== "string" || !value.trim() || value.length > 200) return `${q.label}: enter text (max 200 characters)`;
+    return null;
+  }
+  return `${q.label}: unknown question kind`;
+}
+function storeAnswerValue(q: MissingInfoQuestion, value: any): any {
+  if (q.store === "short") return shortCode(String(value));
+  if (q.store === "bool") return true;
+  if (q.kind === "number") return Number(value);
+  return value;
 }
 
 async function countsAll(): Promise<any> {
@@ -3094,6 +3515,118 @@ function resolveBookingEventDate(booking: any, opp: any): { date: Date | null; s
   return { date: null, source: null, display: null };
 }
 
+// buildMissingInfoEmail — the missing-info alert (v1.3.2). Lists exactly
+// what is missing, nothing more. The talent answers in the in-profile form
+// (link) or replies to this email; either way the answers land on her
+// record. Never invents a missing item — the list IS the gap list.
+async function buildMissingInfoEmail(talentName: string, gaps: any[], formUrl: string | null, opportunityTitle: string | null): Promise<any> {
+  const from = await agencyEmail();
+  const subject = `Top Tea Talents — ${gaps.length} detail${gaps.length === 1 ? "" : "s"} we need from you${opportunityTitle ? ` for ${opportunityTitle}` : ""}`;
+  const lines: string[] = [];
+  lines.push(`Hello ${talentName},`);
+  lines.push(``);
+  if (opportunityTitle) lines.push(`You match ${opportunityTitle}, but we cannot submit you yet — the details below are missing from your profile.`);
+  else lines.push(`We cannot submit you for new roles yet — the details below are missing from your profile.`);
+  lines.push(``);
+  for (const g of gaps) {
+    if (g.kind === "photos") lines.push(`- ${g.label} — upload them in your portfolio (2 photos: one close-up, one full body).`);
+    else lines.push(`- ${g.label}`);
+  }
+  lines.push(``);
+  if (formUrl) {
+    lines.push(`Answer them here (mostly taps — typing only where a number or date is needed):`);
+    lines.push(formUrl);
+    lines.push(``);
+  }
+  lines.push(`Or just reply to this email with your answers — we will put them on your profile the moment they arrive.`);
+  lines.push(`Once these are in, they stay on your record, so this never happens again unless a new role needs something new.`);
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS — ${from}`);
+  return { from, subject, body: lines.join("\n"), replyTo: [from] };
+}
+
+// buildSubmissionSnapshotEmail — the receipt (v1.3.2). Exactly what went
+// out: the job, the reference code, the destination or portal link, and
+// when it went. The full sent email text is stored on the application
+// record; this email carries the facts the talent needs at a glance.
+async function buildSubmissionSnapshotEmail(talentName: string, snap: any): Promise<any> {
+  const from = await agencyEmail();
+  const subject = `Your submission receipt — ${snap.jobTitle || snap.opportunityId} — Ref ${snap.referenceCode || "—"}`;
+  const lines: string[] = [];
+  lines.push(`Hello ${talentName},`);
+  lines.push(``);
+  lines.push(`Here is exactly what TOP TEA TALENTS sent for you:`);
+  lines.push(``);
+  lines.push(`Job: ${snap.jobTitle || snap.opportunityId}`);
+  if (snap.org) lines.push(`Agency: ${snap.org}`);
+  lines.push(`Reference code: ${snap.referenceCode || "—"}`);
+  lines.push(`Status: ${snap.status}`);
+  if (snap.destination) lines.push(`Sent to: ${snap.destination}`);
+  if (snap.submitVia) lines.push(`Submitted via: ${snap.submitVia}`);
+  if (snap.sentAt) lines.push(`Sent: ${snap.sentAt}`);
+  if (snap.payLine) lines.push(`Pay: ${snap.payLine}`);
+  if (snap.portfolioLink) lines.push(`Portfolio link sent: ${snap.portfolioLink}`);
+  if (snap.answersSummary) lines.push(`About you (as sent): ${snap.answersSummary}`);
+  if (snap.photosSent !== null && snap.photosSent !== undefined) lines.push(`Photos sent: ${snap.photosSent}`);
+  if (snap.note) lines.push(`Note: ${snap.note}`);
+  lines.push(``);
+  lines.push(`The full text we sent is stored on your application — ask the agency any time and we can show it to you.`);
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS — ${from}`);
+  return { from, subject, body: lines.join("\n"), replyTo: [from] };
+}
+
+// buildOutcomeEmail — the outcome notification (v1.3.2). Every detail comes
+// from the agency's reply as recorded — the system never invents a call
+// time, location, or pay figure. Anything the reply did not say is listed
+// under "Still to come", never guessed.
+async function buildOutcomeEmail(talentName: string, outcome: string, opp: any, details: any, fromName: string | null): Promise<any> {
+  const from = await agencyEmail();
+  const title = String(opp?.title || opp?.id || "your application").slice(0, 80);
+  const label = outcome === "accepted" ? "You're booked!" : outcome === "callback" ? "Callback / questions from the agency" : "Update on your application";
+  const subject = `${label} — ${title}`;
+  const lines: string[] = [];
+  lines.push(`Hello ${talentName},`);
+  lines.push(``);
+  if (outcome === "accepted") {
+    lines.push(`Good news — ${fromName || "the agency"} booked you for ${title}.`);
+  } else if (outcome === "callback") {
+    lines.push(`${fromName || "The agency"} came back on your application for ${title} — they have a question or a callback for you.`);
+  } else {
+    lines.push(`${fromName || "The agency"} came back on your application for ${title} — you were not selected for this one.`);
+  }
+  lines.push(``);
+  const d = details || {};
+  const shown: string[] = [];
+  if (d.callTime) { lines.push(`Call time: ${d.callTime}`); shown.push("callTime"); }
+  if (d.eventDate) { lines.push(`Date: ${d.eventDate}`); shown.push("eventDate"); }
+  if (d.location) { lines.push(`Location: ${d.location}`); shown.push("location"); }
+  if (d.whatToBring) { lines.push(`Bring: ${d.whatToBring}`); shown.push("whatToBring"); }
+  if (d.contact) { lines.push(`Contact: ${d.contact}`); shown.push("contact"); }
+  if (d.ask) { lines.push(`The agency asks: ${d.ask}`); shown.push("ask"); }
+  if (d.notes) { lines.push(`Notes: ${d.notes}`); shown.push("notes"); }
+  if (outcome === "accepted") {
+    const missing: string[] = [];
+    if (!d.callTime) missing.push("call time");
+    if (!d.eventDate) missing.push("date");
+    if (!d.location) missing.push("location");
+    if (!d.whatToBring) missing.push("what to bring");
+    if (missing.length) {
+      lines.push(``);
+      lines.push(`Still to come from the agency: ${missing.join(", ")}. We will send them the moment they arrive — nothing here is a guess.`);
+    }
+  }
+  if (outcome === "rejected") {
+    lines.push(`Nothing else was sent with this one — no call time, no booking. Your other applications are unaffected.`);
+  }
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS — ${from}`);
+  return { from, subject, body: lines.join("\n"), replyTo: [from] };
+}
+
 // buildReleaseEmail — the ONE release template. Only the talent's name and
 // the agency name vary per email; the booking title/date/location are facts
 // from the record, never invented. No per-release free text in v1.
@@ -3182,6 +3715,54 @@ async function resolveDestination(opp: any, explicitTo?: string): Promise<{ to: 
     if (rows.length) return { to: String(rows[0].email), source: "contacts" };
   }
   return { to: null, source: null };
+}
+
+// ---------- v1.3.2: submission snapshots ----------
+// storeSnapshot builds the receipt of exactly what went out for an
+// application (email sent, package ready, or portal submission) and stores
+// it on the application record. The full sent email text is kept in the
+// snapshot so the agency can see it verbatim; the talent gets the summary
+// by email. Nothing is invented: destination, link, time, and pay come
+// from the send result and the listing.
+async function storeSnapshot(appId: string, source: string, ctx: any): Promise<any> {
+  const appRows = await db.all("SELECT * FROM applications WHERE id = ?", [appId]);
+  if (!appRows.length) return null;
+  const app = appRows[0];
+  const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [app.opportunity_id]);
+  const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+  const t = await loadTalent(String(app.talent_id));
+  const ref = refCode(String(app.talent_id), String(app.opportunity_id));
+  const email = ctx.email || null;
+  const daily = opp ? normalizedDaily(opp.compensation_type, opp.compensation, opp.hours) : null;
+  const photoRows = await db.all("SELECT COUNT(*) AS n FROM photos WHERE talent_id = ?", [app.talent_id]);
+  const snap = {
+    applicationId: appId, talentId: String(app.talent_id), opportunityId: String(app.opportunity_id),
+    jobTitle: opp?.title || String(app.opportunity_id), org: opp?.casting_org || opp?.employer || null,
+    referenceCode: ref, status: ctx.status || String(app.status),
+    destination: ctx.destination ?? null, destinationSource: ctx.destinationSource ?? null,
+    submitVia: ctx.submitVia ?? null, sentAt: ctx.sentAt ?? null, messageId: ctx.messageId ?? null,
+    source,
+    payLine: daily !== null ? `$${daily}/day (per the posting).` : "Pay not listed on the posting — the application asked the agency to confirm.",
+    portfolioLink: email?.portfolioLink ?? null,
+    answersSummary: t ? `${[t.profile.city, t.profile.state].filter(Boolean).join(", ") || "South Florida"}. Categories: ${(t.profile.categories || []).join(", ") || "—"}. Skills: ${(t.profile.skills || []).join(", ") || "—"}. Experience: ${t.profile.experience || "—"}.` : null,
+    photosSent: Number(photoRows[0]?.n ?? 0),
+    emailSubject: email?.subject ?? null, emailBody: email?.body ?? null,
+    link: app.submission_link ?? null, note: ctx.note ?? null,
+    recordedAt: nowIso(),
+  };
+  await db.run("UPDATE applications SET snapshot_json = ?, updated_at = ? WHERE id = ?", [JSON.stringify(snap), nowIso(), appId]);
+  await audit("application.snapshot", "application", appId, "system", { source, status: snap.status, destination: snap.destination, submitVia: snap.submitVia, messageId: snap.messageId }, { snapshot: snap });
+  return snap;
+}
+async function sendSnapshotEmailToTalent(appId: string, snap: any): Promise<{ queued: boolean; sent: boolean; messageId?: string; reason?: string }> {
+  const t = await loadTalent(String(snap.talentId));
+  const talentEmail = t ? String(t.profile.email || "") : "";
+  if (!talentEmail) return { queued: false, sent: false, reason: "no talent email on file" };
+  const name = t ? (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || "Talent") : "Talent";
+  const email = await buildSubmissionSnapshotEmail(name, snap);
+  const emailId = await enqueueEmail({ to: talentEmail, replyTo: email.replyTo, talentId: String(snap.talentId), applicationId: appId, kind: "snapshot", subject: email.subject, body: email.body });
+  const attempt = await drainOneEmail(emailId);
+  return { queued: true, sent: attempt.sent, messageId: attempt.messageId, reason: attempt.sent ? undefined : attempt.reason };
 }
 
 async function enqueueEmail(row: { to: string | null; cc?: string[]; replyTo?: string[]; talentId?: string | null; applicationId?: string | null; kind: string; subject: string; body: string }): Promise<string> {
@@ -3367,6 +3948,36 @@ function bookingView(r: Row): any {
     commissionCents: Number(r.commission_cents ?? 0), netCents: Number(r.net_cents ?? 0),
     gross: Number(r.gross_cents ?? 0) / 100, fee: Number(r.commission_cents ?? 0) / 100, net: Number(r.net_cents ?? 0) / 100,
     eventDate: r.event_date ?? null, releasedAt: r.released_at ?? null,
+    createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+// v1.3.2 (receipts): parse a stored snapshot JSON; returns null when none.
+function parseSnapshot(r: Row): any {
+  if (!r.snapshot_json) return null;
+  try { return JSON.parse(String(r.snapshot_json)); } catch { return null; }
+}
+function applicationView(r: Row): any {
+  const snap = parseSnapshot(r);
+  let outcomeDetails: any = null;
+  if (r.outcome_detail_json) { try { outcomeDetails = JSON.parse(String(r.outcome_detail_json)); } catch { outcomeDetails = null; } }
+  return {
+    id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status,
+    submissionLink: r.submission_link ?? null,
+    outcome: r.outcome ?? null, outcomeAt: r.outcome_at ?? null, outcomeDetails,
+    snapshot: snap,
+    createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+// List rows carry the small summary, NOT the full snapshot (which holds
+// the entire sent email text). GET /applications/:id returns the full view.
+function applicationSummary(r: Row): any {
+  const snap = parseSnapshot(r);
+  return {
+    id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status,
+    submissionLink: r.submission_link ?? null,
+    outcome: r.outcome ?? null, outcomeAt: r.outcome_at ?? null,
+    snapshotSummary: snap ? { status: snap.status, destination: snap.destination ?? null, submitVia: snap.submitVia ?? null, sentAt: snap.sentAt ?? null, messageId: snap.messageId ?? null, source: snap.source ?? null } : null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
