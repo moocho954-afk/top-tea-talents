@@ -1727,7 +1727,12 @@ async function handle(req: Request): Promise<Response> {
         .slice(0, 25)
         .map((m: any) => {
           const o = byId.get(String(m.opportunityId)) || {};
-          const autoEligible = automation.enabled === true && m.classification !== "NEEDS TALENT APPROVAL";
+          // v1.3.1: the match classification alone does not make a job
+          // auto-eligible — the automation/Fast-Track hard rules
+          // (geography, pay, required languages) must all pass too.
+          // Blocked jobs stay in the feed for manual review.
+          const blockers = automationBlockers(t.profile, o, automation);
+          const autoEligible = automation.enabled === true && m.classification !== "NEEDS TALENT APPROVAL" && blockers.length === 0;
           return {
             opportunityId: m.opportunityId, title: o.title || m.opportunityId, production: o.production || null,
             agency: o.casting_org || o.employer || null, location: o.location || null,
@@ -1738,6 +1743,7 @@ async function handle(req: Request): Promise<Response> {
             genderRequirement: m.genderRequirement || null,
             referenceCode: refCode(talentId, String(m.opportunityId)),
             automationEligible: autoEligible,
+            automationBlockers: blockers,
             automationNote: automation.enabled !== true
               ? "Automation is OFF — nothing is submitted automatically."
               : autoEligible
@@ -2673,6 +2679,140 @@ function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array
   // its classification thresholds are unchanged; only the order moves.
   out.sort((a, b) => (SELECTIVITY_RANK[a.selectivity as SelectivityClass] - SELECTIVITY_RANK[b.selectivity as SelectivityClass]) || (b.score - a.score));
   return out;
+}
+
+// ---------- automation eligibility (v1.3.1) ----------
+// Jobs For You marks a job automationEligible only when the talent's
+// automation/Fast-Track rules actually fit the listing. The match score
+// alone is NOT enough: a high-scoring job can still violate a hard rule,
+// and auto-send must never fire on it. Blocked jobs stay visible in the
+// feed (and keep their match classification) for manual review — they
+// are never auto-sent. The auto-runner only sends jobs with
+// automationEligible === true, so this one gate protects both surfaces.
+// Three hard rules, each returning a human-readable blocker:
+//  (1) Geography — the listing's FIXED location must sit inside the
+//      talent's geography (e.g. south-florida). A "nationwide" LABEL on
+//      the listing does not move the job: Toronto/London/San Francisco/
+//      Savannah/Orlando/Jacksonville all fail for a south-florida talent
+//      even when labeled nationwide. Only a genuinely location-free or
+//      remote listing passes without a place.
+//  (2) Pay — undisclosed pay and unpaid/TFP work are never auto-eligible
+//      (they go to manual review). Stated pay must meet the talent's
+//      minDaily floor (normalized to a daily figure, as elsewhere).
+//  (3) Role requirements — a listing that REQUIRES a language the talent
+//      does not speak (or has not verified on their profile) is never
+//      auto-eligible. "A plus"/"preferred" language is not a requirement
+//      and never blocks; a bare mention ("a French plantation owner") is
+//      not a requirement either.
+const SOUTH_FLORIDA_COUNTIES = ["miami-dade", "broward", "palm beach"];
+const SOUTH_FLORIDA_CITIES = ["miami", "miami beach", "fort lauderdale", "hollywood", "hialeah", "coral gables", "boca raton", "west palm beach", "pompano beach", "pembroke pines", "miramar", "davie", "plantation", "sunrise", "tamarac", "delray beach", "boynton beach", "deerfield beach", "doral", "kendall", "homestead", "aventura", "hallandale beach", "north miami", "north miami beach", "sunny isles beach", "key biscayne", "coconut creek", "margate", "lauderhill", "weston", "cooper city", "dania beach", "lake worth", "palm beach gardens", "jupiter", "wellington", "royal palm beach", "greenacres", "riviera beach", "lake park", "parkland", "miami gardens", "miami lakes", "miami springs", "opa-locka", "sweetwater", "palmetto bay", "pinecrest", "cutler bay", "florida city", "lighthouse point", "southwest ranches", "medley", "el portal", "biscayne park", "golden beach", "surfside", "bal harbour", "bay harbor islands", "indian creek"];
+function locationInGeography(o: any, geography: string | null | undefined): boolean {
+  const geo = String(geography || "").trim().toLowerCase();
+  if (!geo) return true; // no geography rule set — nothing to enforce
+  if (geo === "nationwide") return true; // talent opted into everywhere
+  const loc = o.location || {};
+  const city = normName(String(loc.city || ""));
+  const county = normName(String(loc.county || ""));
+  const state = normName(String(loc.state || ""));
+  const raw = normName(String(loc.raw || ""));
+  // Genuinely location-free / remote: nothing places the job anywhere.
+  if (!city && !county && !state && !raw) return true;
+  if (/\bremote\b|\bvirtual\b|work from home/i.test(raw) || /\bremote\b|\bvirtual\b/i.test(city)) return true;
+  if (geo === "south-florida") {
+    // A non-Florida state on the record fails outright. The seed sometimes
+    // puts the city name in the state field ("London", "San Francisco") —
+    // that is still not Florida.
+    if (state && state !== "fl" && state !== "florida") return false;
+    if (SOUTH_FLORIDA_COUNTIES.includes(county)) return true;
+    if (SOUTH_FLORIDA_CITIES.includes(city)) return true;
+    // Fallback: the raw text names a South Florida place (records where
+    // city/county are empty but the raw string carries the location).
+    const hay = ` ${raw} `;
+    for (const name of [...SOUTH_FLORIDA_COUNTIES, ...SOUTH_FLORIDA_CITIES].sort((a, b) => b.length - a.length)) {
+      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(hay)) return true;
+    }
+    return false;
+  }
+  if (geo === "florida") {
+    if (state === "fl" || state === "florida") return true;
+    if (SOUTH_FLORIDA_COUNTIES.includes(county)) return true;
+    if (/\bflorida\b|, fl\b/.test(raw)) return true;
+    return false;
+  }
+  // Unknown geography value: do not invent a boundary — do not block.
+  return true;
+}
+function payBlocker(o: any, automation: any, profile: any): string | null {
+  const compType = String(o.compensation_type || "").trim().toLowerCase();
+  const compText = String(o.compensation || "");
+  if (compType === "unpaid" || compType === "tfp" || /\btfp\b/i.test(compText) || /\bunpaid\b/i.test(compText) || /\bvolunteer\b/i.test(compText) || /\bno pay\b/i.test(compText)) {
+    return "Unpaid / TFP work is never auto-sent";
+  }
+  const daily = normalizedDaily(o.compensation_type, o.compensation, o.hours);
+  if (daily === null || daily <= 0) return "Pay undisclosed — needs talent approval";
+  const minDaily = automation?.minDaily != null ? Number(automation.minDaily) : (profile?.minCompensation != null ? Number(profile.minCompensation) : null);
+  if (minDaily !== null && Number.isFinite(minDaily) && daily < minDaily) return `Pay $${daily}/day is below the $${minDaily}/day floor`;
+  return null;
+}
+// Languages a listing can require, longest first so "Haitian Creole"
+// matches before "Creole" and "American Sign Language" before "ASL".
+const KNOWN_LANGUAGES = ["american sign language", "haitian creole", "mandarin", "cantonese", "portuguese", "spanish", "french", "hindi", "urdu", "arabic", "italian", "german", "russian", "korean", "japanese", "vietnamese", "tagalog", "creole", "asl", "dutch", "polish", "greek", "turkish", "farsi", "persian", "bengali", "punjabi", "tamil", "telugu", "gujarati", "hebrew", "yiddish", "swahili", "yoruba", "igbo", "amharic"];
+const LANGUAGE_PREFERENCE = /\ba plus\b|\bplus\b|preferred|preference|bonus|nice to have|helpful|\bideal\b|optional|not required/i;
+const LANGUAGE_REQUIRED = /\bmust\b|fluent|fluency|multilingual|\bspeak\b|speaks|speaking|required|requires|\brequire\b|requirement|native|bilingual/i;
+function normalizeLanguage(s: string): string {
+  const n = normName(s);
+  if (n === "american sign language") return "asl";
+  if (n === "haitian creole") return "creole";
+  return n;
+}
+function requiredLanguages(o: any): string[] {
+  const text = [o.roles, o.eligibility, o.skills].map((x) => String(x || "")).join("\n");
+  const found = new Set<string>();
+  // Split into clauses; a language only counts as REQUIRED when its own
+  // clause demands it ("must be fluent in Hindi", "fluent in both English
+  // and Spanish"). A clause that merely prefers it ("Spanish a plus",
+  // "bilingual Spanish/English a plus") never blocks, and a bare mention
+  // ("a French plantation owner") is not a requirement at all.
+  for (const clause of text.split(/[;.\n\r—–]+/)) {
+    const c = clause.trim();
+    if (!c) continue;
+    const langs: string[] = [];
+    for (const lang of KNOWN_LANGUAGES) {
+      const re = new RegExp(`\\b${lang.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+      if (re.test(c)) langs.push(lang);
+    }
+    if (!langs.length) continue;
+    if (LANGUAGE_PREFERENCE.test(c)) continue;
+    if (!LANGUAGE_REQUIRED.test(c)) continue;
+    for (const l of langs) found.add(normalizeLanguage(l));
+  }
+  return [...found];
+}
+function automationBlockers(profile: any, opp: any, automation: any): string[] {
+  const blockers: string[] = [];
+  // (1) Geography — the listing's own "nationwide" label never overrides
+  // the talent's geography; only the fixed location (or a genuinely
+  // location-free/remote listing) decides.
+  if (!locationInGeography(opp, automation?.geography)) {
+    const raw = String(opp.location?.raw || opp.location?.city || opp.geography || "unknown location");
+    blockers.push(`Location ${raw} is outside your ${automation.geography} area`);
+  }
+  // (2) Pay — undisclosed/unpaid never auto-sends; stated pay must clear
+  // the floor.
+  const pay = payBlocker(opp, automation, profile);
+  if (pay) blockers.push(pay);
+  // (3) Role requirements — required languages the talent does not have.
+  const required = requiredLanguages(opp);
+  if (required.length) {
+    const mine = new Set((profile?.languages || []).map((l: string) => normalizeLanguage(String(l))));
+    if (!mine.size) {
+      blockers.push(`Requires ${required.join(", ")} — no languages on your profile to verify against`);
+    } else {
+      const missing = required.filter((l) => !mine.has(l));
+      if (missing.length) blockers.push(`Requires ${missing.join(", ")} — not on your profile`);
+    }
+  }
+  return blockers;
 }
 
 // ---------- rotation ----------
