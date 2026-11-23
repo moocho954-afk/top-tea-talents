@@ -367,6 +367,18 @@ await migrateSocialV12();
 // v1.3.0: email_queue gains addressing + delivery tracking columns so the
 // drain can send real mail and prove it. Idempotent (same catch pattern).
 await migrateMailV13();
+// v1.3.1: bookings gain an event date (the 72-hour release rule needs a
+// concrete booking date) + released_at. Idempotent (same catch pattern).
+await migrateReleaseV131();
+async function migrateReleaseV131(): Promise<void> {
+  const adds: [string, string][] = [
+    ["bookings", "event_date TEXT"],
+    ["bookings", "released_at TEXT"],
+  ];
+  for (const [table, col] of adds) {
+    await db.run(`ALTER TABLE ${table} ADD COLUMN ${col}`).catch(() => {});
+  }
+}
 async function migrateMailV13(): Promise<void> {
   const adds: [string, string][] = [
     ["email_queue", "to_addr TEXT"],
@@ -2395,8 +2407,12 @@ async function handle(req: Request): Promise<Response> {
       const id = genId("bkg");
       const ts = nowIso();
       const status = b.status ?? "BOOKED";
-      await db.run("INSERT INTO bookings (id, application_id, talent_id, opportunity_id, status, evidence, gross_cents, rate, commission_cents, net_cents, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [id, b.applicationId, app.talent_id, app.opportunity_id, status, String(b.evidence), grossCents, rate, feeCents, netCents, ts, ts]);
+      // v1.3.1: an optional event date (YYYY-MM-DD) — the 72-hour release
+      // rule needs a concrete booking date. Validated, never invented.
+      const eventDate = b.eventDate ? String(b.eventDate).trim() : null;
+      if (eventDate && !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return err(400, "eventDate must be YYYY-MM-DD");
+      await db.run("INSERT INTO bookings (id, application_id, talent_id, opportunity_id, status, event_date, released_at, evidence, gross_cents, rate, commission_cents, net_cents, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [id, b.applicationId, app.talent_id, app.opportunity_id, status, eventDate, null, String(b.evidence), grossCents, rate, feeCents, netCents, ts, ts]);
       const t = await loadTalent(String(app.talent_id));
       const name = t ? `${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() : String(app.talent_id);
       const title = opp?.title ?? String(app.opportunity_id);
@@ -2407,17 +2423,27 @@ async function handle(req: Request): Promise<Response> {
       await db.run("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at, to_addr, application_id, kind) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, 'booking')",
         [emailId, app.talent_id, `Booking confirmed: ${title}`, summary, ts, talentEmail || null, b.applicationId]);
       await audit("booking.create", "booking", id, "admin", { applicationId: b.applicationId, talentId: app.talent_id, opportunityId: app.opportunity_id, status, grossCents, rate, commissionCents: feeCents, netCents, agency: opp ? (opp.casting_org || opp.employer || null) : null, email: "email pending: integration not connected" }, {
-        booking: { id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: String(b.evidence), gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts },
+        booking: { id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, event_date: eventDate, released_at: null, evidence: String(b.evidence), gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts },
         notification: ntfId ? { id: ntfId, talent_id: app.talent_id, title: `Booking confirmed: ${title}`, body: summary, read: false, created_at: ts } : null,
         email: { id: emailId, talent_id: app.talent_id, subject: `Booking confirmed: ${title}`, body: summary, status: "QUEUED", created_at: ts },
       });
-      return json({ ok: true, booking: bookingView({ id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: b.evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts }), note: "Email queued only — the booking confirmation goes out once the agency mailbox is connected. No payment processed — tracking only." }, 201);
+      return json({ ok: true, booking: bookingView({ id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, event_date: eventDate, released_at: null, evidence: b.evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts }), note: "Email queued only — the booking confirmation goes out once the agency mailbox is connected. No payment processed — tracking only." }, 201);
     }
     if (method === "GET" && rest.length === 1) {
       const rows = await db.all("SELECT * FROM bookings ORDER BY created_at DESC");
       let list = rows.map(bookingView);
       if (q.get("talentId")) list = list.filter((x) => x.talentId === q.get("talentId"));
       if (q.get("status")) list = list.filter((x) => x.status === q.get("status"));
+      // v1.3.1: attach the resolved event date + hours-until so the talent
+      // view can show the booking date and the 72-hour release rule.
+      for (const x of list) {
+        const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [x.opportunityId]);
+        const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+        const ev = resolveBookingEventDate(x, opp);
+        x.eventDate = ev.display;
+        x.eventDateSource = ev.source;
+        x.hoursUntilEvent = ev.date ? Math.round(((ev.date.getTime() - Date.now()) / 3_600_000) * 10) / 10 : null;
+      }
       return ok({ bookings: list, total: list.length });
     }
     if (method === "PATCH" && rest.length === 3 && rest[2] === "status") {
@@ -2452,6 +2478,58 @@ async function handle(req: Request): Promise<Response> {
       const b = updated[0];
       await audit("booking.complete", "booking", rest[1], "admin", { status: "COMPLETED" }, { booking: { id: b.id, application_id: b.application_id, talent_id: b.talent_id, opportunity_id: b.opportunity_id, status: "COMPLETED", evidence: b.evidence, gross_cents: b.gross_cents, rate: b.rate, commission_cents: b.commission_cents, net_cents: b.net_cents, created_at: b.created_at, updated_at: b.updated_at } });
       return ok({ booking: bookingView(updated[0]) });
+    }
+    // ----- v1.3.1: release a BOOKED booking (>= 72h before the event) -----
+    if (method === "POST" && rest.length === 3 && rest[2] === "release") {
+      const rows = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      if (!rows.length) return err(404, "booking not found");
+      const booking = rows[0];
+      const chk = await requireTalentOrAdmin(req, String(booking.talent_id)); if (!chk.ok) return chk.res!;
+      const b = (await body(req)) || {};
+      const status = String(booking.status || "");
+      if (status === "RELEASED") return err(400, "this booking was already released");
+      if (status === "COMPLETED") return err(400, "this booking is already completed and cannot be released");
+      if (status !== "BOOKED" && status !== "BOOKING CONFIRMED") return err(400, `only a BOOKED booking can be released (currently ${status})`);
+      const t = await loadTalent(String(booking.talent_id));
+      const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [booking.opportunity_id]);
+      const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+      const ev = resolveBookingEventDate(booking, opp);
+      const talentName = t ? (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || "Talent") : String(booking.talent_id);
+      const agencyName = String(opp?.casting_org || opp?.employer || "Casting");
+      const title = opp?.title ?? String(booking.opportunity_id);
+      const hoursUntil = ev.date ? (ev.date.getTime() - Date.now()) / 3_600_000 : null;
+      const dest = opp ? await resolveDestination(opp) : { to: null, source: null };
+      const destination = dest.to && !isPlatformSupportEmail(dest.to) ? dest.to : null;
+      const destinationSource = destination ? dest.source : null;
+      // dryRun previews the exact email + the 72h math without changing
+      // anything — safe in either mode, same discipline as the send endpoint.
+      if (b.dryRun === true) {
+        const email = await buildReleaseEmail(talentName, agencyName, opp, ev.display);
+        return ok({ dryRun: true, bookingId: rest[1], status, eventDate: ev.display, eventDateSource: ev.source, hoursUntilEvent: hoursUntil === null ? null : Math.round(hoursUntil * 10) / 10, releasable: ev.date !== null && hoursUntil !== null && hoursUntil >= 72, destination, destinationSource, email: { from: email.from, to: destination, replyTo: email.replyTo, subject: email.subject, body: email.body } });
+      }
+      if (!ev.date || hoursUntil === null) {
+        return err(400, "No event date on file for this booking — the 72-hour rule cannot be checked, so the release is blocked. Contact the agency directly.");
+      }
+      if (hoursUntil < 72) {
+        return err(400, `Too late to release online — this booking starts in ${Math.max(0, Math.round(hoursUntil))} hours, inside the 72-hour window. Contact the agency directly.`);
+      }
+      const ts = nowIso();
+      await db.run("UPDATE bookings SET status = 'RELEASED', released_at = ?, updated_at = ? WHERE id = ?", [ts, ts, rest[1]]);
+      await notify(String(booking.talent_id), `Booking released: ${title}`, `You released this booking ${Math.round(hoursUntil)} hours before the event date (${ev.display}). It no longer appears on your page.${destination ? " The agency has been notified by email." : " No agency email was on file, so contact the agency directly."}`);
+      let emailQueued = false, emailSent = false, messageId: string | undefined, emailReason: string | undefined;
+      if (destination) {
+        const email = await buildReleaseEmail(talentName, agencyName, opp, ev.display);
+        const emailId = await enqueueEmail({ to: destination, replyTo: email.replyTo, talentId: String(booking.talent_id), applicationId: String(booking.application_id), kind: "release", subject: email.subject, body: email.body });
+        emailQueued = true;
+        const attempt = await drainOneEmail(emailId);
+        emailSent = attempt.sent;
+        messageId = attempt.messageId;
+        emailReason = attempt.sent ? undefined : attempt.reason;
+      }
+      const actor = chk.admin ? "admin" : String(booking.talent_id);
+      await audit("booking.release", "booking", rest[1], actor, { talentId: String(booking.talent_id), opportunityId: String(booking.opportunity_id), eventDate: ev.display, eventDateSource: ev.source, hoursUntilEvent: Math.round(hoursUntil * 10) / 10, releasedAt: ts, destination, destinationSource, emailQueued, emailSent, messageId: messageId ?? null }, { booking: { id: rest[1], status: "RELEASED", released_at: ts, updated_at: ts } });
+      const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
+      return ok({ ok: true, booking: bookingView(updated[0]), releasedAt: ts, eventDate: ev.display, eventDateSource: ev.source, hoursUntilEvent: Math.round(hoursUntil * 10) / 10, emailQueued, emailSent, messageId: messageId ?? null, destination, destinationSource, emailNote: destination ? (emailSent ? "Release email sent to the agency." : `Release email queued — not yet sent (${emailReason || "drain pending"}).`) : "No agency email on file for this listing — the release was recorded but no email was sent. Contact the agency directly." });
     }
     if (method === "PATCH" && rest.length === 3 && rest[2] === "payment") {
       const adm = requireAdmin(req); if (adm) return adm;
@@ -2955,6 +3033,75 @@ async function portfolioLinkAllowed(talentId: string, profile: any): Promise<boo
   return c.length > 0 && Number(c[0].signed) === 1;
 }
 
+// ---------- v1.3.1: release button — 72-hour rule + one release template ----------
+// Platform support / general-contact addresses are never destinations.
+const PLATFORM_SUPPORT_EMAILS = ["support@allcasting.com", "support@projectcasting.com", "support@productionbeast.com", "hello@heybooker.app", "casting@backstage.com", "uigroup@ep.com"];
+function isPlatformSupportEmail(email: string | null | undefined): boolean {
+  if (!email) return false;
+  return PLATFORM_SUPPORT_EMAILS.includes(String(email).trim().toLowerCase());
+}
+
+// An extractDateTokens token -> a Date at the START of that day (UTC).
+// ISO tokens ("2026-11-23") parse directly; month tokens ("january-5-2026")
+// need the month name mapped. Returns null for anything unparseable.
+function parseEventDateToken(token: string): Date | null {
+  const t = String(token || "").trim();
+  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    const d = new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const m = t.match(/^(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{1,2})-(\d{4})$/i);
+  if (!m) return null;
+  const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+  const d = new Date(Date.UTC(Number(m[3]), months.indexOf(m[1].toLowerCase()), Number(m[2])));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// The booking's event date, in order: the event_date stored on the booking
+// row (set at booking time), else the earliest date token in the
+// opportunity's production_dates (the shoot start). The application
+// deadline is NOT an event date — the shoot is after the deadline — so it
+// is never used here. No date anywhere -> null, and a release with no
+// date cannot be checked and is blocked.
+function resolveBookingEventDate(booking: any, opp: any): { date: Date | null; source: "booking" | "opportunity" | null; display: string | null } {
+  const stored = String(booking?.event_date ?? booking?.eventDate ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(stored)) {
+    const d = parseEventDateToken(stored);
+    if (d) return { date: d, source: "booking", display: stored };
+  }
+  const tokens = extractDateTokens(opp?.production_dates);
+  const parsed = tokens.map(parseEventDateToken).filter((d): d is Date => d !== null).sort((a, b) => a.getTime() - b.getTime());
+  if (parsed.length) return { date: parsed[0], source: "opportunity", display: parsed[0].toISOString().slice(0, 10) };
+  return { date: null, source: null, display: null };
+}
+
+// buildReleaseEmail — the ONE release template. Only the talent's name and
+// the agency name vary per email; the booking title/date/location are facts
+// from the record, never invented. No per-release free text in v1.
+async function buildReleaseEmail(talentName: string, agencyName: string, opp: any, eventDisplay: string | null): Promise<any> {
+  const from = await agencyEmail();
+  const title = String(opp?.title || opp?.id || "booking").slice(0, 80);
+  const subject = `Release — ${title} — ${talentName}`;
+  const lines: string[] = [];
+  lines.push(`Hello ${agencyName} team,`);
+  lines.push(``);
+  lines.push(`TOP TEA TALENTS is writing on behalf of ${talentName}.`);
+  lines.push(``);
+  lines.push(`${talentName} will not be available for the booking below due to certain circumstances.`);
+  lines.push(``);
+  lines.push(`Booking: ${title}`);
+  if (eventDisplay) lines.push(`Date: ${eventDisplay}`);
+  if (opp?.location?.raw) lines.push(`Location: ${opp.location.raw}`);
+  lines.push(`Agency: ${agencyName}`);
+  lines.push(``);
+  lines.push(`Please contact TOP TEA TALENTS if you need anything further.`);
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS — ${from}`);
+  return { from, subject, body: lines.join("\n"), replyTo: [from] };
+}
+
 // buildApplicationEmail — the one email builder. Subject carries the
 // per-(talent, job) reference code; the body carries the pay-ask line
 // whenever the posting lists no parseable pay (normalizedDaily null);
@@ -3201,6 +3348,7 @@ function bookingView(r: Row): any {
     status: r.status, evidence: r.evidence, grossCents: Number(r.gross_cents ?? 0), rate: Number(r.rate ?? 0),
     commissionCents: Number(r.commission_cents ?? 0), netCents: Number(r.net_cents ?? 0),
     gross: Number(r.gross_cents ?? 0) / 100, fee: Number(r.commission_cents ?? 0) / 100, net: Number(r.net_cents ?? 0) / 100,
+    eventDate: r.event_date ?? null, releasedAt: r.released_at ?? null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }

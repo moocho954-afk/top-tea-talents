@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS bookings (
   talent_id TEXT NOT NULL,
   opportunity_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'BOOKED',
+  event_date TEXT,
+  released_at TEXT,
   evidence TEXT,
   gross_cents INTEGER,
   rate REAL,
