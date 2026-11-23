@@ -217,12 +217,17 @@ check("reviewWindowsNotice: all three windows + next-day rule + direct-email byp
   assert(html.includes("9:00 AM") && html.includes("12:00 PM") && html.includes("4:00 PM"), "windows missing: " + html);
   assert(html.includes("Eastern"), "timezone missing");
   assert(html.includes("waits until the next day"), "next-day rule missing");
-  assert(html.includes("mailto:moocho954@gmail.com"), "agency mailto link missing");
+  // The mailto must use the single AGENCY_EMAIL constant's value, whatever
+  // the current agency mailbox is (topteatalents@gmail.com since Nov 23).
+  const agencyEmail = agencyEmailDecl[0].match(/"([^"]+)"/)[1];
+  assert(html.includes("mailto:" + agencyEmail), "agency mailto link missing");
   assert(html.includes("notice-box"), "notice-box class missing (mobile styling)");
 });
 check("reviewWindowsNotice: agency email comes from the single AGENCY_EMAIL constant", () => {
-  assert(agencyEmailDecl[0].includes('"moocho954@gmail.com"'), "AGENCY_EMAIL is not moocho954@gmail.com");
-  assert(appSrc.includes("topteatalents@gmail.com"), "swap note for the future agency Gmail missing");
+  // Agency mailbox is topteatalents@gmail.com since the Nov 23 sender swap
+  // (was moocho954@gmail.com); the constant is the single source of truth.
+  assert(agencyEmailDecl[0].includes('"topteatalents@gmail.com"'), "AGENCY_EMAIL is not topteatalents@gmail.com");
+  assert(appSrc.includes("swapped from moocho954@gmail.com"), "swap note for the agency Gmail missing");
   const uses = (appSrc.match(/AGENCY_EMAIL/g) || []).length;
   assert(uses >= 3, "AGENCY_EMAIL should be declared once and used in the notice, found " + uses);
 });

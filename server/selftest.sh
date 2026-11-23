@@ -41,7 +41,7 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.3.0", d
+assert d["version"]=="1.3.1", d
 assert d["live_mode"] is False and d["mail_configured"] is False, d
 print("health ok:", d["counts"])
 PY
@@ -283,6 +283,79 @@ assert 'allcasting:307031' not in ids, 'mixed female-only opp in jobs-for-you fo
 print('jobs:', len(ids), 'genderExcluded:', d['genderExcluded'])
 PY
 check "v1.2.1: manual application male + 307031 returns 400" bash -c "curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/applications -H 'Authorization: Bearer $MTOKEN' -H 'Content-Type: application/json' -d '{\"talentId\":\"$MTALENT_ID\",\"opportunityId\":\"allcasting:307031\"}' | grep -q 400"
+# ----- v1.3.1 AUTOMATION ELIGIBILITY (over-marking fix) -----
+# Jobs For You used to mark EVERY job automationEligible=true for a talent
+# with automation ON, as long as the match was not NEEDS TALENT APPROVAL —
+# the match score alone decided, so Toronto TFP, London/SF undisclosed-pay
+# and Savannah jobs were all flagged auto-sendable. The v1.3.1 gate
+# (automationBlockers) enforces the Fast-Track hard rules — geography,
+# pay, required languages — on top of the classification. Same male talent
+# (Miami FL, 35-44), now with languages English + minCompensation 100 on
+# file and automation ON (south-florida, minDaily 100).
+curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"languages":["English"],"minCompensation":100}' -o /tmp/ttt-body.json
+curl -sf -X POST "$BASE/talent/$MTALENT_ID/automation" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"enabled":true,"categories":["Commercials"],"geography":"south-florida","minDaily":100}' -o /tmp/ttt-body.json
+curl -sf "$BASE/talent/$MTALENT_ID/jobs-for-you" -H "Authorization: Bearer $MTOKEN" -o /tmp/ttt-body.json
+check "v1.3.1: TFP Toronto job is NOT automation-eligible" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+by={j['opportunityId']: j for j in d['jobs']}
+assert 'allcasting:323805' in by, 'TFP Toronto anchor missing from jobs-for-you: ' + str([j['opportunityId'] for j in d['jobs']])
+j=by['allcasting:323805']
+assert j['automationEligible'] is False, 'Toronto TFP still marked eligible'
+assert any('Unpaid' in b or 'TFP' in b for b in j['automationBlockers']), j['automationBlockers']
+assert any('outside your south-florida area' in b for b in j['automationBlockers']), j['automationBlockers']
+print('Toronto blockers:', j['automationBlockers'])
+PY
+check "v1.3.1: undisclosed-pay jobs are NOT automation-eligible" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+by={j['opportunityId']: j for j in d['jobs']}
+for wid in ['projectcasting:muse-the-agency-model-call-to-join-talent-agency', 'projectcasting:fog-city-sag-feature-film-open-casting-call']:
+    assert wid in by, wid + ' missing from jobs-for-you'
+    j=by[wid]
+    assert j['automationEligible'] is False, wid + ' still marked eligible'
+    assert any('undisclosed' in b.lower() for b in j['automationBlockers']), j['automationBlockers']
+    print(wid[:40], 'blockers:', j['automationBlockers'])
+PY
+check "v1.3.1: fixed out-of-area jobs are NOT automation-eligible even when labeled nationwide" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+by={j['opportunityId']: j for j in d['jobs']}
+for wid in ['projectcasting:sorry-about-my-friends-open-casting-call-for-extras', 'allcasting:325201']:
+    assert wid in by, wid + ' missing from jobs-for-you'
+    j=by[wid]
+    assert j['automationEligible'] is False, wid + ' still marked eligible'
+    assert any('outside your south-florida area' in b for b in j['automationBlockers']), j['automationBlockers']
+    print(wid[:40], 'blockers:', j['automationBlockers'])
+PY
+check "v1.3.1: in-area stated-pay jobs STAY automation-eligible" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+by={j['opportunityId']: j for j in d['jobs']}
+# Anchors are the Miami stated-pay jobs in THIS talent's top 25 (the
+# Joseph-live-feed anchors — Miami Male Waiter, AutoZone — score below
+# the cut for a no-skills test talent; the rule they prove is the same).
+for wid in ['allcasting:325814', 'allcasting:325026']:
+    assert wid in by, wid + ' missing from jobs-for-you'
+    j=by[wid]
+    assert j['automationEligible'] is True, wid + ' wrongly blocked: ' + str(j['automationBlockers'])
+    assert j['automationBlockers'] == [], j['automationBlockers']
+    print(wid[:40], 'eligible, classification:', j['classification'])
+PY
+check "v1.3.1: language-required jobs are NOT automation-eligible" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+by={j['opportunityId']: j for j in d['jobs']}
+# allcasting:325752 is the Money Transfer App casting (same roles as
+# commercial:allcasting:325752, which scores below the cut for a
+# no-skills test talent): every role requires Hindi/Urdu/Arabic + English.
+wid='allcasting:325752'
+assert wid in by, wid + ' missing from jobs-for-you'
+j=by[wid]
+assert j['automationEligible'] is False, 'Money Transfer App still marked eligible for an English-only talent'
+assert any('hindi' in b.lower() or 'urdu' in b.lower() or 'arabic' in b.lower() for b in j['automationBlockers']), j['automationBlockers']
+print(wid[:40], 'blockers:', j['automationBlockers'])
+PY
 # Flip the same talent to Female: the anchor MUST now match, with a
 # gender-fit reason on the match row.
 curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"demographics":{"gender":"Female","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json

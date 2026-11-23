@@ -11,7 +11,7 @@ import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
