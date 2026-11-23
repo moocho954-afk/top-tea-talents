@@ -303,7 +303,9 @@ def find_casting_org(body):
         # in a page header is not an org).
         generic = {"call", "calls", "casting", "director", "directors",
                    "company", "companies", "agency", "agencies", "notice",
-                   "notices", "team", "office", "audition", "auditions"}
+                   "notices", "team", "office", "audition", "auditions",
+                   "website", "websites", "sites", "list", "lists", "board",
+                   "boards", "jobs", "job"}
         if any(w.lower() in generic for w in name.split()[1:]):
             return None
         return name
