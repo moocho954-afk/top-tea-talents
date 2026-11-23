@@ -1,13 +1,17 @@
 // TOP TEA TALENTS — public backend API. Bun + TypeScript, ZERO npm dependencies.
-// TEST MODE is always on: no external submission calls exist anywhere in this
-// file; nothing is ever sent live; no payments are processed; email is queued
-// only ("email pending: integration not connected") and never claimed as sent.
-// Never collect SSN or bank credentials. Free-only: no paid service anywhere.
+// LIVE MODE (v1.3.0): sending is gated by liveMode() — env TTT_LIVE_MODE=true
+// OR the DB setting `live_mode`. In TEST MODE (the default) no external
+// submission call is ever made; email is queued only and never claimed as
+// sent. In live mode, application emails send through the Gmail API
+// (src/mailer.ts) from the agency mailbox (setting `agency_email`); every
+// send is written to the ledger with its Gmail message id. Never collect
+// SSN or bank credentials. Free-only: no paid service anywhere.
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
+import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
 
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
@@ -78,6 +82,25 @@ async function setSetting(key: string, value: string): Promise<void> {
 }
 async function submissionsPaused(): Promise<boolean> {
   return (await getSetting("submissions_paused", "true")) === "true";
+}
+// ---------- v1.3.0: live mode ----------
+// Live mode is ON when the deploy env says so OR the admin flips the DB
+// setting. Either switch turns it on; turning it off requires both off.
+// Default is TEST MODE (off) — sending is impossible until the owner
+// deliberately enables it. The sender address is a DB setting so the
+// agency mailbox can swap (moocho954@gmail.com today, topteatalents@
+// gmail.com once that mailbox exists) without a redeploy.
+async function liveMode(): Promise<boolean> {
+  if ((process.env.TTT_LIVE_MODE || "").toLowerCase() === "true") return true;
+  return (await getSetting("live_mode", "false")) === "true";
+}
+async function agencyEmail(): Promise<string> {
+  const v = (await getSetting("agency_email", "moocho954@gmail.com")).trim();
+  return v || "moocho954@gmail.com";
+}
+// The note that travels with application creates: honest in both modes.
+async function modeNote(): Promise<string> {
+  return (await liveMode()) ? "Live mode: queued for agency send." : "TEST MODE: nothing was sent.";
 }
 async function repeatThreshold(): Promise<number> {
   const v = Number(await getSetting("repeat_agency_threshold", "3"));
@@ -341,6 +364,25 @@ await db.exec(SCHEMA);
 // AUTHORIZED without a confirmed code is corrected to pending — never
 // left authorized. Legacy PENDING rows become PENDING_VERIFICATION.
 await migrateSocialV12();
+// v1.3.0: email_queue gains addressing + delivery tracking columns so the
+// drain can send real mail and prove it. Idempotent (same catch pattern).
+await migrateMailV13();
+async function migrateMailV13(): Promise<void> {
+  const adds: [string, string][] = [
+    ["email_queue", "to_addr TEXT"],
+    ["email_queue", "cc TEXT"],
+    ["email_queue", "reply_to TEXT"],
+    ["email_queue", "application_id TEXT"],
+    ["email_queue", "kind TEXT NOT NULL DEFAULT 'general'"],
+    ["email_queue", "attempts INTEGER NOT NULL DEFAULT 0"],
+    ["email_queue", "last_error TEXT"],
+    ["email_queue", "sent_at TEXT"],
+    ["email_queue", "message_id TEXT"],
+  ];
+  for (const [table, col] of adds) {
+    await db.run(`ALTER TABLE ${table} ADD COLUMN ${col}`).catch(() => {});
+  }
+}
 async function migrateSocialV12(): Promise<void> {
   const adds: [string, string][] = [
     ["social_links", "profile_url TEXT"],
@@ -732,7 +774,7 @@ const LIKENESS_TEXT = `TOP TEA TALENTS — LIKENESS RELEASE (contract version TT
 
 7. NO SSN OR BANK DETAILS. TOP TEA TALENTS never collects your Social Security number or bank credentials through this platform.
 
-8. TEST MODE. The platform is in TEST MODE: no submission is ever sent live and no payment is ever processed.`;
+8. SUBMISSIONS. In live mode the agency submits applications by email from its agency mailbox, with you copied when your automation settings ask for it, and each send is logged with its delivery receipt. In test mode no submission is ever sent live. No payment is ever processed through this platform — payments are tracked only.`;
 
 const AVAILABILITY = ["Available immediately", "Weekdays", "Weekends", "Evenings", "Flexible", "Specific dates", "Temporarily unavailable"];
 const CATEGORIES = ["Film and television", "Background extras", "Featured extras", "Commercials", "Advertising", "Music videos", "Modeling", "Print campaigns", "Promotional events", "Brand activations", "Reality television", "Live events", "Corporate productions", "Specialty talent", "Other paid opportunities"];
@@ -751,7 +793,8 @@ async function handle(req: Request): Promise<Response> {
   // ----- health / stats -----
   if (method === "GET" && rest.length === 1 && rest[0] === "health") {
     const counts = await countsAll();
-    return ok({ version: VERSION, test_mode: true, submissions_paused: await submissionsPaused(), storage: db.storage, storage_durable: db.durable, counts });
+    const live = await liveMode();
+    return ok({ version: VERSION, test_mode: !live, live_mode: live, mail_configured: mailStatus().configured, submissions_paused: await submissionsPaused(), storage: db.storage, storage_durable: db.durable, counts });
   }
   if (method === "GET" && rest.length === 1 && rest[0] === "stats") {
     const c = await countsAll();
@@ -796,7 +839,15 @@ async function handle(req: Request): Promise<Response> {
     // v7: email verification. 6-digit code, hash-only, 15-min expiry.
     // TEST MODE: email is not connected, so the code is returned once
     // here under a clearly-named testMode* field — never stored anywhere.
+    // LIVE MODE: the code is emailed from the agency mailbox instead and
+    // is NEVER returned in the response.
     const { code: vcode, expiresAt } = await issueCode(email, id, "email_verify");
+    if (await liveMode()) {
+      await queueVerificationEmail(email, vcode, "email_verify", id);
+      const ms = mailStatus();
+      await audit("talent.email.verification-issued", "talent", id, id, { email, purpose: "email_verify", note: ms.configured ? "Live mode: verification code emailed from the agency mailbox." : "Live mode: verification email QUEUED — the agency mailbox is not connected yet, so the code has not been delivered. Contact the agency." });
+      return json({ ok: true, talentId: id, token, verificationRequired: true, verificationExpiresAt: expiresAt, emailQueued: true, mailConfigured: ms.configured }, 201);
+    }
     await audit("talent.email.verification-issued", "talent", id, id, { email, purpose: "email_verify", note: "TEST MODE: email not connected — code shown once in the register response, never emailed." });
     return json({ ok: true, talentId: id, token, verificationRequired: true, verificationExpiresAt: expiresAt, testModeVerificationCode: vcode, testModeNote: "TEST MODE: email is not connected, so the verification code is shown here instead of emailed. Never do this in live mode." }, 201);
   }
@@ -838,6 +889,12 @@ async function handle(req: Request): Promise<Response> {
     const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
     if (!rows.length) return err(404, "talent not found");
     const { code: vcode, expiresAt } = await issueCode(email, String(rows[0].id), "email_verify");
+    if (await liveMode()) {
+      await queueVerificationEmail(email, vcode, "email_verify", String(rows[0].id));
+      const ms = mailStatus();
+      await audit("talent.email.verification-issued", "talent", String(rows[0].id), String(rows[0].id), { email, purpose: "email_verify", note: ms.configured ? "Resent. Live mode: verification code emailed." : "Resent. Live mode: verification email QUEUED — agency mailbox not connected yet." });
+      return ok({ resent: true, verificationExpiresAt: expiresAt, emailQueued: true, mailConfigured: ms.configured });
+    }
     await audit("talent.email.verification-issued", "talent", String(rows[0].id), String(rows[0].id), { email, purpose: "email_verify", note: "Resent. TEST MODE: email not connected — code shown once in the response, never emailed." });
     return ok({ resent: true, verificationExpiresAt: expiresAt, testModeVerificationCode: vcode, testModeNote: "TEST MODE: email is not connected, so the verification code is shown here instead of emailed. Never do this in live mode." });
   }
@@ -870,8 +927,14 @@ async function handle(req: Request): Promise<Response> {
     const email = String(b.email).toLowerCase().trim();
     const rows = await db.all("SELECT id FROM talents WHERE email = ?", [email]);
     // Always 200 — never reveal whether the email is registered.
-    if (!rows.length) return ok({ requested: true, testModeNote: "TEST MODE: email is not connected. If the address is registered, the reset code is shown in the response instead of emailed." });
+    if (!rows.length) return ok({ requested: true, testModeNote: (await liveMode()) ? "Live mode: if the address is registered, a reset code was emailed." : "TEST MODE: email is not connected. If the address is registered, the reset code is shown in the response instead of emailed." });
     const { code: rcode, expiresAt } = await issueCode(email, String(rows[0].id), "password_reset");
+    if (await liveMode()) {
+      await queueVerificationEmail(email, rcode, "password_reset", String(rows[0].id));
+      const ms = mailStatus();
+      await audit("talent.password.reset-requested", "talent", String(rows[0].id), String(rows[0].id), { email, note: ms.configured ? "Live mode: reset code emailed." : "Live mode: reset email QUEUED — agency mailbox not connected yet." });
+      return ok({ requested: true, resetExpiresAt: expiresAt, emailQueued: true, mailConfigured: ms.configured });
+    }
     await audit("talent.password.reset-requested", "talent", String(rows[0].id), String(rows[0].id), { email, note: "TEST MODE: email not connected — code shown once in the response, never emailed." });
     return ok({ requested: true, resetExpiresAt: expiresAt, testModeResetCode: rcode, testModeNote: "TEST MODE: email is not connected, so the reset code is shown here instead of emailed. Never do this in live mode." });
   }
@@ -1232,12 +1295,18 @@ async function handle(req: Request): Promise<Response> {
 
   // ----- settings -----
   if (rest.join("/") === "settings") {
-    if (method === "GET") return ok({ testMode: true, submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() });
+    if (method === "GET") return ok({ testMode: !(await liveMode()), liveMode: await liveMode(), agencyEmail: await agencyEmail(), mailConfigured: mailStatus().configured, submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() });
     if (method === "POST") {
       const adm = requireAdmin(req); if (adm) return adm;
       const b = await body(req);
       if (!b) return err(400, "invalid JSON");
       if (typeof b.submissionsPaused === "boolean") await setSetting("submissions_paused", String(b.submissionsPaused));
+      if (typeof b.liveMode === "boolean") await setSetting("live_mode", String(b.liveMode));
+      if (typeof b.agencyEmail === "string" && b.agencyEmail.trim()) {
+        const em = b.agencyEmail.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return err(400, "agencyEmail must be a valid email address");
+        await setSetting("agency_email", em);
+      }
       if (b.repeatAgencyThreshold !== undefined) {
         const t = Number(b.repeatAgencyThreshold);
         if (!Number.isFinite(t) || t < 1) return err(400, "repeatAgencyThreshold must be a positive number");
@@ -1248,9 +1317,9 @@ async function handle(req: Request): Promise<Response> {
         if (!Number.isFinite(tp) || tp < 0 || tp > 100) return err(400, "repeatAgencyTopPercent must be 0–100 (0 disables the top-% rule)");
         await setSetting("repeat_agency_top_percent", String(Math.floor(tp)));
       }
-      const settingsSnap = { submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() };
-      await audit("settings.update", "settings", "settings", "admin", { ...settingsSnap, note: "TEST MODE stays on: even unpaused, TEST MODE blocks every submission." }, { settings: { submissions_paused: String(settingsSnap.submissionsPaused), repeat_agency_threshold: String(settingsSnap.repeatAgencyThreshold), repeat_agency_top_percent: String(settingsSnap.repeatAgencyTopPercent) } });
-      return ok({ testMode: true, submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() });
+      const settingsSnap = { liveMode: await liveMode(), agencyEmail: await agencyEmail(), mailConfigured: mailStatus().configured, submissionsPaused: await submissionsPaused(), repeatAgencyThreshold: await repeatThreshold(), repeatAgencyTopPercent: await repeatTopPercent() };
+      await audit("settings.update", "settings", "settings", "admin", { ...settingsSnap, note: "Live mode is on only when liveMode is true (env or setting). In test mode every submission is blocked; in live mode sends go through the Gmail transport and are logged with their message id." }, { settings: { live_mode: String(settingsSnap.liveMode), agency_email: settingsSnap.agencyEmail, submissions_paused: String(settingsSnap.submissionsPaused), repeat_agency_threshold: String(settingsSnap.repeatAgencyThreshold), repeat_agency_top_percent: String(settingsSnap.repeatAgencyTopPercent) } });
+      return ok({ testMode: !settingsSnap.liveMode, liveMode: settingsSnap.liveMode, agencyEmail: settingsSnap.agencyEmail, mailConfigured: settingsSnap.mailConfigured, submissionsPaused: settingsSnap.submissionsPaused, repeatAgencyThreshold: settingsSnap.repeatAgencyThreshold, repeatAgencyTopPercent: settingsSnap.repeatAgencyTopPercent });
     }
   }
 
@@ -1540,7 +1609,7 @@ async function handle(req: Request): Promise<Response> {
       if (!b) return err(400, "invalid JSON");
       if (b.agreed !== true) return err(400, "agreed must be true");
       // v7: the likeness release can only be signed once the email is verified.
-      if (t.profile.emailVerified !== true) return err(400, "verify your email first — enter the 6-digit code from your sign-up confirmation (TEST MODE: the code is shown on the sign-up confirmation screen)");
+      if (t.profile.emailVerified !== true) return err(400, (await liveMode()) ? "verify your email first — enter the 6-digit code emailed to you at sign-up" : "verify your email first — enter the 6-digit code from your sign-up confirmation (TEST MODE: the code is shown on the sign-up confirmation screen)");
       const sig = String(b.signature || "").trim();
       if (!sig) return err(400, "signature is required");
       const legal = `${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim().toLowerCase();
@@ -1632,10 +1701,10 @@ async function handle(req: Request): Promise<Response> {
         const id = genId("app");
         const ts = nowIso();
         await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, talentId, oppId, ts, ts]);
-        await audit("application.create", "application", id, talentId, { talentId, opportunityId: oppId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." }, { application: { id, talent_id: talentId, opportunity_id: oppId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
+        await audit("application.create", "application", id, talentId, { talentId, opportunityId: oppId, status: "AWAITING APPROVAL", note: await modeNote() }, { application: { id, talent_id: talentId, opportunity_id: oppId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
         created.push({ id, talentId, opportunityId: oppId, status: "AWAITING APPROVAL" });
       }
-      return ok({ applications: created, skipped, note: "TEST MODE: nothing was sent." });
+      return ok({ applications: created, skipped, note: await modeNote() });
     }
     if (rest.length === 3 && rest[2] === "notifications" && method === "GET") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
@@ -1652,6 +1721,7 @@ async function handle(req: Request): Promise<Response> {
       const automation = await loadAutomation(talentId);
       const opps = await allOpps();
       const byId = new Map(opps.map((o: any) => [String(o.id), o]));
+      const live = await liveMode();
       const jobs = matches
         .filter((m: any) => m.classification !== "NOT QUALIFIED")
         .slice(0, 25)
@@ -1671,16 +1741,16 @@ async function handle(req: Request): Promise<Response> {
             automationNote: automation.enabled !== true
               ? "Automation is OFF — nothing is submitted automatically."
               : autoEligible
-                ? "Automation is ON and this job fits your rules — it would be queued for agency-send (TEST MODE: nothing is ever sent live)."
+                ? (live ? "Automation is ON and this job fits your rules — the agency will send your application by email." : "Automation is ON and this job fits your rules — it would be queued for agency-send (TEST MODE: nothing is ever sent live).")
                 : "Automation is ON but this job needs your approval first.",
           };
         });
-      return ok({ jobs, total: jobs.length, genderExcluded: (jStats.genderExcluded || []).length, talentGender: talentGender(t.profile), genderSet: !!(t.profile?.demographics?.gender || t.profile?.gender), automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
+      return ok({ jobs, total: jobs.length, genderExcluded: (jStats.genderExcluded || []).length, talentGender: talentGender(t.profile), genderSet: !!(t.profile?.demographics?.gender || t.profile?.gender), automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: live ? "Live mode: the feed ranks matches; automation-eligible jobs are sent by the agency email." : "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
     }
     // ----- v8: BIG automation toggle -----
     if (rest.length === 3 && rest[2] === "automation") {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
-      if (method === "GET") return ok({ automation: await loadAutomation(talentId), testMode: true, note: "TEST MODE: even with automation ON, nothing is ever sent live. Would-be sends queue for review." });
+      if (method === "GET") return ok({ automation: await loadAutomation(talentId), testMode: !(await liveMode()), note: (await liveMode()) ? "Live mode: with automation ON, eligible jobs are sent by the agency email." : "TEST MODE: even with automation ON, nothing is ever sent live. Would-be sends queue for review." });
       if (method === "POST") {
         const b = await body(req);
         if (!b) return err(400, "invalid JSON");
@@ -1697,8 +1767,8 @@ async function handle(req: Request): Promise<Response> {
         const ts = nowIso();
         await db.run("INSERT INTO automation_settings (talent_id, data_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(talent_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at",
           [talentId, JSON.stringify(next), ts]);
-        await audit("talent.automation.save", "talent", talentId, talentId, { enabled: next.enabled, note: "TEST MODE: automation armed, nothing sent live." }, { automation: { talent_id: talentId, data: next, updated_at: ts } });
-        return ok({ automation: next, testMode: true, note: "TEST MODE: even with automation ON, nothing is ever sent live." });
+        await audit("talent.automation.save", "talent", talentId, talentId, { enabled: next.enabled, note: (await liveMode()) ? "Live mode: automation armed — eligible jobs will be sent." : "TEST MODE: automation armed, nothing sent live." }, { automation: { talent_id: talentId, data: next, updated_at: ts } });
+        return ok({ automation: next, testMode: !(await liveMode()), note: (await liveMode()) ? "Live mode: automation armed — eligible jobs will be sent by the agency email." : "TEST MODE: even with automation ON, nothing is ever sent live." });
       }
       return err(404, "not found");
     }
@@ -2106,6 +2176,62 @@ async function handle(req: Request): Promise<Response> {
     return err(404, "not found");
   }
 
+  // ----- v1.3.0: email queue + send -----
+  if (rest[0] === "email") {
+    if (method === "GET" && rest.join("/") === "email/status") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const st = mailStatus();
+      const counts = await db.all("SELECT status, COUNT(*) AS n FROM email_queue GROUP BY status");
+      const byStatus: any = {}; for (const r of counts) byStatus[String(r.status)] = Number(r.n);
+      return ok({ liveMode: await liveMode(), agencyEmail: await agencyEmail(), mailConfigured: st.configured, mailMissing: st.missing, queue: byStatus });
+    }
+    if (method === "POST" && rest.join("/") === "email/drain") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const b = (await body(req)) || {};
+      const limit = Math.min(Math.max(Number(b.limit ?? 10) || 10, 1), 50);
+      return ok(await drainEmailQueue(limit));
+    }
+    return err(404, "not found");
+  }
+
+  // ----- v1.3.0: send an approved application -----
+  if (method === "POST" && rest[0] === "applications" && rest.length === 3 && rest[2] === "send") {
+    const adm = requireAdmin(req); if (adm) return adm;
+    const appId = rest[1];
+    const appRows = await db.all("SELECT * FROM applications WHERE id = ?", [appId]);
+    if (!appRows.length) return err(404, "application not found");
+    const app = appRows[0];
+    const b = (await body(req)) || {};
+    const t = await loadTalent(String(app.talent_id));
+    if (!t) return err(404, "talent not found");
+    const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [app.opportunity_id]);
+    if (!oppRows.length) return err(404, "opportunity not found");
+    const opp = JSON.parse(String(oppRows[0].data_json));
+    const automation = await loadAutomation(String(app.talent_id));
+    const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+    const publicUrl = base ? `${base}/#/talent/${app.talent_id}` : null;
+    const email = await buildApplicationEmail(String(app.talent_id), t.profile, opp, publicUrl, automation);
+    const dest = await resolveDestination(opp, b.to ? String(b.to) : undefined);
+    const live = await liveMode();
+    // dryRun previews the exact email without queueing, sending, or
+    // changing any status — safe in either mode.
+    if (b.dryRun === true) {
+      return ok({ dryRun: true, applicationId: appId, status: String(app.status), liveMode: live, mailConfigured: mailStatus().configured, destination: dest.to, destinationSource: dest.source, submitVia: dest.to ? null : (opp.source_url || null), email: { from: email.from, to: dest.to, cc: email.cc, replyTo: email.replyTo, subject: email.subject, body: email.body, referenceCode: email.referenceCode, portfolioLink: email.portfolioLink, payAsk: email.payAsk } });
+    }
+    if (!live) return err(400, "TEST MODE: sending is disabled — use dryRun to preview the exact email that would go.");
+    if (String(app.status) !== "APPROVED") return err(400, `application must be APPROVED before sending (currently ${app.status})`);
+    if (!dest.to) {
+      const ts = nowIso();
+      await db.run("UPDATE applications SET status = 'PACKAGE READY', updated_at = ? WHERE id = ?", [ts, appId]);
+      await audit("application.package.ready", "application", appId, "admin", { opportunityId: String(app.opportunity_id), referenceCode: email.referenceCode, portfolioLink: email.portfolioLink, payAsk: email.payAsk, submitVia: opp.source_url || null, note: "No submission email on file for this listing — the package is prepared; submit via the official link." }, { application: { id: appId, status: "PACKAGE READY" } });
+      return ok({ sent: false, packageReady: true, applicationId: appId, status: "PACKAGE READY", destination: null, submitVia: opp.source_url || null, email: { from: email.from, cc: email.cc, replyTo: email.replyTo, subject: email.subject, body: email.body, referenceCode: email.referenceCode, portfolioLink: email.portfolioLink, payAsk: email.payAsk } });
+    }
+    const emailId = await enqueueEmail({ to: dest.to, cc: email.cc, replyTo: email.replyTo, talentId: String(app.talent_id), applicationId: appId, kind: "application", subject: email.subject, body: email.body });
+    const attempt = await drainOneEmail(emailId);
+    if (attempt.sent) return ok({ sent: true, applicationId: appId, status: "SUBMITTED — SENT", messageId: attempt.messageId, destination: dest.to, destinationSource: dest.source, referenceCode: email.referenceCode });
+    return ok({ sent: false, queued: true, applicationId: appId, status: String(app.status), emailId, destination: dest.to, reason: attempt.reason, note: "Email queued — it was not sent. The drain will retry it; nothing is claimed sent." });
+  }
+
   // ----- applications -----
   if (rest[0] === "applications") {
     if (method === "POST" && rest.length === 1) {
@@ -2123,13 +2249,23 @@ async function handle(req: Request): Promise<Response> {
       const id = genId("app");
       const ts = nowIso();
       await db.run("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at) VALUES (?, ?, ?, 'AWAITING APPROVAL', ?, ?)", [id, b.talentId, b.opportunityId, ts, ts]);
-      await audit("application.create", "application", id, String(b.talentId), { talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL", note: "TEST MODE: nothing was sent." }, { application: { id, talent_id: b.talentId, opportunity_id: b.opportunityId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
-      return json({ ok: true, application: { id, talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL" }, note: "TEST MODE: nothing was sent." }, 201);
+      await audit("application.create", "application", id, String(b.talentId), { talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL", note: await modeNote() }, { application: { id, talent_id: b.talentId, opportunity_id: b.opportunityId, status: "AWAITING APPROVAL", created_at: ts, updated_at: ts } });
+      return json({ ok: true, application: { id, talentId: b.talentId, opportunityId: b.opportunityId, status: "AWAITING APPROVAL" }, note: await modeNote() }, 201);
     }
     if (method === "GET" && rest.length === 1) {
-      const rows = await db.all("SELECT * FROM applications ORDER BY created_at DESC");
+      // v1.3.0: the full applications list is admin-only. A talent sees
+      // only their own applications (never anyone else's).
+      if (isAdmin(req)) {
+        const rows = await db.all("SELECT * FROM applications ORDER BY created_at DESC");
+        let list = rows.map((r) => ({ id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at }));
+        if (q.get("talentId")) list = list.filter((a) => a.talentId === q.get("talentId"));
+        if (q.get("status")) list = list.filter((a) => a.status === q.get("status"));
+        return ok({ applications: list, total: list.length });
+      }
+      const me = await talentFromToken(req);
+      if (!me) return err(401, "authentication required");
+      const rows = await db.all("SELECT * FROM applications WHERE talent_id = ? ORDER BY created_at DESC", [me]);
       let list = rows.map((r) => ({ id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at }));
-      if (q.get("talentId")) list = list.filter((a) => a.talentId === q.get("talentId"));
       if (q.get("status")) list = list.filter((a) => a.status === q.get("status"));
       return ok({ applications: list, total: list.length });
     }
@@ -2141,7 +2277,13 @@ async function handle(req: Request): Promise<Response> {
       const chk = await requireTalentOrAdmin(req, String(rows[0].talent_id)); if (!chk.ok) return chk.res!;
       const status = String(b.status);
       if (status === "SUBMITTED — CONFIRMED" || status === "SUBMITTED - CONFIRMED" || status === "SUBMITTED_CONFIRMED") {
-        return err(400, "SUBMITTED — CONFIRMED is BLOCKED in TEST MODE: no submission is ever sent live. The application stays AWAITING APPROVAL until TEST MODE is lifted by the owner.");
+        if (!(await liveMode())) {
+          return err(400, "SUBMITTED — CONFIRMED is BLOCKED in TEST MODE: no submission is ever sent live. The application stays AWAITING APPROVAL until TEST MODE is lifted by the owner.");
+        }
+        const sentRows = await db.all("SELECT id FROM email_queue WHERE application_id = ? AND kind = 'application' AND status = 'SENT' LIMIT 1", [rest[1]]);
+        if (!sentRows.length) {
+          return err(400, "Cannot mark CONFIRMED before the application email is sent — send it first (POST /applications/:id/send). Nothing is confirmed on a promise.");
+        }
       }
       await db.run("UPDATE applications SET status = ?, updated_at = ? WHERE id = ?", [status, nowIso(), rest[1]]);
       await audit("application.status", "application", rest[1], String(rows[0].talent_id), { status }, { status });
@@ -2216,17 +2358,18 @@ async function handle(req: Request): Promise<Response> {
       const t = await loadTalent(String(app.talent_id));
       const name = t ? `${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() : String(app.talent_id);
       const title = opp?.title ?? String(app.opportunity_id);
-      const summary = `Booking confirmed: ${title} for ${name}. Gross $${(grossCents / 100).toFixed(2)} — commission ${rate}% $${(feeCents / 100).toFixed(2)} — net $${(netCents / 100).toFixed(2)}. Evidence on file. TEST MODE: no payment processed.`;
+      const summary = `Booking confirmed: ${title} for ${name}. Gross $${(grossCents / 100).toFixed(2)} — commission ${rate}% $${(feeCents / 100).toFixed(2)} — net $${(netCents / 100).toFixed(2)}. Evidence on file. No payment processed — tracking only.`;
       const ntfId = await notify(String(app.talent_id), `Booking confirmed: ${title}`, summary);
       const emailId = genId("eml");
-      await db.run("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at) VALUES (?, ?, ?, ?, 'QUEUED', ?)",
-        [emailId, app.talent_id, `Booking confirmed: ${title}`, summary, ts]);
+      const talentEmail = t ? String(t.profile.email || "") : "";
+      await db.run("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at, to_addr, application_id, kind) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, 'booking')",
+        [emailId, app.talent_id, `Booking confirmed: ${title}`, summary, ts, talentEmail || null, b.applicationId]);
       await audit("booking.create", "booking", id, "admin", { applicationId: b.applicationId, talentId: app.talent_id, opportunityId: app.opportunity_id, status, grossCents, rate, commissionCents: feeCents, netCents, agency: opp ? (opp.casting_org || opp.employer || null) : null, email: "email pending: integration not connected" }, {
         booking: { id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: String(b.evidence), gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts },
         notification: ntfId ? { id: ntfId, talent_id: app.talent_id, title: `Booking confirmed: ${title}`, body: summary, read: false, created_at: ts } : null,
         email: { id: emailId, talent_id: app.talent_id, subject: `Booking confirmed: ${title}`, body: summary, status: "QUEUED", created_at: ts },
       });
-      return json({ ok: true, booking: bookingView({ id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: b.evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts }), note: "Email queued only — email pending: integration not connected. No payment processed (TEST MODE)." }, 201);
+      return json({ ok: true, booking: bookingView({ id, application_id: b.applicationId, talent_id: app.talent_id, opportunity_id: app.opportunity_id, status, evidence: b.evidence, gross_cents: grossCents, rate, commission_cents: feeCents, net_cents: netCents, created_at: ts, updated_at: ts }), note: "Email queued only — the booking confirmation goes out once the agency mailbox is connected. No payment processed — tracking only." }, 201);
     }
     if (method === "GET" && rest.length === 1) {
       const rows = await db.all("SELECT * FROM bookings ORDER BY created_at DESC");
@@ -2249,7 +2392,7 @@ async function handle(req: Request): Promise<Response> {
         const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [rows[0].opportunity_id]);
         const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
         await notify(String(rows[0].talent_id), `Booking ${status === "BOOKED" ? "confirmed" : "confirmed"}: ${opp?.title ?? rows[0].opportunity_id}`,
-          `Your booking is now ${status}. Gross $${(Number(rows[0].gross_cents || 0) / 100).toFixed(2)} — commission $${(Number(rows[0].commission_cents || 0) / 100).toFixed(2)} — net $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. TEST MODE: no payment processed.`);
+          `Your booking is now ${status}. Gross $${(Number(rows[0].gross_cents || 0) / 100).toFixed(2)} — commission $${(Number(rows[0].commission_cents || 0) / 100).toFixed(2)} — net $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. No payment processed — tracking only.`);
       }
       await audit("booking.status", "booking", rest[1], "admin", { status }, { status, evidence });
       const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
@@ -2262,7 +2405,7 @@ async function handle(req: Request): Promise<Response> {
       if (!rows[0].evidence) return err(400, "evidence is required to mark a booking complete");
       const ts = nowIso();
       await db.run("UPDATE bookings SET status = 'COMPLETED', updated_at = ? WHERE id = ?", [ts, rest[1]]);
-      await notify(String(rows[0].talent_id), "Job completed — proof of work added", `Your booking is now marked COMPLETED and appears in your proof-of-work credits. Net pay for this job: $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. TEST MODE: no payment processed.`);
+      await notify(String(rows[0].talent_id), "Job completed — proof of work added", `Your booking is now marked COMPLETED and appears in your proof-of-work credits. Net pay for this job: $${(Number(rows[0].net_cents || 0) / 100).toFixed(2)}. No payment processed — tracking only.`);
       const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
       const b = updated[0];
       await audit("booking.complete", "booking", rest[1], "admin", { status: "COMPLETED" }, { booking: { id: b.id, application_id: b.application_id, talent_id: b.talent_id, opportunity_id: b.opportunity_id, status: "COMPLETED", evidence: b.evidence, gross_cents: b.gross_cents, rate: b.rate, commission_cents: b.commission_cents, net_cents: b.net_cents, created_at: b.created_at, updated_at: b.updated_at } });
@@ -2275,7 +2418,7 @@ async function handle(req: Request): Promise<Response> {
       const rows = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
       if (!rows.length) return err(404, "booking not found");
       await db.run("UPDATE bookings SET updated_at = ? WHERE id = ?", [nowIso(), rest[1]]);
-      await audit("booking.payment", "booking", rest[1], "admin", { paymentStatus: b.status, note: "Payment tracking only — no payment processed (TEST MODE)." });
+      await audit("booking.payment", "booking", rest[1], "admin", { paymentStatus: b.status, note: "Payment tracking only — no payment processed." });
       const updated = await db.all("SELECT * FROM bookings WHERE id = ?", [rest[1]]);
       return ok({ booking: { ...bookingView(updated[0]), paymentStatus: b.status }, note: "Payment tracking only — no payment processed." });
     }
@@ -2624,6 +2767,167 @@ function rotationQueue(profile: any, opps: any[], caps: { perDay: number; perWee
   return queue;
 }
 
+// ---------- v1.3.0: live mail — build, queue, drain, send ----------
+// The portfolio link goes in an application email ONLY when the talent
+// agreed to be pitched: an active likeness release + sharing granted
+// (profile not private, photos shared) + profile not paused. Anything
+// else → the link is WITHHELD and the email carries no portfolio line.
+async function portfolioLinkAllowed(talentId: string, profile: any): Promise<boolean> {
+  if (profile.paused === true) return false;
+  if (profile.visibility === "private" || profile.sharePhotos !== true) return false;
+  const c = await db.all("SELECT signed FROM consents WHERE talent_id = ?", [talentId]);
+  return c.length > 0 && Number(c[0].signed) === 1;
+}
+
+// buildApplicationEmail — the one email builder. Subject carries the
+// per-(talent, job) reference code; the body carries the pay-ask line
+// whenever the posting lists no parseable pay (normalizedDaily null);
+// the portfolio link line appears only when portfolioLinkAllowed().
+// Never invents a pay figure or a link. Pure except for the consent read.
+async function buildApplicationEmail(talentId: string, profile: any, opp: any, publicUrl: string | null, automation: any): Promise<any> {
+  const ref = refCode(talentId, String(opp.id));
+  const name = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim() || profile.professionalName || "Talent";
+  const proName = profile.professionalName || name;
+  const daily = normalizedDaily(opp.compensation_type, opp.compensation, opp.hours);
+  const payAsk = daily === null;
+  const linkOk = await portfolioLinkAllowed(talentId, profile);
+  const portfolioLink = linkOk && publicUrl ? publicUrl : null;
+  const from = await agencyEmail();
+  const talentEmail = String(profile.email || "");
+  const title = String(opp.title || opp.id).slice(0, 80);
+  const subject = `Application — ${title} — Ref ${ref}`;
+  const lines: string[] = [];
+  lines.push(`Hello ${opp.casting_org || opp.employer || "Casting"} team,`);
+  lines.push(``);
+  lines.push(`TOP TEA TALENTS is submitting ${proName} (${name}) for the role below.`);
+  lines.push(``);
+  lines.push(`Role: ${opp.title || opp.id}`);
+  if (opp.production) lines.push(`Production: ${opp.production}`);
+  if (opp.location?.raw) lines.push(`Location: ${opp.location.raw}`);
+  if (opp.production_dates) lines.push(`Dates: ${opp.production_dates}`);
+  if (opp.roles) lines.push(`Roles: ${String(opp.roles).slice(0, 400)}`);
+  lines.push(``);
+  lines.push(`About ${proName}: ${[profile.city, profile.state].filter(Boolean).join(", ") || "South Florida"}. Categories: ${(profile.categories || []).join(", ") || "—"}. Skills: ${(profile.skills || []).join(", ") || "—"}. Experience: ${profile.experience || "—"}.`);
+  if (daily !== null) lines.push(`Listed pay: $${daily}/day (per the posting).`);
+  else lines.push(`Could you confirm the pay rate for this role? The posting does not list compensation.`);
+  if (portfolioLink) lines.push(`Portfolio: ${portfolioLink}`);
+  lines.push(``);
+  lines.push(`Reference code: ${ref} — please include it in any reply so we can route it to the right talent and job.`);
+  lines.push(`Replies to this email reach both the talent and the agency.`);
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS — ${from}`);
+  return {
+    from, subject, body: lines.join("\n"),
+    cc: automation?.ccTalent === true && talentEmail ? [talentEmail] : [],
+    replyTo: automation?.replyToTalent === true && talentEmail ? [from, talentEmail] : [from],
+    referenceCode: ref, portfolioLink, payAsk,
+  };
+}
+
+// Destination resolution, in order: an admin-supplied address, an address
+// parsed from the listing's own instructions/contact fields, a contact
+// email on file for the casting org / employer. Most listings carry NO
+// address at all (verified Nov 22: 0 of 984 local records) — then the
+// destination is null and the caller prepares the package instead of
+// claiming a send. Never guesses an address.
+async function resolveDestination(opp: any, explicitTo?: string): Promise<{ to: string | null; source: string | null }> {
+  if (explicitTo && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(explicitTo.trim())) return { to: explicitTo.trim(), source: "admin-supplied" };
+  const fromText = extractEmail(opp.submission_instructions) || extractEmail(opp.contact_email) || extractEmail(opp.casting_professional);
+  if (fromText) return { to: fromText, source: "listing" };
+  const org = String(opp.casting_org || opp.employer || "").trim();
+  if (org) {
+    const rows = await db.all("SELECT email FROM contacts WHERE normalized = ? AND email IS NOT NULL AND email <> '' LIMIT 1", [normName(org)]);
+    if (rows.length) return { to: String(rows[0].email), source: "contacts" };
+  }
+  return { to: null, source: null };
+}
+
+async function enqueueEmail(row: { to: string | null; cc?: string[]; replyTo?: string[]; talentId?: string | null; applicationId?: string | null; kind: string; subject: string; body: string }): Promise<string> {
+  const id = genId("eml");
+  const ts = nowIso();
+  await db.run(
+    "INSERT INTO email_queue (id, talent_id, subject, body, status, created_at, to_addr, cc, reply_to, application_id, kind, attempts) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, 0)",
+    [id, row.talentId ?? null, row.subject, row.body, ts, row.to, (row.cc || []).join(",") || null, (row.replyTo || []).join(",") || null, row.applicationId ?? null, row.kind],
+  );
+  return id;
+}
+
+async function drainOneEmail(emailId: string): Promise<{ sent: boolean; messageId?: string; reason?: string }> {
+  const rows = await db.all("SELECT * FROM email_queue WHERE id = ?", [emailId]);
+  if (!rows.length) return { sent: false, reason: "email not found" };
+  const row = rows[0];
+  if (String(row.status) !== "QUEUED") return { sent: false, reason: `email is ${row.status}, not QUEUED` };
+  if (!(await liveMode())) return { sent: false, reason: "TEST MODE: sending disabled" };
+  const st = mailStatus();
+  if (!st.configured) return { sent: false, reason: "mail not configured — missing: " + st.missing.join(", ") };
+  const to = String(row.to_addr || "");
+  if (!to) {
+    await db.run("UPDATE email_queue SET status = 'FAILED', attempts = attempts + 1, last_error = ? WHERE id = ?", ["no recipient address", emailId]);
+    return { sent: false, reason: "no recipient address" };
+  }
+  const from = await agencyEmail();
+  try {
+    const { messageId } = await sendGmail({
+      from, to,
+      cc: String(row.cc || "").split(",").map((s: string) => s.trim()).filter(Boolean),
+      replyTo: String(row.reply_to || "").split(",").map((s: string) => s.trim()).filter(Boolean),
+      subject: String(row.subject), body: String(row.body),
+    });
+    const ts = nowIso();
+    await db.run("UPDATE email_queue SET status = 'SENT', attempts = attempts + 1, sent_at = ?, message_id = ? WHERE id = ?", [ts, messageId, emailId]);
+    await audit("email.sent", "email", emailId, "system", { to, subject: String(row.subject), kind: String(row.kind), applicationId: row.application_id ?? null, messageId }, { email: { id: emailId, to_addr: to, subject: String(row.subject), status: "SENT", sent_at: ts, message_id: messageId } });
+    if (row.application_id && String(row.kind) === "application") {
+      const appRows = await db.all("SELECT * FROM applications WHERE id = ?", [row.application_id]);
+      if (appRows.length && String(appRows[0].status) === "APPROVED") {
+        await db.run("UPDATE applications SET status = 'SUBMITTED — SENT', updated_at = ? WHERE id = ?", [ts, row.application_id]);
+        await audit("application.email.sent", "application", String(row.application_id), "system", { messageId, to }, { application: { id: String(row.application_id), status: "SUBMITTED — SENT" } });
+        await notify(String(appRows[0].talent_id), `Application sent: ${String(row.subject).slice(0, 80)}`, `Your application was sent by the agency. Reference ${String(row.subject).match(/Ref (TTT-[A-Z0-9]+)/)?.[1] || ""}.`);
+      }
+    }
+    return { sent: true, messageId };
+  } catch (e: any) {
+    const msg = String(e?.message || e).slice(0, 300);
+    const attempts = Number(row.attempts || 0) + 1;
+    const status = attempts >= 3 ? "FAILED" : "QUEUED";
+    await db.run("UPDATE email_queue SET status = ?, attempts = ?, last_error = ? WHERE id = ?", [status, attempts, msg, emailId]);
+    await audit("email.failed", "email", emailId, "system", { to, subject: String(row.subject), kind: String(row.kind), attempts, error: msg });
+    return { sent: false, reason: msg };
+  }
+}
+
+// Drain the queue (oldest first). Never claims a send: a row becomes SENT
+// only after Gmail returns a message id. In TEST MODE or with no transport
+// configured, rows stay QUEUED and the reason is reported.
+async function drainEmailQueue(limit = 10): Promise<{ sent: number; failed: number; skipped: number; reason?: string; details: any[] }> {
+  const rows = await db.all("SELECT * FROM email_queue WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT ?", [limit]);
+  if (!rows.length) return { sent: 0, failed: 0, skipped: 0, details: [] };
+  if (!(await liveMode())) return { sent: 0, failed: 0, skipped: rows.length, reason: "TEST MODE: sending disabled", details: rows.map((r: any) => ({ id: r.id, status: "QUEUED" })) };
+  const st = mailStatus();
+  if (!st.configured) return { sent: 0, failed: 0, skipped: rows.length, reason: "mail not configured — missing: " + st.missing.join(", "), details: rows.map((r: any) => ({ id: r.id, status: "QUEUED" })) };
+  let sent = 0, failed = 0;
+  const details: any[] = [];
+  for (const row of rows) {
+    const r = await drainOneEmail(String(row.id));
+    if (r.sent) { sent++; details.push({ id: row.id, sent: true, messageId: r.messageId }); }
+    else { failed++; details.push({ id: row.id, sent: false, reason: r.reason }); }
+  }
+  return { sent, failed, skipped: 0, details };
+}
+
+async function queueVerificationEmail(email: string, code: string, purpose: string, talentId: string | null): Promise<string> {
+  const from = await agencyEmail();
+  const subject = purpose === "password_reset" ? "TOP TEA TALENTS — password reset code" : "TOP TEA TALENTS — verification code";
+  const body = [
+    `Your TOP TEA TALENTS ${purpose === "password_reset" ? "password reset" : "verification"} code is: ${code}`,
+    ``,
+    `It expires in 15 minutes and can be used 5 times. If you did not request this, ignore this email.`,
+    ``,
+    `TOP TEA TALENTS — ${from}`,
+  ].join("\n");
+  return enqueueEmail({ to: email, talentId, kind: "verification", subject, body });
+}
+
 // ---------- agencies ----------
 async function agencyStats(): Promise<any[]> {
   const opps = await allOpps();
@@ -2708,7 +3012,7 @@ async function agencyHistory(ag: any): Promise<any> {
   const apps = (await db.all("SELECT * FROM applications")).filter((a) => ids.has(String(a.opportunity_id)))
     .map((r) => ({ id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status, createdAt: r.created_at }));
   const books = (await db.all("SELECT * FROM bookings")).filter((b) => ids.has(String(b.opportunity_id))).map(bookingView);
-  const payments = books.map((b: any) => ({ bookingId: b.id, status: "TRACKING ONLY", grossCents: b.grossCents, commissionCents: b.commissionCents, netCents: b.netCents, note: "Payment tracking only — no payment processed (TEST MODE)." }));
+  const payments = books.map((b: any) => ({ bookingId: b.id, status: "TRACKING ONLY", grossCents: b.grossCents, commissionCents: b.commissionCents, netCents: b.netCents, note: "Payment tracking only — no payment processed." }));
   const events = (await db.all("SELECT * FROM ledger_events ORDER BY seq ASC"))
     .map(ledgerRow)
     .filter((e: any) => ids.has(String(e.data?.opportunityId)) || String(e.data?.agency || "") === ag.name || normName(String(e.data?.agency || "")) === normName(ag.name));
@@ -2726,6 +3030,15 @@ function bookingView(r: Row): any {
 }
 
 // ---------- serve ----------
+// v1.3.0: the mail drain runs inside the server every 60s — it is a
+// no-op in TEST MODE and with no transport configured, so it is safe to
+// run always. On Render's free tier the service sleeps after 15 min
+// idle, so the drain also runs on demand: the auto-runner calls
+// POST /email/drain after every approve, and the admin can call it
+// any time. A send happens only after Gmail returns a message id.
+setInterval(() => {
+  drainEmailQueue(10).catch((e) => console.error("mail drain failed:", e?.message || e));
+}, 60_000);
 Bun.serve({
   port: PORT,
   async fetch(req) {
@@ -2737,4 +3050,4 @@ Bun.serve({
     }
   },
 });
-console.log(`TOP TEA TALENTS API listening on :${PORT} (storage: ${db.storage}, durable: ${db.durable}, TEST MODE on)`);
+console.log(`TOP TEA TALENTS API listening on :${PORT} (storage: ${db.storage}, durable: ${db.durable}, live-mode env: ${process.env.TTT_LIVE_MODE || "off"} — DB setting live_mode can also enable)`);
