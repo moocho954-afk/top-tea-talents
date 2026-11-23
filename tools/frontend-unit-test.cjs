@@ -278,5 +278,75 @@ check("sidebar Talent group has a Log in link", () => {
   assert(idx.includes('<a href="#/login" data-route="login">Log in</a>'), "sidebar has no Log in link");
 });
 
+// --- talent alerts + receipts (v1.3.2, owner order 2026-11-23) ---
+check("router has #/complete-profile -> screenCompleteProfile", () => {
+  assert(appSrc.includes('{re:/^#\\/complete-profile$/, fn:screenCompleteProfile}'), "route missing");
+  assert(appSrc.includes("function screenCompleteProfile(app)"), "screen missing");
+});
+check("complete-profile screen renders one card per question + photos link-out", () => {
+  const cp = appSrc.slice(appSrc.indexOf("function screenCompleteProfile"), appSrc.indexOf("function screenBookings"));
+  assert(cp.includes('/missing-info'), "does not fetch the missing-info questions");
+  assert(cp.includes('#/portfolio'), "photos gap does not link out to the portfolio");
+  assert(cp.includes('/answers'), "does not POST answers");
+  assert(cp.includes('data-multi="1"'), "multi-choice checkboxes not marked");
+  assert(cp.includes('type="date"'), "date questions have no date input");
+  assert(cp.includes('type="number"'), "number questions have no number input");
+});
+check("dashboard shows the missing-info banner (own views only)", () => {
+  const dash = appSrc.slice(appSrc.indexOf("function screenDashboard"), appSrc.indexOf("function screenPortfolio"));
+  assert(dash.includes('/missing-info'), "dashboard does not fetch missing-info");
+  assert(dash.includes("Details we still need from you"), "banner heading missing");
+  assert(dash.includes("#/complete-profile"), "banner does not link to the form");
+  assert(dash.includes("#/portfolio"), "photos gap in the banner does not link to the portfolio");
+});
+check("applications screen shows receipt summary + submission link + outcome", () => {
+  const apps = appSrc.slice(appSrc.indexOf("function screenApplications"), appSrc.indexOf("function screenCompleteProfile"));
+  assert(apps.includes("snapshotSummary"), "no snapshot summary on the card");
+  assert(apps.includes("submissionLink"), "no submission link on the card");
+  assert(apps.includes("a.outcome"), "no outcome on the card");
+});
+check("replies screen has the admin outcome form (accepted/callback/rejected)", () => {
+  const rep = appSrc.slice(appSrc.indexOf("function screenReplies"), appSrc.indexOf("/* ---------- (9) applications"));
+  assert(rep.includes("outcome-form"), "outcome form missing");
+  assert(rep.includes("/outcome"), "outcome form does not POST to the outcome endpoint");
+  assert(rep.includes('value="accepted"'), "accepted option missing");
+  assert(rep.includes('value="callback"'), "callback option missing");
+  assert(rep.includes('value="rejected"'), "rejected option missing");
+  assert(rep.includes("never guessed"), "outcome form lacks the never-invent warning");
+});
+check("server carries the v1.3.2 endpoints + migration", () => {
+  assert(serverSrc.includes('rest[2] === "missing-info"'), "GET missing-info endpoint missing");
+  assert(serverSrc.includes('rest[2] === "missing-info-alert"'), "missing-info-alert endpoint missing");
+  assert(serverSrc.includes('rest[2] === "answers"'), "answers endpoint missing");
+  assert(serverSrc.includes('rest[2] === "submission-link"'), "submission-link endpoint missing");
+  assert(serverSrc.includes('rest[2] === "snapshot"'), "snapshot endpoint missing");
+  assert(serverSrc.includes('rest[2] === "outcome"'), "outcome endpoint missing");
+  assert(serverSrc.includes("migrateAlertsV132"), "v1.3.2 migration missing");
+  assert(serverSrc.includes("buildMissingInfoEmail"), "missing-info email builder missing");
+  assert(serverSrc.includes("buildSubmissionSnapshotEmail"), "snapshot email builder missing");
+  assert(serverSrc.includes("buildOutcomeEmail"), "outcome email builder missing");
+  assert(serverSrc.includes("Still to come from the agency"), "outcome email lacks the still-to-come line");
+});
+check("schema carries the v1.3.2 application columns", () => {
+  const schema = fs.readFileSync(path.join(ROOT, "server", "src", "schema.sql"), "utf8");
+  for (const col of ["snapshot_json", "submission_link", "outcome", "outcome_at", "outcome_detail_json"]) {
+    assert(schema.includes(col), "schema missing column " + col);
+  }
+});
+check("missing-info question module: 33 questions, 37 Miami Vice dates", () => {
+  const q = fs.readFileSync(path.join(ROOT, "server", "src", "missing-info-questions.ts"), "utf8");
+  const ids = q.match(/id: "[a-zA-Z]+"/g) || [];
+  assert(ids.length === 33, "expected 33 questions, got " + ids.length);
+  assert(q.includes("TAYLORMADE_MIAMI_VICE_DATES"), "Miami Vice dates missing");
+  const dates = q.match(/"12\/7 \(MON\)"/g) || [];
+  assert(dates.length === 1, "Miami Vice date list does not start 12/7 (MON)");
+  assert(q.includes('"2/6 (SAT)"'), "Miami Vice date list does not end 2/6 (SAT)");
+});
+check("submitter stores the portal link after a live submit (v1.3.2)", () => {
+  const sub = fs.readFileSync(path.join(ROOT, "tools", "taylormade-form-submitter.py"), "utf8");
+  assert(sub.includes("/submission-link"), "backend_log does not POST the submission link");
+  assert(sub.includes("submission-link storage failed"), "link-storage failure is not wrapped so it cannot fail the log");
+});
+
 console.log("\nFRONTEND-UNIT: " + PASS + " passed, " + FAIL + " failed");
 process.exit(FAIL === 0 ? 0 : 1);

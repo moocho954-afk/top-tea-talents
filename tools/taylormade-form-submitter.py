@@ -570,7 +570,17 @@ def backend_log(talent_id, opportunity_id, form_url):
             raise
     patched = ttt_json("PATCH", f"/api/v1/applications/{app_id}/status",
                        {"status": "SUBMITTED — SENT"})
-    return patched["application"]["id"]
+    app_id = patched["application"]["id"]
+    # v1.3.2 (receipts): store the portal link on the application so the
+    # talent's receipt carries the exact form URL. A link-storage failure
+    # must NEVER fail the submission log — the submit already happened.
+    try:
+        ttt_json("POST", f"/api/v1/applications/{app_id}/submission-link",
+                 {"link": form_url,
+                  "note": "TaylorMade Tally form submitted from the live browser task."})
+    except Exception as e:
+        print(f"WARNING: submission-link storage failed for {app_id}: {e}", file=sys.stderr)
+    return app_id
 
 
 # ---------- CLI ----------
