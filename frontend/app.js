@@ -102,7 +102,7 @@ function loadingBox(msg){ return '<div class="card"><p class="muted">'+esc(msg||
    profiles three times a day — 9:00 AM, 12:00 PM, and 4:00 PM Eastern.
    A profile not in by the 4:00 PM review waits until the next day, unless
    the talent emails the agency directly. */
-var AGENCY_EMAIL = "moocho954@gmail.com"; // agency contact for now — swap to topteatalents@gmail.com once the agency Gmail exists.
+var AGENCY_EMAIL = "topteatalents@gmail.com"; // agency contact — swapped from moocho954@gmail.com once the agency Gmail existed (Nov 23 00:0x EST).
 function reviewWindowsNotice(){
   return '<p class="notice-box">Agency review runs three times a day — <strong>9:00 AM, 12:00 PM, and 4:00 PM Eastern</strong>. If your profile is not in by the 4:00 PM review, it waits until the next day. Need it sooner? Email the agency directly at <a href="mailto:'+AGENCY_EMAIL+'">'+AGENCY_EMAIL+'</a>.</p>';
 }
