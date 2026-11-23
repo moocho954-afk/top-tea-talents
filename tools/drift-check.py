@@ -217,9 +217,9 @@ def main():
                 drift.append("BACKEND: storage_durable is not true "
                              "(sign-ups do not survive a restart yet)")
             counts = health.get("counts", {})
-            if counts.get("opportunities") != 434:
+            if counts.get("opportunities") != 435:
                 drift.append(f"BACKEND: opportunity count is "
-                             f"{counts.get('opportunities')}, expected 434")
+                             f"{counts.get('opportunities')}, expected 435")
         else:
             unknown.append(f"Backend /health returned HTTP {status}")
             checks["backend"] = {"http": status}
