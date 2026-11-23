@@ -12,7 +12,7 @@ import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, r
 import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
 import { MISSING_INFO_QUESTIONS, TAYLORMADE_MIAMI_VICE_DATES, shortCode, type MissingInfoQuestion } from "./missing-info-questions.js";
 
-const VERSION = "1.3.1";
+const VERSION = "1.3.2";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
