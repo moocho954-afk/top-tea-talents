@@ -1,0 +1,24 @@
+{
+ "generated_at_et": "2026-11-23T11:56:39-05:00",
+ "days_of_data": 1,
+ "sweep_runs": 3,
+ "total_first_seen": 1,
+ "sources": {
+  "allcasting": {
+   "total_first_seen": 1,
+   "by_hour_et": {
+    "10": 1
+   },
+   "peak_hours_et": [
+    10
+   ]
+  }
+ },
+ "recommended_slots_et": [
+  "08:00",
+  "12:00",
+  "16:00",
+  "20:00"
+ ],
+ "recommendation": "Only 1 day(s) of sweep data — too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
+}
