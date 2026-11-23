@@ -38,7 +38,11 @@ HISTORY = os.path.join(PACKAGE, "tools", "drift-history.jsonl")
 
 # Files tracked for repo-vs-disk comparison (node_modules and .git excluded).
 SKIP_DIRS = {"node_modules", ".git", "__pycache__"}
-SKIP_FILES = {"drift-report.json", "drift-history.jsonl"}
+# Runtime-generated state/logs mutate every run (reply-watch ~30 min, sweep
+# ~4 h) and can never stay byte-identical to a pushed snapshot; the page
+# does not depend on them, so they are not tracked for drift.
+SKIP_FILES = {"drift-report.json", "drift-history.jsonl",
+              "reply-watch-state.json", "sweep-log.jsonl"}
 
 
 def fetch(url, timeout=90, retries=1):
