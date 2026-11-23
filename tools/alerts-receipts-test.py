@@ -232,8 +232,14 @@ try:
           "detail" in em.get("subject", "") and str(len(dry.get("gaps", []))) in em.get("subject", ""), em.get("subject"))
     check("alert email body lists the gaps + reply option",
           "Weight (lbs)" in em.get("body", "") and "reply to this email" in em.get("body", ""), em.get("body", ""))
-    check("alert email has NO form link on scratch (no PUBLIC_URL)",
-          "Answer them here" not in em.get("body", ""), em.get("body", ""))
+    # publicBase() fix (2026-11-23): the form link is ALWAYS present now —
+    # with no PUBLIC_URL it falls back to the Pages origin, never a dead
+    # API-host link. The old assertion ("NO form link on scratch") tested
+    # the bug.
+    check("alert email carries a Pages-origin form link even with no PUBLIC_URL",
+          "Answer them here" in em.get("body", "")
+          and "https://moocho954-afk.github.io/top-tea-talents/#/complete-profile" in em.get("body", "")
+          and "onrender.com" not in em.get("body", ""), em.get("body", ""))
     s, al = call("POST", f"/talent/{F}/missing-info-alert", token=ADMIN, body={})
     check("alert real -> alerted, email queued not sent (no transport), notification made",
           s == 200 and al.get("alerted") is True and al.get("emailQueued") is True
