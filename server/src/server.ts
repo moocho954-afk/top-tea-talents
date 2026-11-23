@@ -1490,6 +1490,42 @@ async function handle(req: Request): Promise<Response> {
     return ok({ contacts: out, total: out.length });
   }
 
+  // ----- contacts: admin upsert (2026-11-23 email harvest) -----
+  // Seeded ONLY from addresses actually seen on a live listing page.
+  // Platform support / general-contact addresses are refused outright —
+  // they are never submission destinations.
+  if (method === "POST" && rest.join("/") === "contacts") {
+    const adm = requireAdmin(req); if (adm) return adm;
+    const b = await body(req);
+    if (!b || !b.name) return err(400, "name is required");
+    const kind = String(b.kind || "agency");
+    if (!["agency", "employer", "casting-professional", "production-company"].includes(kind)) {
+      return err(400, "kind must be agency, employer, casting-professional, or production-company");
+    }
+    const email = b.email ? String(b.email).trim() : null;
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err(400, "email is not a valid address");
+    const blocked = ["support@allcasting.com", "support@projectcasting.com", "support@productionbeast.com", "hello@heybooker.app", "casting@backstage.com", "uigroup@ep.com"];
+    if (email && blocked.includes(email.toLowerCase())) return err(400, "platform support addresses are not submission destinations");
+    // Merge with any existing row so an upsert that omits a field never
+    // wipes a stored email/phone.
+    const exRows = await db.all("SELECT * FROM contacts WHERE normalized = ? AND kind = ?", [normName(String(b.name)), kind]);
+    const ex = exRows[0];
+    const mergedEmail = email || (ex ? String(ex.email || "") || null : null);
+    const mergedPhone = (b.phone ? String(b.phone) : null) || (ex ? String(ex.phone || "") || null : null);
+    const mergedCity = (b.city ? String(b.city) : null) || (ex ? String(ex.city || "") || null : null);
+    const mergedState = (b.state ? String(b.state) : null) || (ex ? String(ex.state || "") || null : null);
+    const mergedSource = b.source ? String(b.source) : (ex && ex.source ? String(ex.source) : "admin");
+    const extra: any = { source: mergedSource };
+    if (mergedEmail) extra.email = mergedEmail;
+    if (mergedPhone) extra.phone = mergedPhone;
+    if (mergedCity) extra.city = mergedCity;
+    if (mergedState) extra.state = mergedState;
+    const id = await upsertContact(kind, String(b.name), extra);
+    await audit("contact.upsert", "contact", id, "admin", { kind, name: String(b.name), email: mergedEmail }, { contact: { id, kind, name: String(b.name), email: mergedEmail, phone: mergedPhone } });
+    const rows = await db.all("SELECT * FROM contacts WHERE id = ?", [id]);
+    return json({ ok: true, contact: rows[0] || { id, kind, name: String(b.name), email: mergedEmail } }, 201);
+  }
+
   // ----- agencies -----
   if (rest[0] === "agencies") {
     if (method === "GET" && rest.length === 1) return ok({ agencies: await agencyStats() });
