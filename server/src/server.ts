@@ -52,6 +52,23 @@ const isObj = (v: any) => v && typeof v === "object" && !Array.isArray(v);
 const normName = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
 const slugify = (s: string) => normName(s).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
 
+// ---------- public site origin (talent-facing SPA links) ----------
+// v1.3.2 live proof (2026-11-23): PUBLIC_URL on Render points at the API
+// host (top-tea-talents-api.onrender.com), which serves JSON and 404s at
+// its root — it can never serve the SPA. The missing-info alert email
+// linked `${PUBLIC_URL}/#/complete-profile` and the link was dead. Every
+// talent-facing link (#/talent/:id, #/complete-profile) must point at the
+// Pages site, so PUBLIC_URL is honoured ONLY when it is set and does not
+// point at an onrender.com host; anything else (unset, or the API host)
+// falls back to the Pages origin. A future custom domain still works —
+// any non-onrender PUBLIC_URL is used as-is.
+const PAGES_ORIGIN = "https://moocho954-afk.github.io/top-tea-talents";
+function publicBase(): string {
+  const env = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+  if (env && !env.includes("onrender.com")) return env;
+  return PAGES_ORIGIN;
+}
+
 // ---------- money / pay parsing ----------
 function parseMoney(text: string | null | undefined): number | null {
   if (!text) return null;
@@ -1554,6 +1571,24 @@ async function handle(req: Request): Promise<Response> {
     return json({ ok: true, contact: rows[0] || { id, kind, name: String(b.name), email: mergedEmail } }, 201);
   }
 
+  // ----- contacts: delete a contact (admin only) -----
+  // Added 2026-11-23: the alerts+receipts live proof left a scratch
+  // contacts row ("Test Proof") the API could not remove — no delete
+  // route existed. Same shape as DELETE /bookings/:id: admin-only,
+  // audited, {ok:true, deletedId}. Contacts have no lifecycle state, so
+  // there is no status guard — admin-only + the audit trail is the guard.
+  // Never delete a contact the live system still uses as a submission
+  // destination; check its applications/bookings counts first.
+  if (method === "DELETE" && rest.length === 2 && rest[0] === "contacts") {
+    const adm = requireAdmin(req); if (adm) return adm;
+    const rows = await db.all("SELECT * FROM contacts WHERE id = ?", [rest[1]]);
+    if (!rows.length) return err(404, "contact not found");
+    await db.run("DELETE FROM contacts WHERE id = ?", [rest[1]]);
+    await audit("contact.delete", "contact", rest[1], "admin",
+      { kind: String(rows[0].kind || ""), name: String(rows[0].name || ""), email: String(rows[0].email || "") }, { deleted: true });
+    return ok({ ok: true, deletedId: rest[1] });
+  }
+
   // ----- agencies -----
   if (rest[0] === "agencies") {
     if (method === "GET" && rest.length === 1) return ok({ agencies: await agencyStats() });
@@ -1858,7 +1893,7 @@ async function handle(req: Request): Promise<Response> {
       const chk = await requireTalentOrAdmin(req, talentId); if (!chk.ok) return chk.res!;
       const t = await loadTalent(talentId);
       if (!t) return err(404, "talent not found");
-      const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+      const base = publicBase();
       return ok({
         talentId, path: `#/talent/${talentId}`,
         publicUrl: base ? `${base}/#/talent/${talentId}` : null,
@@ -2135,7 +2170,7 @@ async function handle(req: Request): Promise<Response> {
       const photoRows = await db.all("SELECT COUNT(*) AS n FROM photos WHERE talent_id = ?", [talentId]);
       const info = computeMissingInfo(t.profile, Number(photoRows[0]?.n ?? 0), opp, formSlug);
       if (!info.gaps.length) return ok({ alerted: false, gaps: [], reason: "no missing info — the profile already carries every answer" });
-      const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+      const base = publicBase();
       const formUrl = base ? `${base}/#/complete-profile` : null;
       const talentName = (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || "Talent");
       const email = await buildMissingInfoEmail(talentName, info.gaps, formUrl, opp ? String(opp.title || opp.id) : null);
@@ -2386,7 +2421,7 @@ async function handle(req: Request): Promise<Response> {
     if (!oppRows.length) return err(404, "opportunity not found");
     const opp = JSON.parse(String(oppRows[0].data_json));
     const automation = await loadAutomation(String(app.talent_id));
-    const base = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+    const base = publicBase();
     const publicUrl = base ? `${base}/#/talent/${app.talent_id}` : null;
     const email = await buildApplicationEmail(String(app.talent_id), t.profile, opp, publicUrl, automation);
     const dest = await resolveDestination(opp, b.to ? String(b.to) : undefined);
