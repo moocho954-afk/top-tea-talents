@@ -217,9 +217,13 @@ def main():
                 drift.append("BACKEND: storage_durable is not true "
                              "(sign-ups do not survive a restart yet)")
             counts = health.get("counts", {})
-            if counts.get("opportunities") != 437:
+            # Expected count is the live count as of the last verified run
+            # (2026-11-24 08:17 EST: 438 after the 07:57 ET sweep found 1 new
+            # castingandacting listing). The sweep adds listings, so this
+            # number grows over time — bump it when a new listing lands.
+            if counts.get("opportunities") != 438:
                 drift.append(f"BACKEND: opportunity count is "
-                             f"{counts.get('opportunities')}, expected 437")
+                             f"{counts.get('opportunities')}, expected 438")
         else:
             unknown.append(f"Backend /health returned HTTP {status}")
             checks["backend"] = {"http": status}
