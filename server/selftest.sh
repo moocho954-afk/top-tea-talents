@@ -41,7 +41,7 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.3.3", d
+assert d["version"]=="1.3.4", d
 assert d["live_mode"] is False and d["mail_configured"] is False, d
 print("health ok:", d["counts"])
 PY
@@ -389,6 +389,42 @@ curl -sf "$BASE/applications/follow-ups" -H "Authorization: Bearer $ADMIN_TOKEN"
 check "v1.3.3: follow-ups endpoint answers, empty when nothing sent" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['total']==0 and d['nudgeAfterDays']==5, d"
 curl -sf -X POST "$BASE/applications/nudge-stale" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"dryRun":true}' -o /tmp/ttt-body.json
 check "v1.3.3: nudge-stale dry-run answers, nothing to nudge" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['nudged']==[] and d['failed']==[] and d['dryRun'] is True, d"
+# v1.3.4: sent-date fallback — an application SENT before v1.3.2 has a
+# snapshot with NO sentAt, but its email_queue SENT row carries the date.
+# follow-ups must read the queue date; nudge-stale (dry-run) must see it
+# as nudge-due instead of "sent date unknown".
+python3 - "$DB" "$MTALENT_ID" <<'PY'
+import sqlite3, sys, json
+from datetime import datetime, timedelta, timezone
+db = sqlite3.connect(sys.argv[1])
+sent = (datetime.now(timezone.utc) - timedelta(days=6, hours=1)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+snap = json.dumps({"applicationId": "app_selftest134", "status": "SUBMITTED — SENT", "destination": "test@example.com"})
+db.execute("INSERT INTO applications (id, talent_id, opportunity_id, status, created_at, updated_at, snapshot_json) VALUES ('app_selftest134', ?, 'allcasting:325201', 'SUBMITTED — SENT', ?, ?, ?)", (sys.argv[2], now, now, snap))
+db.execute("INSERT INTO email_queue (id, talent_id, subject, body, status, created_at, to_addr, application_id, kind, attempts, sent_at, message_id) VALUES ('eml_selftest134', ?, 'test', 'test', 'SENT', ?, 'test@example.com', 'app_selftest134', 'application', 1, ?, 'test-msg-134')", (sys.argv[2], sent, sent))
+db.commit()
+print("fixture sent_at:", sent)
+PY
+curl -sf "$BASE/applications/follow-ups" -H "Authorization: Bearer $ADMIN_TOKEN" -o /tmp/ttt-body.json
+check "v1.3.4: follow-ups reads the email_queue sent date when the snapshot has none" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+rows=[r for r in d['followUps'] if r['applicationId']=='app_selftest134']
+assert len(rows)==1, d
+r=rows[0]
+assert r['sentAt'] is not None and r['daysSinceSent']==6, r
+assert r['nextAction'].startswith('nudge due'), r
+print('fallback row:', r['sentAt'], r['daysSinceSent'], r['nextAction'])
+PY
+curl -sf -X POST "$BASE/applications/nudge-stale" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"dryRun":true}' -o /tmp/ttt-body.json
+check "v1.3.4: nudge-stale dry-run sees the fallback date as nudge-due" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+rows=[r for r in d['nudged'] if r['applicationId']=='app_selftest134']
+assert len(rows)==1 and rows[0].get('dryRun') is True, d
+assert d['failed']==[], d
+print('dry-run nudge:', rows[0]['destination'], rows[0]['referenceCode'])
+PY
 # Flip the same talent to Female: the anchor MUST now match, with a
 # gender-fit reason on the match row.
 curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"demographics":{"gender":"Female","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json
