@@ -218,10 +218,10 @@ def main():
                              "(sign-ups do not survive a restart yet)")
             counts = health.get("counts", {})
             # Expected count is the live count as of the last verified run
-            # (2026-11-25 07:57 EST: 443 after the 07:57 ET sweep found 2 new
-            # castingandacting listings). The sweep adds listings, so this
+            # (2026-11-25 11:57 EST: 444 after the 11:57 ET sweep found 1 new
+            # castingandacting listing). The sweep adds listings, so this
             # number grows over time — bump it when a new listing lands.
-            if counts.get("opportunities") != 443:
+            if counts.get("opportunities") != 444:
                 drift.append(f"BACKEND: opportunity count is "
                              f"{counts.get('opportunities')}, expected 443")
         else:

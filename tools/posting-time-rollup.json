@@ -1,8 +1,8 @@
 {
- "generated_at_et": "2026-11-25T07:57:20-05:00",
+ "generated_at_et": "2026-11-25T11:57:44-05:00",
  "days_of_data": 3,
- "sweep_runs": 16,
- "total_first_seen": 10,
+ "sweep_runs": 17,
+ "total_first_seen": 11,
  "sources": {
   "allcasting": {
    "total_first_seen": 3,
@@ -18,10 +18,10 @@
    ]
   },
   "castingandacting": {
-   "total_first_seen": 7,
+   "total_first_seen": 8,
    "by_hour_et": {
     "7": 3,
-    "11": 1,
+    "11": 2,
     "15": 2,
     "23": 1
    },
