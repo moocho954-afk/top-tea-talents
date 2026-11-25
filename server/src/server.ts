@@ -13,7 +13,7 @@ import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
 import { MISSING_INFO_QUESTIONS, TAYLORMADE_MIAMI_VICE_DATES, shortCode, type MissingInfoQuestion } from "./missing-info-questions.js";
 import { deriveSelectivity, deriveProfileKeywords, scoreKeywords, derivePaidGuaranteed, isPaidCompType, locationInGeography, SELECTIVITY_RANK, type SelectivityClass } from "./classify.js";
 
-const VERSION = "1.3.3";
+const VERSION = "1.3.4";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
@@ -2580,7 +2580,10 @@ async function handle(req: Request): Promise<Response> {
       for (const r of rows) {
         const snap = parseSnapshot(r);
         const fu = parseFollowUp(r);
-        const sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        // v1.3.4: snapshot may predate sentAt (sent before v1.3.2) — fall
+        // back to the email_queue SENT receipt so the nudge clock runs.
+        let sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        if (!sentAt) { const rc = await sentReceipt(r.id); sentAt = rc.sentAt; }
         const sentMs = sentAt ? Date.parse(sentAt) : NaN;
         const days = Number.isFinite(sentMs) ? Math.max(0, Math.floor((Date.now() - sentMs) / 86400000)) : null;
         const replies = await db.all("SELECT id FROM application_replies WHERE application_id = ?", [r.id]);
@@ -2759,7 +2762,12 @@ async function handle(req: Request): Promise<Response> {
         const snap = parseSnapshot(r);
         const fu = parseFollowUp(r);
         if (fu) { skipped.push({ applicationId: r.id, reason: "already nudged" }); continue; }
-        const sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        // v1.3.4: snapshot may predate sentAt (sent before v1.3.2) — fall
+        // back to the email_queue SENT receipt; hand the resolved date to
+        // the nudge email so it prints the true sent date, not "recently".
+        let sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        if (!sentAt) { const rc = await sentReceipt(r.id); sentAt = rc.sentAt; }
+        if (snap && sentAt) snap.sentAt = sentAt;
         const sentMs = sentAt ? Date.parse(sentAt) : NaN;
         if (!Number.isFinite(sentMs)) { skipped.push({ applicationId: r.id, reason: "sent date unknown" }); continue; }
         const days = Math.floor((Date.now() - sentMs) / 86400000);
@@ -4126,6 +4134,15 @@ function parseSnapshot(r: Row): any {
 function parseFollowUp(r: Row): any {
   if (!r.follow_up_json) return null;
   try { return JSON.parse(String(r.follow_up_json)); } catch { return null; }
+}
+// v1.3.4: sent-date fallback — applications sent before v1.3.2 stored no
+// sentAt in their snapshot, so follow-ups/nudge read "unknown" forever.
+// The email_queue SENT row is the ground truth (the drain wrote sent_at +
+// message_id at send time). Read it when the snapshot has no sentAt.
+async function sentReceipt(appId: string): Promise<{ sentAt: string | null; messageId: string | null }> {
+  const rows = await db.all("SELECT sent_at, message_id FROM email_queue WHERE application_id = ? AND kind = 'application' AND status = 'SENT' ORDER BY sent_at ASC LIMIT 1", [appId]);
+  if (!rows.length) return { sentAt: null, messageId: null };
+  return { sentAt: rows[0]?.sent_at ? String(rows[0].sent_at) : null, messageId: rows[0]?.message_id ? String(rows[0].message_id) : null };
 }
 function applicationView(r: Row): any {
   const snap = parseSnapshot(r);
