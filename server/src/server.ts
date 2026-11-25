@@ -11,8 +11,9 @@ import { createDb, type Db, type Row } from "./libsql.js";
 import { appendMirror, bootRestoreIfNeeded, defaultMirrorPath, readMirrorText, rebuildMirrorFromDb, verifyMirrorFile } from "./mirror.js";
 import { extractEmail, mailStatus, sendGmail } from "./mailer.js";
 import { MISSING_INFO_QUESTIONS, TAYLORMADE_MIAMI_VICE_DATES, shortCode, type MissingInfoQuestion } from "./missing-info-questions.js";
+import { deriveSelectivity, deriveProfileKeywords, scoreKeywords, derivePaidGuaranteed, isPaidCompType, locationInGeography, SELECTIVITY_RANK, type SelectivityClass } from "./classify.js";
 
-const VERSION = "1.3.2";
+const VERSION = "1.3.3";
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const SEED_DIR = import.meta.dir + "/../seed";
@@ -391,6 +392,17 @@ await migrateReleaseV131();
 // v1.3.2: applications gain a submission snapshot, a portal submission
 // link, and the agency outcome. Idempotent (same catch pattern).
 await migrateAlertsV132();
+// v1.3.3: applications gain a follow-up record (one no-reply nudge per
+// application, ever). Idempotent (same catch pattern).
+await migrateFollowUpV133();
+async function migrateFollowUpV133(): Promise<void> {
+  const adds: [string, string][] = [
+    ["applications", "follow_up_json TEXT"],
+  ];
+  for (const [table, col] of adds) {
+    await db.run(`ALTER TABLE ${table} ADD COLUMN ${col}`).catch(() => {});
+  }
+}
 async function migrateAlertsV132(): Promise<void> {
   const adds: [string, string][] = [
     ["applications", "snapshot_json TEXT"],
@@ -1816,8 +1828,11 @@ async function handle(req: Request): Promise<Response> {
       const t = await loadTalent(talentId);
       if (!t) return err(404, "talent not found");
       const jStats: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> } = {};
-      const matches = matchTalent(t.profile, await allOpps(), jStats);
       const automation = await loadAutomation(talentId);
+      // v1.3.3: the talent's automation geography feeds the PAID GUARANTEED
+      // class, so a Florida-wide open call never outranks a South Florida
+      // one for a south-florida talent.
+      const matches = matchTalent(t.profile, await allOpps(), jStats, automation?.geography ?? null);
       const opps = await allOpps();
       const byId = new Map(opps.map((o: any) => [String(o.id), o]));
       const live = await liveMode();
@@ -1832,6 +1847,9 @@ async function handle(req: Request): Promise<Response> {
           // Blocked jobs stay in the feed for manual review.
           const blockers = automationBlockers(t.profile, o, automation);
           const autoEligible = automation.enabled === true && m.classification !== "NEEDS TALENT APPROVAL" && blockers.length === 0;
+          // v1.3.3: PAID GUARANTEED counts only when it ALSO passes every
+          // automation gate — the class alone never makes a job sendable.
+          const paidGuaranteed = m.paidGuaranteed === true && autoEligible;
           return {
             opportunityId: m.opportunityId, title: o.title || m.opportunityId, production: o.production || null,
             agency: o.casting_org || o.employer || null, location: o.location || null,
@@ -1840,16 +1858,23 @@ async function handle(req: Request): Promise<Response> {
             classification: m.classification, reasons: m.reasons, score: m.score,
             selectivity: m.selectivity || "unknown", selectivityReason: m.selectivityReason || null,
             genderRequirement: m.genderRequirement || null,
+            keywords: m.keywords || [], keywordScore: m.keywordScore ?? 0,
+            paidGuaranteed,
             referenceCode: refCode(talentId, String(m.opportunityId)),
             automationEligible: autoEligible,
             automationBlockers: blockers,
             automationNote: automation.enabled !== true
               ? "Automation is OFF — nothing is submitted automatically."
               : autoEligible
-                ? (live ? "Automation is ON and this job fits your rules — the agency will send your application by email." : "Automation is ON and this job fits your rules — it would be queued for agency-send (TEST MODE: nothing is ever sent live).")
+                ? (paidGuaranteed
+                  ? "PAID GUARANTEED — paid, sign-up-and-show, no audition. Automation is ON and this job fits your rules — the agency will send your application by email."
+                  : (live ? "Automation is ON and this job fits your rules — the agency will send your application by email." : "Automation is ON and this job fits your rules — it would be queued for agency-send (TEST MODE: nothing is ever sent live)."))
                 : "Automation is ON but this job needs your approval first.",
           };
-        });
+        })
+        // v1.3.3: PAID GUARANTEED + eligible sorts first, then guaranteed,
+        // then unknown, then selective — within each class, best score.
+        .sort((a: any, b: any) => ((b.paidGuaranteed ? 1 : 0) - (a.paidGuaranteed ? 1 : 0)) || (SELECTIVITY_RANK[a.selectivity as SelectivityClass] - SELECTIVITY_RANK[b.selectivity as SelectivityClass]) || (b.score - a.score));
       return ok({ jobs, total: jobs.length, genderExcluded: (jStats.genderExcluded || []).length, talentGender: talentGender(t.profile), genderSet: !!(t.profile?.demographics?.gender || t.profile?.gender), automationEnabled: automation.enabled === true, generatedAt: nowIso(), note: live ? "Live mode: the feed ranks matches; automation-eligible jobs are sent by the agency email." : "TEST MODE: the feed ranks matches; nothing is ever submitted live." });
     }
     // ----- v8: BIG automation toggle -----
@@ -2477,6 +2502,9 @@ async function handle(req: Request): Promise<Response> {
 
   // ----- applications -----
   if (rest[0] === "applications") {
+    // v1.3.3: a SENT application with no reply after this many days gets
+    // the ONE polite follow-up email.
+    const NUDGE_AFTER_DAYS = 5;
     if (method === "POST" && rest.length === 1) {
       const b = await body(req);
       if (!b || !b.talentId || !b.opportunityId) return err(400, "talentId and opportunityId are required");
@@ -2537,6 +2565,38 @@ async function handle(req: Request): Promise<Response> {
       await db.run("DELETE FROM applications WHERE id = ?", [rest[1]]);
       await audit("application.delete", "application", rest[1], "admin", {}, { deleted: true });
       return ok({ deleted: true, applicationId: rest[1] });
+    }
+    // ----- v1.3.3: follow-ups — what is still waiting on a reply -----
+    // GET /api/v1/applications/follow-ups — admin only. One row per SENT
+    // application: days since sent, whether the agency replied, whether
+    // the one nudge went out, and the next action. The auto-runner report
+    // reads this every run so no sent application goes quiet unnoticed.
+    // (Placed before GET /:id — that handler would otherwise catch the
+    // literal segment "follow-ups" as an application id.)
+    if (method === "GET" && rest.length === 2 && rest[1] === "follow-ups") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const rows = await db.all("SELECT * FROM applications WHERE status = 'SUBMITTED — SENT' ORDER BY updated_at ASC");
+      const out = [];
+      for (const r of rows) {
+        const snap = parseSnapshot(r);
+        const fu = parseFollowUp(r);
+        const sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        const sentMs = sentAt ? Date.parse(sentAt) : NaN;
+        const days = Number.isFinite(sentMs) ? Math.max(0, Math.floor((Date.now() - sentMs) / 86400000)) : null;
+        const replies = await db.all("SELECT id FROM application_replies WHERE application_id = ?", [r.id]);
+        const t = await loadTalent(String(r.talent_id));
+        const talentName = t ? (`${t.profile.firstName ?? ""} ${t.profile.lastName ?? ""}`.trim() || t.profile.professionalName || String(r.talent_id)) : String(r.talent_id);
+        const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [r.opportunity_id]);
+        const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+        let nextAction: string;
+        if (replies.length) nextAction = "replied — record the outcome from the reply";
+        else if (fu) nextAction = `nudged ${String(fu.nudgedAt || "").slice(0, 10)} — if still silent, call the casting office`;
+        else if (days !== null && days >= NUDGE_AFTER_DAYS) nextAction = "nudge due — send the one follow-up email";
+        else if (days !== null) nextAction = `waiting — nudge due in ${NUDGE_AFTER_DAYS - days} day(s)`;
+        else nextAction = "sent date unknown — check the snapshot";
+        out.push({ applicationId: r.id, talentId: r.talent_id, talentName, opportunityId: r.opportunity_id, jobTitle: opp?.title ?? String(r.opportunity_id), referenceCode: refCode(String(r.talent_id), String(r.opportunity_id)), sentAt, daysSinceSent: days, hasReply: replies.length > 0, replyCount: replies.length, nudgedAt: fu?.nudgedAt ?? null, outcome: r.outcome ?? null, nextAction });
+      }
+      return ok({ followUps: out, total: out.length, nudgeAfterDays: NUDGE_AFTER_DAYS });
     }
     // ----- v1.3.2: submission link, snapshot, outcome (receipts) -----
     // GET /applications/:id — the full record: snapshot, submission link,
@@ -2681,6 +2741,49 @@ async function handle(req: Request): Promise<Response> {
       await audit("application.outcome", "application", rest[1], "admin", { outcome, replyId: b.replyId ? String(b.replyId) : null, fromName, eventDate, emailQueued, emailSent, messageId: messageId ?? null, notificationId: ntfId, bookingId: booking?.id ?? null }, { outcome, outcomeAt: ts, booking: booking ?? null });
       const updated = await db.all("SELECT * FROM applications WHERE id = ?", [rest[1]]);
       return ok({ application: applicationView(updated[0]), booking: booking ?? null, emailQueued, emailSent, messageId: messageId ?? null, emailReason, notificationId: ntfId });
+    }
+
+    // POST /api/v1/applications/nudge-stale — admin only. Sends the ONE
+    // polite follow-up email to each SENT application with no reply after
+    // NUDGE_AFTER_DAYS days. Never nudges the same application twice,
+    // never nudges package-ready or awaiting-approval. dryRun previews
+    // without sending or marking. A failed send marks nothing — the next
+    // run retries it.
+    if (method === "POST" && rest.length === 2 && rest[1] === "nudge-stale") {
+      const adm = requireAdmin(req); if (adm) return adm;
+      const b = (await body(req)) || {};
+      const dryRun = b.dryRun === true;
+      const list = await db.all("SELECT * FROM applications WHERE status = 'SUBMITTED — SENT' ORDER BY updated_at ASC");
+      const nudged: any[] = []; const failed: any[] = []; const skipped: any[] = [];
+      for (const r of list) {
+        const snap = parseSnapshot(r);
+        const fu = parseFollowUp(r);
+        if (fu) { skipped.push({ applicationId: r.id, reason: "already nudged" }); continue; }
+        const sentAt = snap?.sentAt ? String(snap.sentAt) : null;
+        const sentMs = sentAt ? Date.parse(sentAt) : NaN;
+        if (!Number.isFinite(sentMs)) { skipped.push({ applicationId: r.id, reason: "sent date unknown" }); continue; }
+        const days = Math.floor((Date.now() - sentMs) / 86400000);
+        if (days < NUDGE_AFTER_DAYS) { skipped.push({ applicationId: r.id, reason: `only ${days} day(s) since sent` }); continue; }
+        const replies = await db.all("SELECT id FROM application_replies WHERE application_id = ?", [r.id]);
+        if (replies.length) { skipped.push({ applicationId: r.id, reason: "agency already replied" }); continue; }
+        const oppRows = await db.all("SELECT data_json FROM opportunities WHERE id = ?", [r.opportunity_id]);
+        const opp = oppRows.length ? JSON.parse(String(oppRows[0].data_json)) : null;
+        const t = await loadTalent(String(r.talent_id));
+        if (!opp || !t) { skipped.push({ applicationId: r.id, reason: "opportunity or talent not found" }); continue; }
+        const dest = snap?.destination || (await resolveDestination(opp)).to;
+        const email = buildFollowUpEmail(String(r.talent_id), t.profile, opp, snap);
+        if (dryRun) { nudged.push({ applicationId: r.id, dryRun: true, destination: dest, subject: email.subject, body: email.body, referenceCode: email.referenceCode }); continue; }
+        if (!dest) { failed.push({ applicationId: r.id, reason: "no destination email on file" }); continue; }
+        const emailId = await enqueueEmail({ to: dest, talentId: String(r.talent_id), applicationId: r.id, kind: "follow-up", subject: email.subject, body: email.body });
+        const attempt = await drainOneEmail(emailId);
+        if (!attempt.sent) { failed.push({ applicationId: r.id, reason: attempt.reason || "send failed" }); continue; }
+        const ts = nowIso();
+        const record = { nudgedAt: ts, messageId: attempt.messageId ?? null, destination: dest, referenceCode: email.referenceCode };
+        await db.run("UPDATE applications SET follow_up_json = ?, updated_at = ? WHERE id = ?", [JSON.stringify(record), ts, r.id]);
+        await audit("application.followup.nudge", "application", r.id, "admin", { destination: dest, messageId: attempt.messageId ?? null, daysSinceSent: days }, { followUp: record });
+        nudged.push({ applicationId: r.id, destination: dest, messageId: attempt.messageId ?? null, referenceCode: email.referenceCode });
+      }
+      return ok({ nudged, failed, skipped, dryRun });
     }
     return err(404, "not found");
   }
@@ -3164,34 +3267,23 @@ function genderBlocksTalent(oppGenders: OppGenders, tg: "male" | "female" | null
   return false;
 }
 
-// ---------- selectivity (owner order 2026-11-22) ----------
-// Every casting is classed by how selective it is, derived from the
-// listing text — never guessed as guaranteed:
-// - "guaranteed": the text says it outright — open call / open casting /
-//   walk-in / everyone welcome / immediate hire / no audition. These are
-//   the everybody-gets-picked jobs; they rank first in Jobs For You and
-//   are preferred by the auto-submit rotation.
-// - "selective": audition / callback / limited spots / only a few picked /
-//   competitive / by invitation. Clearly labeled so a talent knows the
-//   odds before applying; ranked below guaranteed.
-// - "unknown": neither signal is present. Shown as "selectivity unknown",
-//   never promoted to guaranteed. Audition language wins ties: an "open
-//   casting call" that still holds auditions is selective, not guaranteed.
-// ("Open to all ethnicities/ages" is an inclusivity statement, not a hire
-// guarantee — the lookahead excludes it. "No experience necessary" only
-// speaks to requirements, not hiring odds, so it is not a signal either.)
-type SelectivityClass = "guaranteed" | "selective" | "unknown";
-const GUARANTEED_SIGNALS = /\b(open call|open casting|walk[\s-]?in|everyone welcome|all welcome|all are welcome|everyone hired|immediate hire|hiring immediately|no audition|all sizes welcome|all types welcome|open to all(?!\s+(ethnicities|ages))|everyone who (shows? up|applies|attends)|guaranteed (hire|work|pay|booking))\b/i;
-const SELECTIVE_SIGNALS = /\b(audition|callback|call back|limited spots?|limited openings?|only (a )?few|only \d+ (will be|to be) (selected|chosen|picked)|competitive|by invitation|invite only|invitation only|screening|must have experience|experienced only|highly selective|shortlist)\b/i;
-function deriveSelectivity(o: any): { class: SelectivityClass; reason: string | null } {
-  const text = [o.title, o.roles, o.eligibility, o.appearance, o.skills, o.category].map((x) => String(x || "")).join(" ");
-  const g = GUARANTEED_SIGNALS.exec(text);
-  const s = SELECTIVE_SIGNALS.exec(text);
-  if (g && !s) return { class: "guaranteed", reason: g[0] };
-  if (s) return { class: "selective", reason: s[0] };
-  return { class: "unknown", reason: null };
-}
-const SELECTIVITY_RANK: Record<SelectivityClass, number> = { guaranteed: 0, unknown: 1, selective: 2 };
+// ---------- selectivity ----------
+// v1.3.3: the classifier lives in ./classify.ts (shared by the matcher,
+// Jobs For You and the opportunities list — all derive on read, so the
+// sweep stores no selectivity and a new listing is classified the moment
+// it arrives). Rules, owner orders 2026-11-22 + 2026-11-25:
+// - "guaranteed": the text says everybody gets picked — open call / open
+//   casting / walk-in / walk-on / everyone welcome / immediate hire / no
+//   audition / no experience necessary / sign up / register / background
+//   or extras needed. These rank first and are preferred by auto-submit.
+// - "selective": audition / callback / self-tape / must audition /
+//   "submit … for consideration" / limited spots / competitive / by
+//   invitation. Ranked below guaranteed; audition language wins ties.
+// - "unknown": neither signal is present. Never promoted to guaranteed.
+// ("All ethnicities/ages welcome" counts only inside an open-call
+// context — a bare inclusivity line is not a hire guarantee. A bare
+// "submit headshot and resume" is not a signal either — background jobs
+// ask for that too.)
 
 // ---------- matching ----------
 function parseAgeRange(s: string | null | undefined): [number, number] | null {
@@ -3199,7 +3291,7 @@ function parseAgeRange(s: string | null | undefined): [number, number] | null {
   const m = String(s).match(/(\d+)\s*-\s*(\d+)/);
   return m ? [Number(m[1]), Number(m[2])] : null;
 }
-function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> }): any[] {
+function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array<{ opportunityId: string; requiredGender: "female" | "male"; source: string }> }, geography?: string | null): any[] {
   const out: any[] = [];
   const mySkills: Set<string> = new Set((profile.skills || []).map((s: string) => String(s).toLowerCase()));
   const myCats = new Set((profile.categories || []).map((s: string) => String(s).toLowerCase()));
@@ -3207,6 +3299,17 @@ function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array
   const myAge = parseAgeRange(profile.ageRange);
   const myMin = profile.minCompensation != null ? Number(profile.minCompensation) : null;
   const tg = talentGender(profile);
+  // v1.3.3: keyword set dissected from THIS talent's live profile
+  // (gender, age, ethnicity, build, hair/eyes, beard, tattoos, languages,
+  // city/state, categories, skills, experience) — scored against every
+  // listing's text so the reason is visible, never a black box.
+  const kws = deriveProfileKeywords(profile);
+  // Geography for the PAID GUARANTEED class: the caller's automation
+  // geography when given (Jobs For You), else derived from the profile
+  // (a South Florida city -> south-florida, any FL talent -> florida).
+  const geo = geography ?? (String(profile.state || "").trim().toLowerCase() === "fl"
+    ? (["miami", "miami beach", "fort lauderdale", "hollywood", "hialeah", "coral gables", "boca raton", "west palm beach", "pompano beach", "pembroke pines", "miramar", "davie", "plantation", "sunrise", "tamarac", "delray beach", "boynton beach", "deerfield beach", "doral", "kendall", "homestead", "aventura", "hallandale beach", "north miami", "north miami beach", "sunny isles beach", "key biscayne", "coconut creek", "margate", "lauderhill", "weston", "cooper city", "dania beach", "lake worth", "palm beach gardens", "jupiter", "wellington", "royal palm beach", "greenacres", "riviera beach", "lake park", "parkland", "miami gardens", "miami lakes", "miami springs", "opa-locka", "sweetwater", "palmetto bay", "pinecrest", "cutler bay", "florida city", "lighthouse point", "southwest ranches", "medley", "el portal", "biscayne park", "golden beach", "surfside", "bal harbour", "bay harbor islands", "indian creek"].includes(String(profile.city || "").trim().toLowerCase()) ? "south-florida" : "florida")
+    : null);
   for (const o of opps) {
     if (oppExpired(o)) continue;
     // Gender gate FIRST: a listing that requires the other gender is never
@@ -3260,12 +3363,22 @@ function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array
     // by gender, so the talent can see WHY it fits — never a silent pass.
     const sel = deriveSelectivity(o);
     if (dg.genders !== "open") reasons.push(`Gender fit: ${dg.genders}-only role`);
-    out.push({ opportunityId: o.id, classification, reasons, score, selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: dg.genders === "open" ? null : dg.genders });
+    // v1.3.3: profile-keyword score + PAID GUARANTEED class. Paid +
+    // guaranteed + in geography + meets the daily floor + keyword score
+    // above threshold (>=2 matched, >=1 of them a work keyword). The
+    // class is a TYPE flag here; Jobs For You refines it to "and passes
+    // every automation gate" before it can be auto-sent.
+    const kw = scoreKeywords(profile, o, kws);
+    if (kw.matched.length) reasons.push(`Keywords: ${kw.matched.join(", ")}`);
+    const pg = derivePaidGuaranteed(o, profile, geo, { sel, kw, daily });
+    if (pg.paidGuaranteed) for (const r of pg.reasons) reasons.push(r);
+    out.push({ opportunityId: o.id, classification, reasons, score, selectivity: sel.class, selectivityReason: sel.reason, genderRequirement: dg.genders === "open" ? null : dg.genders, keywords: kw.matched, keywordScore: kw.score, workKeywordScore: kw.workScore, paidGuaranteed: pg.paidGuaranteed });
   }
-  // Guaranteed (everybody-gets-picked) castings rank first, then unknown,
-  // then selective — within each class, best score first. The score and
-  // its classification thresholds are unchanged; only the order moves.
-  out.sort((a, b) => (SELECTIVITY_RANK[a.selectivity as SelectivityClass] - SELECTIVITY_RANK[b.selectivity as SelectivityClass]) || (b.score - a.score));
+  // PAID GUARANTEED (sign-up-and-show, paid) ranks first, then
+  // guaranteed, then unknown, then selective — within each class, best
+  // score first. The score and its classification thresholds are
+  // unchanged; only the order moves.
+  out.sort((a, b) => ((b.paidGuaranteed ? 1 : 0) - (a.paidGuaranteed ? 1 : 0)) || (SELECTIVITY_RANK[a.selectivity as SelectivityClass] - SELECTIVITY_RANK[b.selectivity as SelectivityClass]) || (b.score - a.score));
   return out;
 }
 
@@ -3292,44 +3405,8 @@ function matchTalent(profile: any, opps: any[], stats?: { genderExcluded?: Array
 //      auto-eligible. "A plus"/"preferred" language is not a requirement
 //      and never blocks; a bare mention ("a French plantation owner") is
 //      not a requirement either.
-const SOUTH_FLORIDA_COUNTIES = ["miami-dade", "broward", "palm beach"];
-const SOUTH_FLORIDA_CITIES = ["miami", "miami beach", "fort lauderdale", "hollywood", "hialeah", "coral gables", "boca raton", "west palm beach", "pompano beach", "pembroke pines", "miramar", "davie", "plantation", "sunrise", "tamarac", "delray beach", "boynton beach", "deerfield beach", "doral", "kendall", "homestead", "aventura", "hallandale beach", "north miami", "north miami beach", "sunny isles beach", "key biscayne", "coconut creek", "margate", "lauderhill", "weston", "cooper city", "dania beach", "lake worth", "palm beach gardens", "jupiter", "wellington", "royal palm beach", "greenacres", "riviera beach", "lake park", "parkland", "miami gardens", "miami lakes", "miami springs", "opa-locka", "sweetwater", "palmetto bay", "pinecrest", "cutler bay", "florida city", "lighthouse point", "southwest ranches", "medley", "el portal", "biscayne park", "golden beach", "surfside", "bal harbour", "bay harbor islands", "indian creek"];
-function locationInGeography(o: any, geography: string | null | undefined): boolean {
-  const geo = String(geography || "").trim().toLowerCase();
-  if (!geo) return true; // no geography rule set — nothing to enforce
-  if (geo === "nationwide") return true; // talent opted into everywhere
-  const loc = o.location || {};
-  const city = normName(String(loc.city || ""));
-  const county = normName(String(loc.county || ""));
-  const state = normName(String(loc.state || ""));
-  const raw = normName(String(loc.raw || ""));
-  // Genuinely location-free / remote: nothing places the job anywhere.
-  if (!city && !county && !state && !raw) return true;
-  if (/\bremote\b|\bvirtual\b|work from home/i.test(raw) || /\bremote\b|\bvirtual\b/i.test(city)) return true;
-  if (geo === "south-florida") {
-    // A non-Florida state on the record fails outright. The seed sometimes
-    // puts the city name in the state field ("London", "San Francisco") —
-    // that is still not Florida.
-    if (state && state !== "fl" && state !== "florida") return false;
-    if (SOUTH_FLORIDA_COUNTIES.includes(county)) return true;
-    if (SOUTH_FLORIDA_CITIES.includes(city)) return true;
-    // Fallback: the raw text names a South Florida place (records where
-    // city/county are empty but the raw string carries the location).
-    const hay = ` ${raw} `;
-    for (const name of [...SOUTH_FLORIDA_COUNTIES, ...SOUTH_FLORIDA_CITIES].sort((a, b) => b.length - a.length)) {
-      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(hay)) return true;
-    }
-    return false;
-  }
-  if (geo === "florida") {
-    if (state === "fl" || state === "florida") return true;
-    if (SOUTH_FLORIDA_COUNTIES.includes(county)) return true;
-    if (/\bflorida\b|, fl\b/.test(raw)) return true;
-    return false;
-  }
-  // Unknown geography value: do not invent a boundary — do not block.
-  return true;
-}
+// (v1.3.3: SOUTH_FLORIDA_COUNTIES / SOUTH_FLORIDA_CITIES /
+// locationInGeography moved to ./classify.ts — same code, one home.)
 function payBlocker(o: any, automation: any, profile: any): string | null {
   const compType = String(o.compensation_type || "").trim().toLowerCase();
   const compText = String(o.compensation || "");
@@ -3688,6 +3765,48 @@ async function buildReleaseEmail(talentName: string, agencyName: string, opp: an
   return { from, subject, body: lines.join("\n"), replyTo: [from] };
 }
 
+// v1.3.3: quote the posting's own "what to bring / wardrobe" line when
+// it states one — a sentence containing bring/wardrobe, quoted verbatim
+// (max 200 chars), never paraphrased or invented. Returns null when the
+// posting says nothing about it.
+function extractBringLine(instructions: any): string | null {
+  const text = String(instructions || "");
+  if (!text) return null;
+  for (const sentence of text.split(/(?<=[.!?])\s+|\n+/)) {
+    if (/\b(bring|wardrobe|bring along|what to (wear|bring))\b/i.test(sentence)) {
+      const s = sentence.trim().replace(/\s+/g, " ");
+      if (s.length > 10) return s.slice(0, 200);
+    }
+  }
+  return null;
+}
+
+// ---------- v1.3.3: no-reply nudge ----------
+// buildFollowUpEmail — the ONE polite follow-up for a SENT application
+// with no reply after 5 days. Same ref code, one short paragraph asking
+// for confirmation of receipt + any next step. Nothing invented: dates,
+// pay and role come from the original submission record. Pure.
+function buildFollowUpEmail(talentId: string, profile: any, opp: any, snap: any): any {
+  const ref = refCode(talentId, String(opp.id));
+  const name = `${profile.firstName ?? ""} ${profile.lastName ?? ""}`.trim() || profile.professionalName || "Talent";
+  const proName = profile.professionalName || name;
+  const title = String(opp.title || opp.id).slice(0, 80);
+  const subject = `Follow-up — ${title} — Ref ${ref}`;
+  const sentDate = snap?.sentAt ? String(snap.sentAt).slice(0, 10) : "recently";
+  const lines: string[] = [];
+  lines.push(`Hello ${opp.casting_org || opp.employer || "Casting"} team,`);
+  lines.push(``);
+  lines.push(`Following up on our application for ${proName} for "${title}" (Ref ${ref}), submitted ${sentDate}. Could you confirm you received it, and let us know if there is any next step or anything else you need from us?`);
+  lines.push(``);
+  if (opp.production_dates) lines.push(`Shoot dates (per the posting): ${opp.production_dates}`);
+  if (opp.location?.raw) lines.push(`Location: ${opp.location.raw}`);
+  lines.push(`Reference code: ${ref} — please include it in any reply so we can route it to the right talent and job.`);
+  lines.push(``);
+  lines.push(`Thank you,`);
+  lines.push(`TOP TEA TALENTS`);
+  return { subject, body: lines.join("\n"), referenceCode: ref };
+}
+
 // buildApplicationEmail — the one email builder. Subject carries the
 // per-(talent, job) reference code; the body carries the pay-ask line
 // whenever the posting lists no parseable pay (normalizedDaily null);
@@ -3714,10 +3833,21 @@ async function buildApplicationEmail(talentId: string, profile: any, opp: any, p
   if (opp.production) lines.push(`Production: ${opp.production}`);
   if (opp.location?.raw) lines.push(`Location: ${opp.location.raw}`);
   if (opp.production_dates) lines.push(`Dates: ${opp.production_dates}`);
+  // v1.3.3: every gig fact the record holds goes in the email — pay +
+  // rate type, hours, deadline, contact, source link, appearance, and
+  // what to bring when the posting states it. A missing field is omitted,
+  // never filled.
+  if (opp.hours) lines.push(`Hours: ${opp.hours}`);
+  if (opp.deadline) lines.push(`Apply by: ${opp.deadline}`);
+  if (opp.casting_professional) lines.push(`Contact: ${opp.casting_professional}`);
+  if (opp.appearance) lines.push(`Appearance: ${String(opp.appearance).slice(0, 300)}`);
+  const bring = extractBringLine(opp.submission_instructions);
+  if (bring) lines.push(`What to bring (per the posting): ${bring}`);
+  if (opp.source_url) lines.push(`Listing: ${opp.source_url}`);
   if (opp.roles) lines.push(`Roles: ${String(opp.roles).slice(0, 400)}`);
   lines.push(``);
   lines.push(`About ${proName}: ${[profile.city, profile.state].filter(Boolean).join(", ") || "South Florida"}. Categories: ${(profile.categories || []).join(", ") || "—"}. Skills: ${(profile.skills || []).join(", ") || "—"}. Experience: ${profile.experience || "—"}.`);
-  if (daily !== null) lines.push(`Listed pay: $${daily}/day (per the posting).`);
+  if (daily !== null) lines.push(`Listed pay: $${daily}/day${opp.compensation_type ? ` (${opp.compensation_type})` : ""}${opp.compensation && String(opp.compensation).trim() && !String(opp.compensation).includes(String(daily)) ? ` — posting says: ${String(opp.compensation).slice(0, 200)}` : ""} (per the posting).`);
   else lines.push(`Could you confirm the pay rate for this role? The posting does not list compensation.`);
   if (portfolioLink) lines.push(`Portfolio: ${portfolioLink}`);
   lines.push(``);
@@ -3992,6 +4122,11 @@ function parseSnapshot(r: Row): any {
   if (!r.snapshot_json) return null;
   try { return JSON.parse(String(r.snapshot_json)); } catch { return null; }
 }
+// v1.3.3: the one no-reply nudge record, if any. Null = never nudged.
+function parseFollowUp(r: Row): any {
+  if (!r.follow_up_json) return null;
+  try { return JSON.parse(String(r.follow_up_json)); } catch { return null; }
+}
 function applicationView(r: Row): any {
   const snap = parseSnapshot(r);
   let outcomeDetails: any = null;
@@ -4001,6 +4136,7 @@ function applicationView(r: Row): any {
     submissionLink: r.submission_link ?? null,
     outcome: r.outcome ?? null, outcomeAt: r.outcome_at ?? null, outcomeDetails,
     snapshot: snap,
+    followUp: parseFollowUp(r),
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -4008,11 +4144,13 @@ function applicationView(r: Row): any {
 // the entire sent email text). GET /applications/:id returns the full view.
 function applicationSummary(r: Row): any {
   const snap = parseSnapshot(r);
+  const fu = parseFollowUp(r);
   return {
     id: r.id, talentId: r.talent_id, opportunityId: r.opportunity_id, status: r.status,
     submissionLink: r.submission_link ?? null,
     outcome: r.outcome ?? null, outcomeAt: r.outcome_at ?? null,
     snapshotSummary: snap ? { status: snap.status, destination: snap.destination ?? null, submitVia: snap.submitVia ?? null, sentAt: snap.sentAt ?? null, messageId: snap.messageId ?? null, source: snap.source ?? null } : null,
+    followUpSummary: fu ? { nudgedAt: fu.nudgedAt ?? null, messageId: fu.messageId ?? null } : null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }

@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS applications (
   outcome TEXT,
   outcome_at TEXT,
   outcome_detail_json TEXT,
+  -- v1.3.3: one no-reply nudge per application, ever ({nudgedAt,
+  -- messageId, destination, referenceCode}).
+  follow_up_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
