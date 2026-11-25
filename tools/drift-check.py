@@ -223,7 +223,7 @@ def main():
             # number grows over time — bump it when a new listing lands.
             if counts.get("opportunities") != 441:
                 drift.append(f"BACKEND: opportunity count is "
-                             f"{counts.get('opportunities')}, expected 440")
+                             f"{counts.get('opportunities')}, expected 441")
         else:
             unknown.append(f"Backend /health returned HTTP {status}")
             checks["backend"] = {"http": status}
