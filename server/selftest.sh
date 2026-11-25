@@ -41,7 +41,7 @@ import json
 d=json.load(open('/tmp/ttt-body.json'))
 assert d["ok"] is True and d["test_mode"] is True and d["submissions_paused"] is True, d
 assert d["storage"]=="sqlite" and d["storage_durable"] is False, d
-assert d["version"]=="1.3.1", d
+assert d["version"]=="1.3.3", d
 assert d["live_mode"] is False and d["mail_configured"] is False, d
 print("health ok:", d["counts"])
 PY
@@ -321,7 +321,10 @@ check "v1.3.1: fixed out-of-area jobs are NOT automation-eligible even when labe
 import json
 d=json.load(open('/tmp/ttt-body.json'))
 by={j['opportunityId']: j for j in d['jobs']}
-for wid in ['projectcasting:sorry-about-my-friends-open-casting-call-for-extras', 'allcasting:325201']:
+# Anchors (v1.3.3 note): allcasting:325201 (CVS, deadline 2026-11-24) is
+# EXPIRED as of 2026-11-25, so it no longer matches at all — replaced by
+# the live Knoxville background job, which is out-of-area the same way.
+for wid in ['projectcasting:sorry-about-my-friends-open-casting-call-for-extras', 'actorsandextras:docu-series-true-crime-knoxville']:
     assert wid in by, wid + ' missing from jobs-for-you'
     j=by[wid]
     assert j['automationEligible'] is False, wid + ' still marked eligible'
@@ -332,15 +335,23 @@ check "v1.3.1: in-area stated-pay jobs STAY automation-eligible" python3 - <<'PY
 import json
 d=json.load(open('/tmp/ttt-body.json'))
 by={j['opportunityId']: j for j in d['jobs']}
-# Anchors are the Miami stated-pay jobs in THIS talent's top 25 (the
-# Joseph-live-feed anchors — Miami Male Waiter, AutoZone — score below
-# the cut for a no-skills test talent; the rule they prove is the same).
-for wid in ['allcasting:325814', 'allcasting:325026']:
-    assert wid in by, wid + ' missing from jobs-for-you'
-    j=by[wid]
-    assert j['automationEligible'] is True, wid + ' wrongly blocked: ' + str(j['automationBlockers'])
-    assert j['automationBlockers'] == [], j['automationBlockers']
-    print(wid[:40], 'eligible, classification:', j['classification'])
+# Anchors (v1.3.3 note): allcasting:325026 (Margaritaville, deadline
+# 2026-11-23) is EXPIRED as of 2026-11-25, so it no longer matches at
+# all — 325814 stays as the specific anchor, and the rule is also checked
+# across every eligible job in the feed (stated pay + no blockers).
+wid='allcasting:325814'
+assert wid in by, wid + ' missing from jobs-for-you'
+j=by[wid]
+assert j['automationEligible'] is True, wid + ' wrongly blocked: ' + str(j['automationBlockers'])
+assert j['automationBlockers'] == [], j['automationBlockers']
+print(wid[:40], 'eligible, classification:', j['classification'])
+paid_types={'daily','flat','hourly','session','residual'}
+elig=[x for x in d['jobs'] if x['automationEligible'] is True]
+assert len(elig) >= 1, 'no automation-eligible jobs in the feed at all'
+for x in elig:
+    assert x['automationBlockers'] == [], x
+    assert x.get('compensationType') in paid_types, x
+print('eligible jobs in feed:', len(elig), '— all stated-pay, no blockers')
 PY
 check "v1.3.1: language-required jobs are NOT automation-eligible" python3 - <<'PY'
 import json
@@ -356,6 +367,28 @@ assert j['automationEligible'] is False, 'Money Transfer App still marked eligib
 assert any('hindi' in b.lower() or 'urdu' in b.lower() or 'arabic' in b.lower() for b in j['automationBlockers']), j['automationBlockers']
 print(wid[:40], 'blockers:', j['automationBlockers'])
 PY
+# v1.3.3: jobs-for-you rows carry keywords + paidGuaranteed; guaranteed
+# rows sort first; follow-ups + nudge-stale (dry-run) answer cleanly.
+check "v1.3.3: jobs-for-you rows carry keywords + paidGuaranteed, guaranteed first" python3 - <<'PY'
+import json
+d=json.load(open('/tmp/ttt-body.json'))
+jobs=d['jobs']
+assert len(jobs) == 25, jobs
+for j in jobs:
+    assert 'keywords' in j and isinstance(j['keywords'], list), j
+    assert 'paidGuaranteed' in j and isinstance(j['paidGuaranteed'], bool), j
+    assert 'keywordScore' in j, j
+assert jobs[0]['selectivity'] == 'guaranteed', jobs[0]
+seen_unknown_or_selective = False
+for j in jobs:
+    if j['selectivity'] in ('unknown', 'selective'): seen_unknown_or_selective = True
+    if j['selectivity'] == 'guaranteed': assert not seen_unknown_or_selective, 'guaranteed row after unknown/selective row'
+print('first row:', jobs[0]['opportunityId'][:40], 'guaranteed;', sum(1 for j in jobs if j['selectivity']=='guaranteed'), 'guaranteed in feed')
+PY
+curl -sf "$BASE/applications/follow-ups" -H "Authorization: Bearer $ADMIN_TOKEN" -o /tmp/ttt-body.json
+check "v1.3.3: follow-ups endpoint answers, empty when nothing sent" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['total']==0 and d['nudgeAfterDays']==5, d"
+curl -sf -X POST "$BASE/applications/nudge-stale" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"dryRun":true}' -o /tmp/ttt-body.json
+check "v1.3.3: nudge-stale dry-run answers, nothing to nudge" python3 -c "import json; d=json.load(open('/tmp/ttt-body.json')); assert d['ok'] is True and d['nudged']==[] and d['failed']==[] and d['dryRun'] is True, d"
 # Flip the same talent to Female: the anchor MUST now match, with a
 # gender-fit reason on the match row.
 curl -sf -X PATCH "$BASE/talent/$MTALENT_ID" -H "Authorization: Bearer $MTOKEN" -H 'Content-Type: application/json' -d '{"demographics":{"gender":"Female","ethnicity":"Black / African American"}}' -o /tmp/ttt-body.json
