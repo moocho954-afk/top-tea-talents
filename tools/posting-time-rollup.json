@@ -1,7 +1,7 @@
 {
- "generated_at_et": "2026-11-26T11:57:36-05:00",
+ "generated_at_et": "2026-11-26T15:57:10-05:00",
  "days_of_data": 3,
- "sweep_runs": 23,
+ "sweep_runs": 24,
  "total_first_seen": 11,
  "sources": {
   "allcasting": {
@@ -38,5 +38,5 @@
   "16:00",
   "20:00"
  ],
- "recommendation": "Only 3 day(s) of sweep data \u2014 too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
+ "recommendation": "Only 3 day(s) of sweep data — too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
 }
