@@ -1,42 +1,42 @@
 {
-  "generated_at_et": "2026-11-26T19:57:01-05:00",
-  "days_of_data": 3,
-  "sweep_runs": 25,
-  "total_first_seen": 11,
-  "sources": {
-    "allcasting": {
-      "total_first_seen": 3,
-      "by_hour_et": {
-        "3": 1,
-        "10": 1,
-        "19": 1
-      },
-      "peak_hours_et": [
-        10,
-        19,
-        3
-      ]
-    },
-    "castingandacting": {
-      "total_first_seen": 8,
-      "by_hour_et": {
-        "7": 3,
-        "11": 2,
-        "15": 2,
-        "23": 1
-      },
-      "peak_hours_et": [
-        7,
-        15,
-        11
-      ]
-    }
+ "generated_at_et": "2026-11-26T19:57:01-05:00",
+ "days_of_data": 3,
+ "sweep_runs": 25,
+ "total_first_seen": 11,
+ "sources": {
+  "allcasting": {
+   "total_first_seen": 3,
+   "by_hour_et": {
+    "3": 1,
+    "10": 1,
+    "19": 1
+   },
+   "peak_hours_et": [
+    10,
+    19,
+    3
+   ]
   },
-  "recommended_slots_et": [
-    "08:00",
-    "12:00",
-    "16:00",
-    "20:00"
-  ],
-  "recommendation": "Only 3 day(s) of sweep data \u2014 too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
+  "castingandacting": {
+   "total_first_seen": 8,
+   "by_hour_et": {
+    "7": 3,
+    "11": 2,
+    "15": 2,
+    "23": 1
+   },
+   "peak_hours_et": [
+    7,
+    15,
+    11
+   ]
+  }
+ },
+ "recommended_slots_et": [
+  "08:00",
+  "12:00",
+  "16:00",
+  "20:00"
+ ],
+ "recommendation": "Only 3 day(s) of sweep data \u2014 too thin to move slots. Keep the initial schedule 08:00, 12:00, 16:00, 20:00 ET; re-run this rollup after 7 days. Floor: 2/day."
 }
